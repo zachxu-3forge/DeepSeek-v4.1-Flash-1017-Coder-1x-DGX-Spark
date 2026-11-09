@@ -1,0 +1,94 @@
+diff --git a/zig/src/families/deepseek_v41/affine_cuda.zig b/zig/src/families/deepseek_v41/affine_cuda.zig
+new file mode 100644
+index 0000000..08c4201
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_cuda.zig
+@@ -0,0 +1,48 @@
++//! Which MLX affine widths the current CUDA kernels serve, and which need a fallback.
++//!
++//! `cuda/qlinear.zig` serves affine linears at 2/3/5/6/8-bit group 64 through `affine8.cu`.
++//! The expert kernels (`cuda/experts.zig`) serve only affine-3 and affine-4; a 2-bit routed
++//! expert must go through a per-expert `AffineN` fallback, which is not wired yet.
++
++const std = @import("std");
++const affine = @import("affine.zig");
++const plan = @import("affine_plan.zig");
++
++pub fn linearSupported(spec: affine.Spec) bool {
++    if (spec.mode != .affine or spec.group != 64) return false;
++    return switch (spec.bits) {
++        2, 3, 5, 6, 8 => true,
++        else => false,
++    };
++}
++
++/// The native expert gather/GLU kernels' widths (affine-3 and affine-4).
++pub fn expertNative(spec: affine.Spec) bool {
++    if (spec.mode != .affine or spec.group != 64) return false;
++    return spec.bits == 3 or spec.bits == 4;
++}
++
++/// Why a module cannot use its native kernel, or null when it can.
++pub fn problem(kind: plan.Kind, spec: affine.Spec) ?[]const u8 {
++    if (spec.mode != .affine) return "not an affine module";
++    if (spec.group != 64) return "the CUDA kernels serve affine group 64 only";
++    return switch (kind) {
++        .linear => if (linearSupported(spec)) null else "the CUDA affine8 path serves 2/3/5/6/8-bit linears only",
++        .expert => if (expertNative(spec))
++            null
++        else
++            "the CUDA expert kernels serve affine-3/4; this expert needs the per-expert AffineN fallback (not wired)",
++    };
++}
++
++test "CUDA linear widths and expert widths are reported separately" {
++    try std.testing.expect(linearSupported(.{ .bits = 2, .group = 64 }));
++    try std.testing.expect(linearSupported(.{ .bits = 6, .group = 64 }));
++    try std.testing.expect(linearSupported(.{ .bits = 8, .group = 64 }));
++    try std.testing.expect(!linearSupported(.{ .bits = 4, .group = 32 }));
++    try std.testing.expect(expertNative(.{ .bits = 3, .group = 64 }));
++    try std.testing.expect(expertNative(.{ .bits = 4, .group = 64 }));
++    try std.testing.expect(!expertNative(.{ .bits = 2, .group = 64 }));
++    try std.testing.expect(problem(.expert, .{ .bits = 2, .group = 64 }) != null);
++    try std.testing.expect(problem(.linear, .{ .bits = 6, .group = 64 }) == null);
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 86871db..e74d0dd 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -238,13 +238,24 @@ pub const Model = struct {
+             var ap = try @import("affine_plan.zig").build(gpa, &m.cfg, &m.pack, &formats);
+             defer ap.deinit();
+             var modules: usize = 0;
++            var native_experts: usize = 0;
++            var fallback_experts: usize = 0;
++            var unsupported_linears: usize = 0;
+             for (ap.layers) |layer| {
+                 for (layer.modules) |mod| {
+                     try @import("affine_load.zig").checkModule(&m.pack, mod.name, mod.layout);
+                     modules += 1;
++                    switch (mod.kind) {
++                        .expert => {
++                            if (@import("affine_cuda.zig").expertNative(mod.spec)) native_experts += 1 else fallback_experts += 1;
++                        },
++                        .linear => {
++                            if (!@import("affine_cuda.zig").linearSupported(mod.spec)) unsupported_linears += 1;
++                        },
++                    }
+                 }
+             }
+-            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len });
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears });
+             return error.AffineForwardNotPorted;
+         }
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 741bd9c..55b9d4b 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -400,4 +400,5 @@ test {
+     _ = @import("affine_load.zig");
+     _ = @import("affine_plan.zig");
+     _ = @import("affine_ref.zig");
++    _ = @import("affine_cuda.zig");
+ }

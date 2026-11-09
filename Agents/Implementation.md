@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1h committed (affine reference math); image build pending |
+| Overall status | Stage 1i committed (CUDA width audit); image build pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1h affine reference math committed; forward mapping pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1i CUDA width audit committed; 2-bit expert fallback needed |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -60,6 +60,19 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-09 - Stage 1i: CUDA width audit
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0009-dsv41-affine-cuda-audit.patch` with `affine_cuda.zig`:
+  linears at 2/3/5/6/8-bit group 64 are served by `affine8.cu`; native expert kernels
+  serve only affine-3/4, so the target's 2-bit routed experts need a per-expert `AffineN`
+  fallback. Boot now logs native/fallback/unsupported counts.
+- **Approach used:** explicit capability audit before any forward wiring.
+- **Verification:** `0009` applies on top of `0001`-`0008`; `affine_cuda` passes in the
+  18-test host suite.
+- **Artifacts:** `patches-mlx/0009-dsv41-affine-cuda-audit.patch`.
+- **Next:** stage 1j, per-expert `AffineN` fallback for 2-bit experts.
 
 ### 2026-11-09 - Stage 1h: affine reference math
 
@@ -264,6 +277,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 192 experts / world 1 | Data-driven expert count; single-rank path | `affine_plan` exercises 192; `block_admission` test proves world 1 | Plan already uses `cfg.experts`; no hardcoded 384 in the affine path | `0006` committed |
 | Mixed DSpark | Load MXFP8/MXFP4 modules | Plan lists them in `mixed`; boot logs the count | Keeps affine and mixed formats separate until readers exist | `0007` committed; 17 tests |
 | Affine reference | Verify dequantization math before kernels | CPU bit-stream extraction and row dot | Gives kernels an independent oracle, including 6-bit word crossings | `0008` committed; 3 tests |
+| CUDA width audit | Map formats to native kernels | Linears use `affine8.cu` 2/3/5/6/8-bit; experts only 3/4-bit native | Target's 2-bit experts require a per-expert fallback | `0009` committed; 18 tests |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
@@ -285,6 +299,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | `0006` patch apply | `git apply` on `0001`-`0005` | Pass | 192-expert/world-1 tests |
 | 2026-11-09 | `0007` patch apply | `git apply` on `0001`-`0006` | Pass | Mixed DSpark planning |
 | 2026-11-09 | `0008` patch apply | `git apply` on `0001`-`0007` | Pass | Affine reference |
+| 2026-11-09 | `0009` patch apply | `git apply` on `0001`-`0008` | Pass | CUDA width audit |
+| 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
 | 2026-11-09 | Affine reference | `zig test` on `affine_ref.zig` | Pass | 2/6/8-bit, 3 tests |
 | 2026-11-09 | Mixed DSpark planning | `zig test` on `affine_plan.zig` | Pass | 17-test host suite |
 | 2026-11-09 | 192-expert plan | `zig test` on `affine_plan.zig` | Pass | 16-test host suite |
@@ -299,7 +315,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1h admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, and provide the CPU dequantization oracle; the affine path deliberately returns `AffineForwardNotPorted`, so forward mapping and kernels are still missing.
+- Stage 1a-1i admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide the CPU dequantization oracle, and audit CUDA widths. The critical gap is now explicit: linears are served by `affine8.cu` at 2/3/5/6/8-bit, but native expert kernels cover only affine-3/4, so the target's 2-bit routed experts need a per-expert fallback. The affine path deliberately returns `AffineForwardNotPorted`.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -310,7 +326,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Implement stage 1i: map the affine images into the forward and add the CUDA gather/linear path.
-2. Implement stage 1j: add the MXFP8/MXFP4 DSpark reader.
-3. Implement stage 1k: one-layer forward harness; keep runtime verification deferred.
+1. Implement stage 1j: the per-expert `AffineN` fallback for the 2-bit routed experts.
+2. Implement stage 1k: the MXFP8/MXFP4 DSpark reader.
+3. Implement stage 1l: forward mapping and the one-layer harness; keep runtime verification deferred.
 4. At the end, build the container, run the one-layer reference, and record all results here.

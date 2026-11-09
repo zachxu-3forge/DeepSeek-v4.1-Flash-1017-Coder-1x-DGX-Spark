@@ -13,10 +13,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0006-dsv41-192-world1.patch` | Exercise a 192-expert affine plan and single-rank admission |
 | `0007-dsv41-mixed-dspark.patch` | List DSpark MXFP8/MXFP4 modules as mixed and log them at boot |
 | `0008-dsv41-affine-reference.patch` | CPU reference for the MLX bit-stream dequantization and row dot |
-| `0009-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0010-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
+| `0009-dsv41-affine-cuda-audit.patch` | Report native CUDA width support; 2-bit routed experts need a per-expert fallback |
+| `0010-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0011-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001`-`0008`. Planned: `0009`-`0010`.
+Implemented: `0001`-`0009`. Planned: `0010`-`0011`.
 
 Rules:
 
