@@ -1,0 +1,67 @@
+diff --git a/zig/src/families/deepseek_v41/affine_cuda.zig b/zig/src/families/deepseek_v41/affine_cuda.zig
+index 08c4201..1b651d1 100644
+--- a/zig/src/families/deepseek_v41/affine_cuda.zig
++++ b/zig/src/families/deepseek_v41/affine_cuda.zig
+@@ -35,6 +35,62 @@ pub fn problem(kind: plan.Kind, spec: affine.Spec) ?[]const u8 {
+     };
+ }
+ 
++/// A per-expert view of a stacked affine projection, for the fallback that calls an
++/// `AffineN` linear once per active expert. Offsets are bytes into the stacked tensors.
++pub const ExpertView = struct {
++    expert: u32,
++    weight_off: u64,
++    scales_off: u64,
++    biases_off: u64,
++    n: u32,
++    k: u32,
++    bits: u8,
++};
++
++pub fn expertView(
++    layout: affine.Layout,
++    experts: u32,
++    expert: u32,
++    weight_bytes: u64,
++    scales_bytes: u64,
++    biases_bytes: u64,
++) !ExpertView {
++    if (expert >= experts or layout.n == 0 or layout.k == 0) return error.BadAffine;
++    const packed_k = try layout.packedK();
++    const groups = try layout.groups();
++    const row_w = std.math.mul(u64, packed_k, 4) catch return error.BadAffine;
++    const row_s = std.math.mul(u64, groups, 2) catch return error.BadAffine;
++    const expert_w = std.math.mul(u64, layout.n, row_w) catch return error.BadAffine;
++    const expert_s = std.math.mul(u64, layout.n, row_s) catch return error.BadAffine;
++    const weight_off = std.math.mul(u64, expert, expert_w) catch return error.BadAffine;
++    const scales_off = std.math.mul(u64, expert, expert_s) catch return error.BadAffine;
++    const biases_off = scales_off;
++    const w_end = std.math.add(u64, weight_off, expert_w) catch return error.BadAffine;
++    const s_end = std.math.add(u64, scales_off, expert_s) catch return error.BadAffine;
++    const b_end = std.math.add(u64, biases_off, expert_s) catch return error.BadAffine;
++    if (w_end > weight_bytes or s_end > scales_bytes or b_end > biases_bytes) return error.BadAffine;
++    return .{
++        .expert = expert,
++        .weight_off = weight_off,
++        .scales_off = scales_off,
++        .biases_off = biases_off,
++        .n = layout.n,
++        .k = layout.k,
++        .bits = layout.bits,
++    };
++}
++
++test "per-expert fallback views step through a stacked 2-bit projection" {
++    const layout: affine.Layout = .{ .n = 3, .k = 64, .bits = 2, .group = 64 };
++    const v = try expertView(layout, 2, 1, 2 * 3 * 16, 2 * 3 * 2, 2 * 3 * 2);
++    try std.testing.expectEqual(@as(u64, 48), v.weight_off);
++    try std.testing.expectEqual(@as(u64, 6), v.scales_off);
++    try std.testing.expectEqual(@as(u32, 3), v.n);
++    try std.testing.expectEqual(@as(u32, 64), v.k);
++    try std.testing.expectEqual(@as(u8, 2), v.bits);
++    try std.testing.expectError(error.BadAffine, expertView(layout, 2, 2, 2 * 3 * 16, 2 * 3 * 2, 2 * 3 * 2));
++}
++
+ test "CUDA linear widths and expert widths are reported separately" {
+     try std.testing.expect(linearSupported(.{ .bits = 2, .group = 64 }));
+     try std.testing.expect(linearSupported(.{ .bits = 6, .group = 64 }));
