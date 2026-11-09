@@ -1,0 +1,126 @@
+diff --git a/zig/src/families/deepseek_v41/affine_dispatch.zig b/zig/src/families/deepseek_v41/affine_dispatch.zig
+new file mode 100644
+index 0000000..af47f8f
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_dispatch.zig
+@@ -0,0 +1,88 @@
++//! The forward dispatch table for affine and mixed DSpark modules.
++//!
++//! The table names the kernel family each module takes: `affine8.cu` for linears, the
++//! per-expert `AffineN` fallback for 2-bit routed experts, and the MXFP8/MXFP4 paths for
++//! DSpark. It is host-only; the forward still has to bind the buffers and launch.
++
++const std = @import("std");
++const affine = @import("affine.zig");
++const plan = @import("affine_plan.zig");
++
++pub const Mode = enum { affine8_linear, affine_n_expert, mxfp8, mxfp4 };
++
++pub const Entry = struct {
++    kind: plan.Kind,
++    name: []const u8,
++    spec: affine.Spec,
++    mode: Mode,
++};
++
++pub const Dispatch = struct {
++    arena: std.heap.ArenaAllocator,
++    entries: []Entry,
++    linear: u32 = 0,
++    expert: u32 = 0,
++    mxfp8: u32 = 0,
++    mxfp4: u32 = 0,
++
++    pub fn deinit(d: *Dispatch) void {
++        d.arena.deinit();
++        d.* = undefined;
++    }
++};
++
++pub fn modeFor(kind: plan.Kind, spec: affine.Spec) !Mode {
++    if (spec.mode == .mxfp8) {
++        if (kind != .linear) return error.BadAffine;
++        return .mxfp8;
++    }
++    if (spec.mode == .mxfp4) {
++        if (kind != .expert) return error.BadAffine;
++        return .mxfp4;
++    }
++    if (spec.mode != .affine) return error.BadAffine;
++    return switch (kind) {
++        .linear => .affine8_linear,
++        .expert => .affine_n_expert,
++    };
++}
++
++pub fn build(gpa: std.mem.Allocator, p: *const plan.Plan) !Dispatch {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    var entries: std.ArrayList(Entry) = .empty;
++    var out: Dispatch = .{ .arena = arena, .entries = &.{} };
++    for (p.layers) |layer| {
++        for (layer.modules) |mod| {
++            const mode = try modeFor(mod.kind, mod.spec);
++            try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode });
++            switch (mode) {
++                .affine8_linear => out.linear += 1,
++                .affine_n_expert => out.expert += 1,
++                .mxfp8 => out.mxfp8 += 1,
++                .mxfp4 => out.mxfp4 += 1,
++            }
++        }
++    }
++    for (p.mixed) |mod| {
++        const mode = try modeFor(mod.kind, mod.spec);
++        try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode });
++        switch (mode) {
++            .affine8_linear => out.linear += 1,
++            .affine_n_expert => out.expert += 1,
++            .mxfp8 => out.mxfp8 += 1,
++            .mxfp4 => out.mxfp4 += 1,
++        }
++    }
++    out.entries = try entries.toOwnedSlice(a);
++    return out;
++}
++
++test "dispatch maps linears, 2-bit experts, and mixed DSpark" {
++    try std.testing.expectEqual(Mode.affine8_linear, try modeFor(.linear, .{ .bits = 6, .group = 64 }));
++    try std.testing.expectEqual(Mode.affine_n_expert, try modeFor(.expert, .{ .bits = 2, .group = 64 }));
++    try std.testing.expectEqual(Mode.mxfp8, try modeFor(.linear, .{ .bits = 8, .mode = .mxfp8 }));
++    try std.testing.expectEqual(Mode.mxfp4, try modeFor(.expert, .{ .bits = 4, .mode = .mxfp4 }));
++    try std.testing.expectError(error.BadAffine, modeFor(.linear, .{ .bits = 4, .group = 64, .mode = .mxfp4 }));
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index e74d0dd..4fffaf5 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -237,6 +237,8 @@ pub const Model = struct {
+             defer formats.deinit();
+             var ap = try @import("affine_plan.zig").build(gpa, &m.cfg, &m.pack, &formats);
+             defer ap.deinit();
++            var dispatch = try @import("affine_dispatch.zig").build(gpa, &ap);
++            defer dispatch.deinit();
+             var modules: usize = 0;
+             var native_experts: usize = 0;
+             var fallback_experts: usize = 0;
+@@ -255,7 +257,7 @@ pub const Model = struct {
+                     }
+                 }
+             }
+-            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears });
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; dispatch: {d} affine8 linears, {d} expert fallbacks, {d} mxfp8, {d} mxfp4; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears, dispatch.linear, dispatch.expert, dispatch.mxfp8, dispatch.mxfp4 });
+             return error.AffineForwardNotPorted;
+         }
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 76aebe1..e20447d 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -403,4 +403,5 @@ test {
+     _ = @import("affine_cuda.zig");
+     _ = @import("mixed.zig");
+     _ = @import("mixed_load.zig");
++    _ = @import("affine_dispatch.zig");
+ }

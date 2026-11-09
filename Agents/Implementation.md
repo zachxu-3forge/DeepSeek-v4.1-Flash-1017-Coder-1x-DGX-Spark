@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1k committed (MXFP8/MXFP4 reader); image build pending |
+| Overall status | Stage 1l committed (forward dispatch table); image build pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1k mixed reader committed; forward/qlinear loop pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1l dispatch table committed; buffer binding/launch pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -60,6 +60,18 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-09 - Stage 1l: forward dispatch table
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0012-dsv41-affine-dispatch.patch` with `affine_dispatch.zig`:
+  each affine/mixed module maps to `.affine8_linear`, `.affine_n_expert`, `.mxfp8`, or
+  `.mxfp4`; boot logs the counts.
+- **Approach used:** host-side dispatch plan; no buffer binding or kernel launch yet.
+- **Verification:** `0012` applies on top of `0001`-`0011`; `affine_dispatch` passes in the
+  18-test host suite.
+- **Artifacts:** `patches-mlx/0012-dsv41-affine-dispatch.patch`.
+- **Next:** stage 1m, bind the dispatch entries to buffers and launch the one-layer path.
 
 ### 2026-11-09 - Stage 1k: MXFP8/MXFP4 reader
 
@@ -305,6 +317,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | CUDA width audit | Map formats to native kernels | Linears use `affine8.cu` 2/3/5/6/8-bit; experts only 3/4-bit native | Target's 2-bit experts require a per-expert fallback | `0009` committed; 18 tests |
 | Expert fallback | Call `AffineN` per active expert | Byte views into the stacked projection with bounds checks | Bridges the missing 2-bit expert kernel without a new CUDA kernel | `0010` committed; 19 tests |
 | Mixed reader | Load DSpark MXFP8/MXFP4 | U32 bit-stream words with U8 E8M0 scales, no bias | The mixed modules reuse the same code stream as affine | `0011` committed; 35 tests |
+| Forward dispatch | Map modules to kernels | `.affine8_linear`, `.affine_n_expert`, `.mxfp8`, `.mxfp4` table | Separates format selection from buffer binding | `0012` committed; 18 tests |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
@@ -329,6 +342,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | `0009` patch apply | `git apply` on `0001`-`0008` | Pass | CUDA width audit |
 | 2026-11-09 | `0010` patch apply | `git apply` on `0001`-`0009` | Pass | Per-expert fallback views |
 | 2026-11-09 | `0011` patch apply | `git apply` on `0001`-`0010` | Pass | MXFP8/MXFP4 reader |
+| 2026-11-09 | `0012` patch apply | `git apply` on `0001`-`0011` | Pass | Forward dispatch table |
+| 2026-11-09 | Dispatch table | `zig test` on `affine_dispatch.zig` | Pass | 18-test host suite |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -346,7 +361,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1k admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles for affine and MXFP8/MXFP4, audit CUDA widths, define per-expert fallback views, and read mixed tensors. The remaining affine work is the actual qlinear fallback loop and forward mapping; the affine path deliberately returns `AffineForwardNotPorted`.
+- Stage 1a-1l admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles for affine and MXFP8/MXFP4, audit CUDA widths, define per-expert fallback views, read mixed tensors, and build the forward dispatch table. The remaining affine work is buffer binding and kernel launch; the affine path deliberately returns `AffineForwardNotPorted`.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -357,7 +372,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Implement stage 1l: wire the `AffineN` fallback loop and affine linears into the forward.
-2. Implement stage 1m: one-layer forward harness; keep runtime verification deferred.
-3. Implement stage 1n: the Engram affine reader/converter.
+1. Implement stage 1m: bind the dispatch entries to device buffers and launch the one-layer affine path.
+2. Implement stage 1n: one-layer forward harness; keep runtime verification deferred.
+3. Implement stage 1o: the Engram affine reader/converter.
 4. At the end, build the container, run the one-layer reference, and record all results here.
