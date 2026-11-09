@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1b committed (affine layout parser); image build pending |
+| Overall status | Stage 1c committed (affine tensor reader); image build pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1b layout parser committed; loader wiring pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1c tensor reader committed; plan wiring pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -60,6 +60,21 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-09 - Stage 1c: affine tensor reader
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0003-dsv41-affine-tensor-reader.patch` with
+  `affine_load.zig`: reads `.weight`/`.scales`/`.biases` from the pack into named host
+  images, keeps U32/BF16 bytes unchanged, preserves the stacked expert axis, and validates
+  shapes through `affine.Layout`. `named.Kind` gained `u32` and `Named.deinit`.
+- **Approach used:** byte-preserving host reader; no dequantization, no expert split, no
+  device upload or kernel selection yet.
+- **Verification:** `0003` applies on top of `0001`+`0002`; `ast-check` passes for the new
+  files; `config.zig` and `affine.zig` unit tests still pass. The full engine build is
+  deferred.
+- **Artifacts:** `patches-mlx/0003-dsv41-affine-tensor-reader.patch`.
+- **Next:** stage 1d, wire the affine plan into `cuda_model`/`cuda_weights`.
 
 ### 2026-11-09 - Stage 1a fix: expert-count admission
 
@@ -178,7 +193,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | Base engine | Upstream `main` first, fork fallback | Upstream `main` at `26e1b074...` | Has affine readers and the dsv41 lane backend | Dockerfile targets it; build pending |
 | Config | Translate `omlx_deepseek_v41.quantized_modules` to canonical metadata | Direct canonical per-module keys inside `quantization`; non-affine modes emitted as `false` plus `non_affine_modules` | Reuses `qwen27/affine.zig` parser and keeps MXFP8/MXFP4 visible to the dsv41 patch | Synthetic fixture and published config pass (429 affine, 31 non-affine); `0001` config gate committed |
 | Affine layout | Validate packed U32 shapes before reading | Host-only `affine.zig` parser and shape checks | Starts the loader without touching CUDA kernels | `0002` committed; 2 unit tests pass |
-| Expert layout | Prefer native stacked gather; else load-time split | Inspector detects stacked `[192, ...]` tensors; loader not written | Target has one tensor per projection | Detection works on fixture |
+| Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
 | TP/world | World 1 serving path | Not started | - | - |
@@ -192,6 +207,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | Shell syntax | `bash -n scripts/mlx/run_container.sh` | Pass | Git Bash |
 | 2026-11-09 | `0001` patch apply | `git apply --check patches-mlx/0001-admit-omlx-affine.patch` | Pass | Against pinned `26e1b074` |
 | 2026-11-09 | `0002` patch apply | `git apply` in a fresh worktree with `0001` | Pass | Both patches apply |
+| 2026-11-09 | `0003` patch apply | `git apply` on `0001`+`0002` | Pass | New reader + `named`/`plan` hunks |
+| 2026-11-09 | Affine reader syntax | `zig ast-check` on changed files | Pass | 5 files |
 | 2026-11-09 | Affine parser/layout | `zig test` on `affine.zig` | Pass | 2 unit tests; Zig 0.17.0 |
 | 2026-11-09 | Config admission | `zig test` on `config.zig` | Pass | 8 tests; fixed affine expert-count path |
 | 2026-11-09 | Synthetic fixture | `inspect_checkpoint.py` + `translate_config.py` | Pass | 5 modules; stacked experts and Engram detected; missing w2/w3 intentional |
@@ -200,7 +217,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a+1b admit and validate affine metadata, but there is no tensor reader or kernel yet; boot still fails at plan/load.
+- Stage 1a+1b+1c admit metadata and read bytes, but there is no plan wiring or kernel yet; boot still fails at plan/load.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -211,7 +228,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Implement stage 1c: a raw affine tensor reader that emits U32/BF16 named images, plus the stacked-expert adapter (`patches-mlx/0003-stacked-experts.patch`).
-2. Implement stage 1d: wire the affine plan into `cuda_model`/`cuda_weights`, including 192-expert shapes and the single-rank admission path.
-3. Implement stage 1e: mixed MXFP8/MXFP4 DSpark loading (`0004`/`0005`).
+1. Implement stage 1d: wire the affine plan into `cuda_model`/`cuda_weights`, including 192-expert shapes and the single-rank admission path.
+2. Implement stage 1e: mixed MXFP8/MXFP4 DSpark loading (`0004`/`0005`).
+3. Implement stage 1f: one-layer forward wiring and a reference harness, without running the full verification yet.
 4. Defer engine build and runtime verification to the end; then build the container, run the one-layer reference, and record the result here.

@@ -1,0 +1,147 @@
+diff --git a/zig/src/families/deepseek_v41/affine_load.zig b/zig/src/families/deepseek_v41/affine_load.zig
+new file mode 100644
+index 0000000..2759490
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_load.zig
+@@ -0,0 +1,106 @@
++//! Read MLX affine projections from a dsv41 pack into named host images.
++//!
++//! This is the loader seam between `affine.zig`'s metadata/shape checks and the device upload.
++//! It keeps the packed U32 words and BF16 scales/biases byte-for-byte and does not dequantize
++//! or split the expert stack.
++
++const std = @import("std");
++const Io = std.Io;
++const Pack = @import("pack.zig").Pack;
++const Named = @import("named.zig").Named;
++const named = @import("named.zig");
++const affine = @import("affine.zig");
++
++pub const Images = struct {
++    weight: Named,
++    scales: Named,
++    biases: Named,
++
++    pub fn deinit(i: *Images, a: std.mem.Allocator) void {
++        i.weight.deinit(a);
++        i.scales.deinit(a);
++        i.biases.deinit(a);
++        i.* = undefined;
++    }
++};
++
++fn kindOf(dtype: @import("pack.zig").DType) !named.Kind {
++    return switch (dtype) {
++        .u32 => .u32,
++        .bf16 => .bf16,
++        .f16 => .f16,
++        .f32 => .f32,
++        else => error.UnexpectedTensor,
++    };
++}
++
++pub fn readNamed(a: std.mem.Allocator, io: Io, pack: *const Pack, name: []const u8) !Named {
++    const info = try pack.need(name);
++    const key = try a.dupe(u8, name);
++    errdefer a.free(key);
++    const len = std.math.cast(usize, info.nbytes) orelse return error.UnexpectedTensor;
++    const bytes = try a.alignedAlloc(u8, .@"16", len);
++    errdefer a.free(bytes);
++    try pack.read(io, info, .{ .offset = 0, .len = info.nbytes }, bytes);
++    var n: Named = .{
++        .name = key,
++        .kind = try kindOf(info.dtype),
++        .shape = @splat(1),
++        .rank = info.rank,
++        .bytes = bytes,
++    };
++    @memcpy(n.shape[0..info.rank], info.dims());
++    return n;
++}
++
++/// Read `base.weight`, `base.scales`, and `base.biases` and check their declared shapes.
++/// `base` is the module name (no `.weight` suffix).
++pub fn readModule(a: std.mem.Allocator, io: Io, pack: *const Pack, base: []const u8, layout: affine.Layout) !Images {
++    const wname = try std.fmt.allocPrint(a, "{s}.weight", .{base});
++    defer a.free(wname);
++    var images: Images = undefined;
++    images.weight = try readNamed(a, io, pack, wname);
++    errdefer images.weight.deinit(a);
++    const sname = try std.fmt.allocPrint(a, "{s}.scales", .{base});
++    defer a.free(sname);
++    images.scales = try readNamed(a, io, pack, sname);
++    errdefer images.scales.deinit(a);
++    const bname = try std.fmt.allocPrint(a, "{s}.biases", .{base});
++    defer a.free(bname);
++    images.biases = try readNamed(a, io, pack, bname);
++    errdefer images.biases.deinit(a);
++    if (images.weight.kind != .u32) return error.UnexpectedTensor;
++    if (images.scales.kind == .u32 or images.biases.kind == .u32) return error.UnexpectedTensor;
++    try layout.checkShape(
++        images.weight.shape[0..images.weight.rank],
++        images.scales.shape[0..images.scales.rank],
++        images.biases.shape[0..images.biases.rank],
++    );
++    return images;
++}
++
++test "a stacked affine projection reads its U32 words and BF16 metadata byte-for-byte" {
++    const a = std.testing.allocator;
++    const data = try @import("pack.zig").image(a, &.{
++        .{ .name = "m.weight", .dtype = "U32", .shape = &.{ 2, 3, 4 } },
++        .{ .name = "m.scales", .dtype = "BF16", .shape = &.{ 2, 3, 1 } },
++        .{ .name = "m.biases", .dtype = "BF16", .shape = &.{ 2, 3, 1 } },
++    });
++    defer a.free(data);
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = data });
++    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
++    defer a.free(dir);
++    var p = try Pack.open(a, std.testing.io, dir);
++    defer p.deinit();
++    const layout: affine.Layout = .{ .n = 3, .k = 64, .bits = 2, .group = 64 };
++    var images = try readModule(a, std.testing.io, &p, "m", layout);
++    defer images.deinit(a);
++    try std.testing.expectEqual(named.Kind.u32, images.weight.kind);
++    try std.testing.expectEqual(@as(u8, 3), images.weight.rank);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 4 }, images.weight.shape[0..3]);
++    try std.testing.expectEqual(@as(usize, 2 * 3 * 4 * 4), images.weight.bytes.len);
++    try std.testing.expectEqual(named.Kind.bf16, images.scales.kind);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 1 }, images.scales.shape[0..3]);
++}
+diff --git a/zig/src/families/deepseek_v41/named.zig b/zig/src/families/deepseek_v41/named.zig
+index 7732c76..cfb2f8b 100644
+--- a/zig/src/families/deepseek_v41/named.zig
++++ b/zig/src/families/deepseek_v41/named.zig
+@@ -9,7 +9,7 @@ const Pack = @import("pack.zig").Pack;
+ const DType = @import("pack.zig").DType;
+ const Io = std.Io;
+ 
+-pub const Kind = enum { f32, bf16, f16, i16 };
++pub const Kind = enum { f32, bf16, f16, i16, u32 };
+ 
+ /// One tensor the forward holds: its name (`L2.attn.wq_a.trellis`, `embed`), element kind, shape and bytes.
+ pub const Named = struct {
+@@ -18,6 +18,11 @@ pub const Named = struct {
+     shape: [4]usize,
+     rank: u8,
+     bytes: []align(16) u8,
++
++    pub fn deinit(n: *Named, a: std.mem.Allocator) void {
++        a.free(n.name);
++        a.free(n.bytes);
++    }
+ };
+ 
+ /// What a native tensor becomes (Loader.native and its callers).
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index ec77313..658db9a 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -397,4 +397,5 @@ test "CUDA rank planning selects EXL3 over a kept dense sibling from headers alo
+ 
+ test {
+     _ = @import("affine.zig");
++    _ = @import("affine_load.zig");
+ }
