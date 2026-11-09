@@ -1,0 +1,241 @@
+diff --git a/zig/src/families/deepseek_v41/affine.zig b/zig/src/families/deepseek_v41/affine.zig
+index 8844688..1866ec7 100644
+--- a/zig/src/families/deepseek_v41/affine.zig
++++ b/zig/src/families/deepseek_v41/affine.zig
+@@ -77,6 +77,7 @@ pub const Formats = struct {
+     quant: ?std.json.ObjectMap,
+     non_affine: ?std.json.ObjectMap,
+     global: ?Spec,
++    dense_by_default: bool = false,
+ 
+     pub fn init(gpa: std.mem.Allocator, json: []const u8) !Formats {
+         const p = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+@@ -93,11 +94,16 @@ pub const Formats = struct {
+                 if (v != .object) return error.BadAffine;
+                 break :blk v.object;
+             } else null;
++            const dense = if (o.get("dense_by_default")) |v| switch (v) {
++                .bool => |b| b,
++                else => return error.BadConfig,
++            } else false;
+             return .{
+                 .parsed = p,
+                 .quant = o,
+                 .non_affine = non,
+                 .global = try spec(o, null),
++                .dense_by_default = dense,
+             };
+         }
+         return .{ .parsed = p, .quant = null, .non_affine = null, .global = null };
+@@ -132,7 +138,7 @@ pub const Formats = struct {
+             found = own;
+             matched = true;
+         }
+-        return if (matched) found else f.global;
++        return if (matched) found else if (f.dense_by_default) null else f.global;
+     }
+ };
+ 
+@@ -191,7 +197,7 @@ test "the published 2-bit expert and 6/8-bit layouts pass; a wrong packed width
+ 
+ test "translated affine metadata resolves per module and keeps MXFP8/MXFP4 separate" {
+     const json =
+-        \\{"text_config":{"quantization":{"quant_method":"affine","bits":4,"group_size":64,
++        \\{"text_config":{"quantization":{"quant_method":"affine","bits":4,"group_size":64,"dense_by_default":true,
+         \\"layers.0.ffn.experts.w1":{"bits":2,"group_size":64,"mode":"affine"},
+         \\"layers.0.attn.wkv":{"bits":8,"group_size":64,"mode":"affine"},
+         \\"layers.0.attn.wo_a":false,
+@@ -203,6 +209,7 @@ test "translated affine metadata resolves per module and keeps MXFP8/MXFP4 separ
+     try std.testing.expectEqual(Spec{ .bits = 2, .group = 64 }, (try f.resolve("language_model.layers.0.ffn.experts.w1")).?);
+     try std.testing.expectEqual(Spec{ .bits = 8, .group = 64 }, (try f.resolve("language_model.layers.0.attn.wkv.weight")).?);
+     try std.testing.expectEqual(@as(?Spec, null), try f.resolve("layers.0.attn.wo_a"));
++    try std.testing.expectEqual(@as(?Spec, null), try f.resolve("layers.0.ffn.gate"));
+     try std.testing.expectEqual(Spec{ .bits = 8, .mode = .mxfp8 }, (try f.resolve("mtp.0.attn.wkv")).?);
+     try std.testing.expectEqual(Spec{ .bits = 4, .mode = .mxfp4 }, (try f.resolve("mtp.0.ffn.experts.w1")).?);
+ }
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+new file mode 100644
+index 0000000..245caf9
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -0,0 +1,170 @@
++//! Enumerate the affine projections of a dsv41 checkpoint from headers and the translated map.
++//!
++//! The plan is host-only: it names each module, resolves its affine spec, and records the
++//! packed layout. It does not read payload bytes, choose kernels, or split expert stacks.
++
++const std = @import("std");
++const Config = @import("config.zig").Config;
++const Pack = @import("pack.zig").Pack;
++const names = @import("names.zig");
++const affine = @import("affine.zig");
++
++pub const Kind = enum { linear, expert };
++
++pub const Module = struct {
++    kind: Kind,
++    /// Canonical module name, e.g. `layers.0.attn.wq_a` or `layers.0.ffn.experts.w1`.
++    name: []const u8,
++    spec: affine.Spec,
++    layout: affine.Layout,
++};
++
++pub const Reason = enum { dense, non_affine, engram };
++
++pub const Skipped = struct {
++    name: []const u8,
++    reason: Reason,
++};
++
++pub const Layer = struct {
++    index: u32,
++    prefix: []const u8,
++    modules: []Module,
++};
++
++pub const Plan = struct {
++    arena: std.heap.ArenaAllocator,
++    layers: []Layer,
++    skipped: []Skipped,
++
++    pub fn deinit(p: *Plan) void {
++        p.arena.deinit();
++        p.* = undefined;
++    }
++};
++
++pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, formats: *const affine.Formats) !Plan {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    const layers = try a.alloc(Layer, cfg.allLayers());
++    var skipped: std.ArrayList(Skipped) = .empty;
++    var name_buf: [160]u8 = undefined;
++    var prefix_buf: [32]u8 = undefined;
++    for (layers, 0..) |*layer, i| {
++        const prefix = try a.dupe(u8, try names.blockPrefix(cfg, @intCast(i), &prefix_buf));
++        const has_shared = pack.has(try std.fmt.bufPrint(&name_buf, "{s}.ffn.shared_experts.w1.weight", .{prefix}));
++        var modules: std.ArrayList(Module) = .empty;
++        const releases = try names.releaseBlocks(cfg, @intCast(i), has_shared);
++        for (releases.items()) |r| {
++            if (r.proj == .engram_embed) {
++                try skipped.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, r.suffix }), .reason = .engram });
++                continue;
++            }
++            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, r.suffix });
++            const spec = try formats.resolve(name);
++            if (spec == null) {
++                try skipped.append(a, .{ .name = name, .reason = .dense });
++                continue;
++            }
++            if (spec.?.mode != .affine) {
++                try skipped.append(a, .{ .name = name, .reason = .non_affine });
++                continue;
++            }
++            if (r.k == 0 or r.n == 0) {
++                try skipped.append(a, .{ .name = name, .reason = .dense });
++                continue;
++            }
++            try modules.append(a, .{
++                .kind = .linear,
++                .name = name,
++                .spec = spec.?,
++                .layout = try spec.?.layout(r.n, r.k),
++            });
++        }
++        for ([_]names.ExpertProj{ .w1, .w2, .w3 }) |p| {
++            const name = try std.fmt.allocPrint(a, "{s}.ffn.experts.{t}", .{ prefix, p });
++            const spec = try formats.resolve(name);
++            if (spec == null) {
++                try skipped.append(a, .{ .name = name, .reason = .dense });
++                continue;
++            }
++            if (spec.?.mode != .affine) {
++                try skipped.append(a, .{ .name = name, .reason = .non_affine });
++                continue;
++            }
++            const kn = names.ExpertProj.kn(p, cfg);
++            try modules.append(a, .{
++                .kind = .expert,
++                .name = name,
++                .spec = spec.?,
++                .layout = try spec.?.layout(kn[1], kn[0]),
++            });
++        }
++        layer.* = .{ .index = @intCast(i), .prefix = prefix, .modules = try modules.toOwnedSlice(a) };
++    }
++    return .{ .arena = arena, .layers = layers, .skipped = try skipped.toOwnedSlice(a) };
++}
++
++test "one tiny layer plans four linears and three expert stacks; wo_a is dense" {
++    const a = std.testing.allocator;
++    var cfg = @import("config.zig").tiny();
++    cfg.layers = 1;
++    cfg.mtp_layers = 0;
++    cfg.q_lora = 64;
++    cfg.compress_ratios = @import("config.zig").Ids.of(&.{0});
++    cfg.kv_sources = .{};
++    cfg.index_sources = .{};
++    cfg.engram_layers = .{};
++    cfg.engram_rows = @import("config.zig").List(u64, 8).of(&.{});
++    const json =
++        \\{"quantization":{"quant_method":"affine","bits":4,"group_size":64,"dense_by_default":true,
++        \\"layers.0.attn.wq_a":{"bits":8,"group_size":64},
++        \\"layers.0.attn.wkv":{"bits":8,"group_size":64},
++        \\"layers.0.attn.wq_b":{"bits":6,"group_size":64},
++        \\"layers.0.attn.wo_b":{"bits":6,"group_size":64},
++        \\"layers.0.ffn.experts.w1":{"bits":2,"group_size":64},
++        \\"layers.0.ffn.experts.w2":{"bits":2,"group_size":64},
++        \\"layers.0.ffn.experts.w3":{"bits":2,"group_size":64}}}
++    ;
++    var formats = try affine.Formats.init(a, json);
++    defer formats.deinit();
++    const image = try @import("pack.zig").headerOnly(a, &.{
++        .{ .name = "layers.0.attn.wq_a.weight", .dtype = "U32", .shape = &.{ 64, 64 } },
++        .{ .name = "layers.0.attn.wq_a.scales", .dtype = "BF16", .shape = &.{ 64, 4 } },
++        .{ .name = "layers.0.attn.wq_a.biases", .dtype = "BF16", .shape = &.{ 64, 4 } },
++        .{ .name = "layers.0.attn.wkv.weight", .dtype = "U32", .shape = &.{ 64, 64 } },
++        .{ .name = "layers.0.attn.wkv.scales", .dtype = "BF16", .shape = &.{ 64, 4 } },
++        .{ .name = "layers.0.attn.wkv.biases", .dtype = "BF16", .shape = &.{ 64, 4 } },
++        .{ .name = "layers.0.attn.wq_b.weight", .dtype = "U32", .shape = &.{ 256, 12 } },
++        .{ .name = "layers.0.attn.wq_b.scales", .dtype = "BF16", .shape = &.{ 256, 1 } },
++        .{ .name = "layers.0.attn.wq_b.biases", .dtype = "BF16", .shape = &.{ 256, 1 } },
++        .{ .name = "layers.0.attn.wo_b.weight", .dtype = "U32", .shape = &.{ 256, 48 } },
++        .{ .name = "layers.0.attn.wo_b.scales", .dtype = "BF16", .shape = &.{ 256, 4 } },
++        .{ .name = "layers.0.attn.wo_b.biases", .dtype = "BF16", .shape = &.{ 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w1.weight", .dtype = "U32", .shape = &.{ 8, 256, 16 } },
++        .{ .name = "layers.0.ffn.experts.w1.scales", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w1.biases", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w2.weight", .dtype = "U32", .shape = &.{ 8, 256, 16 } },
++        .{ .name = "layers.0.ffn.experts.w2.scales", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w2.biases", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w3.weight", .dtype = "U32", .shape = &.{ 8, 256, 16 } },
++        .{ .name = "layers.0.ffn.experts.w3.scales", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++        .{ .name = "layers.0.ffn.experts.w3.biases", .dtype = "BF16", .shape = &.{ 8, 256, 4 } },
++    });
++    defer a.free(image);
++    var p = Pack.init(a);
++    defer p.deinit();
++    try p.addHeaderDump("model.safetensors", image);
++    var plan = try build(a, &cfg, &p, &formats);
++    defer plan.deinit();
++    try std.testing.expectEqual(@as(usize, 1), plan.layers.len);
++    try std.testing.expectEqual(@as(usize, 7), plan.layers[0].modules.len);
++    var dense = false;
++    for (plan.skipped) |s| {
++        if (std.mem.eql(u8, s.name, "layers.0.attn.wo_a") and s.reason == .dense) {
++            dense = true;
++        }
++    }
++    try std.testing.expect(dense);
++}
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 658db9a..7de3844 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -398,4 +398,5 @@ test "CUDA rank planning selects EXL3 over a kept dense sibling from headers alo
+ test {
+     _ = @import("affine.zig");
+     _ = @import("affine_load.zig");
++    _ = @import("affine_plan.zig");
+ }
