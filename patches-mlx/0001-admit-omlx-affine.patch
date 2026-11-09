@@ -1,0 +1,82 @@
+diff --git a/zig/src/families/deepseek_v41/config.zig b/zig/src/families/deepseek_v41/config.zig
+index 71aefd8..a3a10ca 100644
+--- a/zig/src/families/deepseek_v41/config.zig
++++ b/zig/src/families/deepseek_v41/config.zig
+@@ -47,8 +47,9 @@ pub const Rope = struct {
+ /// The attention a layer runs: sliding window only, KV source + indexer, own indexer on a source's keys, or reuse.
+ pub const Mode = enum { swa, full, reindex, reuse };
+ 
+-/// How the checkpoint stores its weights: the EXL3 trellises or the release's own FP8 blocks and MXFP4 experts.
+-pub const Format = enum { exl3, release_fp8 };
++/// How the checkpoint stores its weights: the EXL3 trellises, the release's own FP8 blocks and
++/// MXFP4 experts, or MLX affine packed words with scales and biases.
++pub const Format = enum { exl3, release_fp8, affine };
+ 
+ pub const Config = struct {
+     /// how the checkpoint stores its weights; the release's own format is admitted beside the EXL3 trellises
+@@ -230,6 +231,8 @@ pub const Config = struct {
+         try c.validate();
+         const release: Config = .{};
+         inline for (.{ "vocab", "hidden", "layers", "heads", "head_dim", "rope_dim", "q_lora", "o_lora", "o_groups", "window", "experts", "shared_experts", "topk", "expert_width", "routed_scale", "norm_topk", "swiglu_limit", "index_heads", "index_dim", "index_topk", "candidate_source", "candidate_blocks", "candidate_block_size", "hc_mult", "hc_sinkhorn_iters", "hc_post_alpha", "engram_max_ngram", "engram_vocab", "engram_heads", "engram_head_dim", "engram_pad", "engram_compressed_vocab", "mtp_layers", "dspark_block", "dspark_noise_token", "dspark_markov_rank", "dspark_experts", "dspark_topk", "bos", "eos" }) |name| {
++            // A pruned affine pack keeps the release's geometry but may select fewer routed experts.
++            if (c.format == .affine and std.mem.eql(u8, name, "experts")) continue;
+             if (@field(c.*, name) != @field(release, name)) return error.UnsupportedArchitecture;
+         }
+         inline for (.{ "compress_ratios", "kv_sources", "index_sources", "engram_layers", "dspark_targets" }) |name| {
+@@ -468,6 +471,10 @@ fn requireFormat(top: std.json.ObjectMap) !Format {
+         return .exl3;
+     }
+     if (std.mem.eql(u8, method.string, "fp8")) return requireReleaseFp8(quant.object);
++    if (std.mem.eql(u8, method.string, "affine")) {
++        try requireAffine(quant.object);
++        return .affine;
++    }
+     return error.UnsupportedCheckpoint;
+ }
+ 
+@@ -493,6 +500,32 @@ fn requireMetadata(top: std.json.ObjectMap, text: std.json.ObjectMap) !void {
+     if (kind != .string or !std.mem.eql(u8, kind.string, "yarn")) return error.UnsupportedArchitecture;
+ }
+ 
++/// A translated omlx map: a global affine fallback and per-module overrides, with non-affine
++/// DSpark modules listed separately (MXFP8 and MXFP4).
++fn requireAffine(quant: std.json.ObjectMap) !void {
++    const bits = quant.get("bits") orelse return error.MissingField;
++    const group = quant.get("group_size") orelse return error.MissingField;
++    const b = unsigned(u64, bits) catch return error.BadConfig;
++    const g = unsigned(u64, group) catch return error.BadConfig;
++    if (std.mem.indexOfScalar(u64, &.{ 2, 3, 4, 5, 6, 8 }, b) == null) return error.BadConfig;
++    if (std.mem.indexOfScalar(u64, &.{ 32, 64, 128 }, g) == null) return error.BadConfig;
++    if (quant.get("mode")) |mode| {
++        if (mode != .string or !std.mem.eql(u8, mode.string, "affine")) return error.BadConfig;
++    }
++    if (quant.get("non_affine_modules")) |v| {
++        if (v != .object) return error.BadConfig;
++        var it = v.object.iterator();
++        while (it.next()) |entry| {
++            const spec = entry.value_ptr.*;
++            if (spec != .object) return error.BadConfig;
++            const mode = spec.object.get("mode") orelse return error.BadConfig;
++            if (mode != .string or
++                !(std.mem.eql(u8, mode.string, "mxfp8") or std.mem.eql(u8, mode.string, "mxfp4")))
++                return error.BadConfig;
++        }
++    }
++}
++
+ /// The release's own format: FP8 weights in 32x32 blocks with E8M0 scales, the routed experts in MXFP4.
+ fn requireReleaseFp8(quant: std.json.ObjectMap) !Format {
+     const block = quant.get("weight_block_size") orelse return error.UnsupportedCheckpoint;
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 0ec70ee..c1098ce 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -22,7 +22,7 @@ const serve_line = @import("serve_line.zig");
+ const round_graph = @import("round_graph.zig");
+ 
+ pub const backends: []const []const u8 = &.{"cuda"};
+-pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"}, .raw_text = false }};
++pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{ "exl3", "affine" }, .raw_text = false }};
+ 
+ pub fn chip(_: Allocator) ?[]const u8 {
+     return null;

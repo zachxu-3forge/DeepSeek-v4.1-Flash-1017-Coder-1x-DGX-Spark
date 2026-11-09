@@ -12,6 +12,8 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0005-dsv41-world1.patch` | Admit and run the single-rank serving path |
 | `0006-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
+Implemented: `0001-admit-omlx-affine.patch` (config gate and server family list). `0002`-`0006` are planned.
+
 Rules:
 
 - One logical change per patch; apply cleanly with `git apply --check`.
