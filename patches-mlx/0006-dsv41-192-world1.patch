@@ -1,0 +1,57 @@
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index 245caf9..8bf8137 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -106,6 +106,38 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+     return .{ .arena = arena, .layers = layers, .skipped = try skipped.toOwnedSlice(a) };
+ }
+ 
++test "a 192-expert layer plans three expert stacks without loading headers" {
++    const a = std.testing.allocator;
++    var cfg = @import("config.zig").tiny();
++    cfg.layers = 1;
++    cfg.mtp_layers = 0;
++    cfg.experts = 192;
++    cfg.q_lora = 64;
++    cfg.compress_ratios = @import("config.zig").Ids.of(&.{0});
++    cfg.kv_sources = .{};
++    cfg.index_sources = .{};
++    cfg.engram_layers = .{};
++    cfg.engram_rows = @import("config.zig").List(u64, 8).of(&.{});
++    const json =
++        \\{"quantization":{"quant_method":"affine","bits":4,"group_size":64,"dense_by_default":true,
++        \\"layers.0.ffn.experts.w1":{"bits":2,"group_size":64},
++        \\"layers.0.ffn.experts.w2":{"bits":2,"group_size":64},
++        \\"layers.0.ffn.experts.w3":{"bits":2,"group_size":64}}}
++    ;
++    var formats = try affine.Formats.init(a, json);
++    defer formats.deinit();
++    var p = Pack.init(a);
++    defer p.deinit();
++    var plan = try build(a, &cfg, &p, &formats);
++    defer plan.deinit();
++    try std.testing.expectEqual(@as(usize, 3), plan.layers[0].modules.len);
++    for (plan.layers[0].modules) |m| {
++        try std.testing.expectEqual(Kind.expert, m.kind);
++        try std.testing.expectEqual(@as(u32, 256), m.layout.n);
++        try std.testing.expectEqual(@as(u32, 256), m.layout.k);
++    }
++}
++
+ test "one tiny layer plans four linears and three expert stacks; wo_a is dense" {
+     const a = std.testing.allocator;
+     var cfg = @import("config.zig").tiny();
+diff --git a/zig/src/families/deepseek_v41/block_admission.zig b/zig/src/families/deepseek_v41/block_admission.zig
+index 67b68d8..db6401e 100644
+--- a/zig/src/families/deepseek_v41/block_admission.zig
++++ b/zig/src/families/deepseek_v41/block_admission.zig
+@@ -53,3 +53,9 @@ pub fn view(shape: []const i64, stride: []const i64, offset: i64, bytes: u64) !v
+     const size = std.math.mul(u64, count, bytes) catch return error.InvalidBlock;
+     _ = std.math.add(u64, @intCast(offset), size) catch return error.InvalidBlock;
+ }
++
++test "a single rank admits serving and native prefill" {
++    const c: Config = .{};
++    try serving(&c, 1);
++    try nativePrefill(&c, 1);
++}

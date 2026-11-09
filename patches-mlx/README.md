@@ -15,7 +15,7 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0008-dsv41-mixed-dspark.patch` | Load the DSpark MXFP8 and MXFP4 modules |
 | `0009-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001`-`0005`. Planned: `0006`-`0009`.
+Implemented: `0001`-`0006`. Planned: `0007`-`0009`.
 
 Rules:
 
