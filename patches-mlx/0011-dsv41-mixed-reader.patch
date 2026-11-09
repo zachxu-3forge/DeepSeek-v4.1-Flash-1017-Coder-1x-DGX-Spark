@@ -1,0 +1,238 @@
+diff --git a/zig/src/families/deepseek_v41/affine_load.zig b/zig/src/families/deepseek_v41/affine_load.zig
+index 3a7e905..5e91015 100644
+--- a/zig/src/families/deepseek_v41/affine_load.zig
++++ b/zig/src/families/deepseek_v41/affine_load.zig
+@@ -27,6 +27,7 @@ pub const Images = struct {
+ fn kindOf(dtype: @import("pack.zig").DType) !named.Kind {
+     return switch (dtype) {
+         .u32 => .u32,
++        .u8 => .u8,
+         .bf16 => .bf16,
+         .f16 => .f16,
+         .f32 => .f32,
+diff --git a/zig/src/families/deepseek_v41/mixed.zig b/zig/src/families/deepseek_v41/mixed.zig
+new file mode 100644
+index 0000000..b08f94d
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/mixed.zig
+@@ -0,0 +1,122 @@
++//! MXFP8/MXFP4 DSpark modules: MLX's little-endian code stream at 8 or 4 bits,
++//! with one E8M0 scale every 32 inputs and no bias.
++//!
++//! The target's `mtp.*` modules use this layout: `U32 [.., N, K*bits/32]` words and
++//! `U8 [.., N, K/32]` scales. This is a host reference and shape check, not a kernel.
++
++const std = @import("std");
++const ref = @import("affine_ref.zig");
++
++pub const Spec = struct {
++    bits: u8,
++    group: u32 = 32,
++};
++
++pub const Layout = struct {
++    n: u32,
++    k: u32,
++    bits: u8,
++    group: u32 = 32,
++
++    pub fn packedK(l: Layout) !u32 {
++        const bits = std.math.mul(u64, l.k, l.bits) catch return error.BadMixed;
++        if (bits % 32 != 0) return error.BadMixed;
++        return std.math.cast(u32, bits / 32) orelse error.BadMixed;
++    }
++
++    pub fn groups(l: Layout) !u32 {
++        if (l.group != 32 or l.k % l.group != 0) return error.BadMixed;
++        return std.math.cast(u32, l.k / l.group) orelse error.BadMixed;
++    }
++
++    /// `weight` is `[N, packed]` or `[E, N, packed]`; `scales` has the same rank and
++    /// `[.., N, groups]`.
++    pub fn check(l: Layout, weight: []const usize, scales: []const usize) !void {
++        try checkOne(l, weight, try l.packedK());
++        try checkOne(l, scales, try l.groups());
++        if (weight.len != scales.len) return error.BadMixed;
++        if (weight.len == 3 and weight[0] != scales[0]) return error.BadMixed;
++    }
++
++    fn checkOne(l: Layout, shape: []const usize, want: u32) !void {
++        if (shape.len != 2 and shape.len != 3) return error.BadMixed;
++        if (shape[shape.len - 2] != l.n) return error.BadMixed;
++        if (shape[shape.len - 1] != want) return error.BadMixed;
++        if (shape.len == 3 and shape[0] == 0) return error.BadMixed;
++    }
++};
++
++/// E8M0: exponent-only scale, bias 127; 0 is 2^-127 and 255 is NaN.
++pub fn e8m0(byte: u8) f32 {
++    if (byte == 0) return 0x1p-127;
++    if (byte == 0xff) return std.math.nan(f32);
++    return @bitCast(@as(u32, byte) << 23);
++}
++
++/// Dequantize one row at `bits` (8 or 4), group 32, without a bias.
++pub fn dequantizeRow(words: []const u32, scales: []const u8, bits: u8, out: []f32) !void {
++    if (bits != 4 and bits != 8) return error.BadMixed;
++    if (out.len == 0 or out.len % 32 != 0) return error.BadMixed;
++    const groups = out.len / 32;
++    if (scales.len != groups) return error.BadMixed;
++    if (words.len != out.len * bits / 32) return error.BadMixed;
++    const m: u64 = (@as(u64, 1) << @intCast(bits)) - 1;
++    for (out, 0..) |*y, i| {
++        const q = try ref.codeAt(words, i * bits) & m;
++        y.* = @as(f32, @floatFromInt(q)) * e8m0(scales[i / 32]);
++    }
++}
++
++pub fn dotRow(words: []const u32, scales: []const u8, bits: u8, x: []const f32) !f32 {
++    if (bits != 4 and bits != 8) return error.BadMixed;
++    if (x.len == 0 or x.len % 32 != 0) return error.BadMixed;
++    const groups = x.len / 32;
++    if (scales.len != groups) return error.BadMixed;
++    if (words.len != x.len * bits / 32) return error.BadMixed;
++    const m: u64 = (@as(u64, 1) << @intCast(bits)) - 1;
++    var y: f32 = 0;
++    for (x, 0..) |v, i| {
++        const q = try ref.codeAt(words, i * bits) & m;
++        y += @as(f32, @floatFromInt(q)) * e8m0(scales[i / 32]) * v;
++    }
++    return y;
++}
++
++const testing = std.testing;
++
++fn setCode(words: []u32, i: usize, bits: u8, code: u32) void {
++    for (0..bits) |b| {
++        if ((code >> @intCast(b)) & 1 != 0) {
++            const at = i * bits + b;
++            words[at / 32] |= @as(u32, 1) << @intCast(at % 32);
++        }
++    }
++}
++
++test "MXFP8 uses one E8M0 scale every 32 inputs" {
++    var words: [16]u32 = @splat(0); // 64 * 8 / 32
++    setCode(&words, 0, 8, 200);
++    setCode(&words, 32, 8, 100);
++    const scales = [_]u8{ 127, 128 }; // 1.0, 2.0
++    var out: [64]f32 = undefined;
++    try dequantizeRow(&words, &scales, 8, &out);
++    try testing.expectEqual(@as(f32, 200), out[0]);
++    try testing.expectEqual(@as(f32, 200), out[32]);
++}
++
++test "MXFP4 packed codes share the same scale grid" {
++    var words: [8]u32 = @splat(0); // 64 * 4 / 32
++    setCode(&words, 0, 4, 3);
++    setCode(&words, 63, 4, 7);
++    const scales = [_]u8{ 127, 128 };
++    var out: [64]f32 = undefined;
++    try dequantizeRow(&words, &scales, 4, &out);
++    try testing.expectEqual(@as(f32, 3), out[0]);
++    try testing.expectEqual(@as(f32, 14), out[63]);
++}
++
++test "mixed layouts check stacked expert shapes" {
++    const l: Layout = .{ .n = 2304, .k = 5120, .bits = 4 };
++    try l.check(&.{ 128, 2304, 640 }, &.{ 128, 2304, 160 });
++    try testing.expectError(error.BadMixed, l.check(&.{ 128, 2304, 639 }, &.{ 128, 2304, 160 }));
++}
+diff --git a/zig/src/families/deepseek_v41/mixed_load.zig b/zig/src/families/deepseek_v41/mixed_load.zig
+new file mode 100644
+index 0000000..cd0dc6f
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/mixed_load.zig
+@@ -0,0 +1,68 @@
++//! Read MXFP8/MXFP4 DSpark projections from a dsv41 pack: U32 code words and U8 E8M0
++//! scales, no biases. Byte-preserving host images for the later mixed-format path.
++
++const std = @import("std");
++const Io = std.Io;
++const Pack = @import("pack.zig").Pack;
++const Named = @import("named.zig").Named;
++const named = @import("named.zig");
++const mixed = @import("mixed.zig");
++const affine_load = @import("affine_load.zig");
++
++pub const Images = struct {
++    weight: Named,
++    scales: Named,
++
++    pub fn deinit(i: *Images, a: std.mem.Allocator) void {
++        i.weight.deinit(a);
++        i.scales.deinit(a);
++        i.* = undefined;
++    }
++};
++
++pub fn checkModule(pack: *const Pack, base: []const u8, layout: mixed.Layout) !void {
++    var buf: [256]u8 = undefined;
++    const weight = try pack.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
++    const scales = try pack.need(try std.fmt.bufPrint(&buf, "{s}.scales", .{base}));
++    if (weight.dtype != .u32 or scales.dtype != .u8) return error.UnexpectedTensor;
++    try layout.check(weight.dims(), scales.dims());
++}
++
++pub fn readModule(a: std.mem.Allocator, io: Io, pack: *const Pack, base: []const u8, layout: mixed.Layout) !Images {
++    try checkModule(pack, base, layout);
++    const wname = try std.fmt.allocPrint(a, "{s}.weight", .{base});
++    defer a.free(wname);
++    var images: Images = undefined;
++    images.weight = try affine_load.readNamed(a, io, pack, wname);
++    errdefer images.weight.deinit(a);
++    const sname = try std.fmt.allocPrint(a, "{s}.scales", .{base});
++    defer a.free(sname);
++    images.scales = try affine_load.readNamed(a, io, pack, sname);
++    errdefer images.scales.deinit(a);
++    if (images.weight.kind != .u32 or images.scales.kind != .u8) return error.UnexpectedTensor;
++    return images;
++}
++
++test "an MXFP4 stack reads U32 words and U8 E8M0 scales" {
++    const a = std.testing.allocator;
++    const data = try @import("pack.zig").image(a, &.{
++        .{ .name = "m.weight", .dtype = "U32", .shape = &.{ 2, 3, 16 } },
++        .{ .name = "m.scales", .dtype = "U8", .shape = &.{ 2, 3, 4 } },
++    });
++    defer a.free(data);
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = data });
++    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
++    defer a.free(dir);
++    var p = try Pack.open(a, std.testing.io, dir);
++    defer p.deinit();
++    const layout: mixed.Layout = .{ .n = 3, .k = 128, .bits = 4 };
++    var images = try readModule(a, std.testing.io, &p, "m", layout);
++    defer images.deinit(a);
++    try std.testing.expectEqual(named.Kind.u32, images.weight.kind);
++    try std.testing.expectEqual(@as(u8, 3), images.weight.rank);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 16 }, images.weight.shape[0..3]);
++    try std.testing.expectEqual(named.Kind.u8, images.scales.kind);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 4 }, images.scales.shape[0..3]);
++}
+diff --git a/zig/src/families/deepseek_v41/named.zig b/zig/src/families/deepseek_v41/named.zig
+index cfb2f8b..0ea1588 100644
+--- a/zig/src/families/deepseek_v41/named.zig
++++ b/zig/src/families/deepseek_v41/named.zig
+@@ -9,7 +9,7 @@ const Pack = @import("pack.zig").Pack;
+ const DType = @import("pack.zig").DType;
+ const Io = std.Io;
+ 
+-pub const Kind = enum { f32, bf16, f16, i16, u32 };
++pub const Kind = enum { f32, bf16, f16, i16, u32, u8 };
+ 
+ /// One tensor the forward holds: its name (`L2.attn.wq_a.trellis`, `embed`), element kind, shape and bytes.
+ pub const Named = struct {
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 55b9d4b..76aebe1 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -401,4 +401,6 @@ test {
+     _ = @import("affine_plan.zig");
+     _ = @import("affine_ref.zig");
+     _ = @import("affine_cuda.zig");
++    _ = @import("mixed.zig");
++    _ = @import("mixed_load.zig");
+ }
