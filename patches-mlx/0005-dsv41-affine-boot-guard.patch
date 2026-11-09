@@ -1,0 +1,54 @@
+diff --git a/zig/src/families/deepseek_v41/affine_load.zig b/zig/src/families/deepseek_v41/affine_load.zig
+index 2759490..3a7e905 100644
+--- a/zig/src/families/deepseek_v41/affine_load.zig
++++ b/zig/src/families/deepseek_v41/affine_load.zig
+@@ -53,9 +53,20 @@ pub fn readNamed(a: std.mem.Allocator, io: Io, pack: *const Pack, name: []const
+     return n;
+ }
+ 
++/// Check `base.weight`, `base.scales`, and `base.biases` headers without reading payload bytes.
++pub fn checkModule(pack: *const Pack, base: []const u8, layout: affine.Layout) !void {
++    var buf: [256]u8 = undefined;
++    const weight = try pack.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
++    const scales = try pack.need(try std.fmt.bufPrint(&buf, "{s}.scales", .{base}));
++    const biases = try pack.need(try std.fmt.bufPrint(&buf, "{s}.biases", .{base}));
++    if (weight.dtype != .u32 or scales.dtype == .u32 or biases.dtype == .u32) return error.UnexpectedTensor;
++    try layout.checkShape(weight.dims(), scales.dims(), biases.dims());
++}
++
+ /// Read `base.weight`, `base.scales`, and `base.biases` and check their declared shapes.
+ /// `base` is the module name (no `.weight` suffix).
+ pub fn readModule(a: std.mem.Allocator, io: Io, pack: *const Pack, base: []const u8, layout: affine.Layout) !Images {
++    try checkModule(pack, base, layout);
+     const wname = try std.fmt.allocPrint(a, "{s}.weight", .{base});
+     defer a.free(wname);
+     var images: Images = undefined;
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index e4304af..fcce9c4 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -229,6 +229,24 @@ pub const Model = struct {
+         try @import("block_admission.zig").serving(&m.cfg, world);
+         if (o.own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
+         m.pack = try Pack.open(gpa, io, pack_dir);
++        if (m.cfg.format == .affine) {
++            const cfg_path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
++            const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
++            defer gpa.free(cfg_text);
++            var formats = try @import("affine.zig").Formats.init(gpa, cfg_text);
++            defer formats.deinit();
++            var ap = try @import("affine_plan.zig").build(gpa, &m.cfg, &m.pack, &formats);
++            defer ap.deinit();
++            var modules: usize = 0;
++            for (ap.layers) |layer| {
++                for (layer.modules) |mod| {
++                    try @import("affine_load.zig").checkModule(&m.pack, mod.name, mod.layout);
++                    modules += 1;
++                }
++            }
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} skipped; forward not ported yet", .{ ap.layers.len, modules, ap.skipped.len });
++            return error.AffineForwardNotPorted;
++        }
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+             const all = try a.alloc(u32, m.cfg.layers);
+             for (all, 0..) |*l, i| l.* = @intCast(i);

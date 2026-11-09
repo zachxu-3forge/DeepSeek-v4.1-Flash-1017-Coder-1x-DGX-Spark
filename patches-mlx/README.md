@@ -9,12 +9,13 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0002-dsv41-affine-layout.patch` | Resolve translated affine metadata and validate packed U32/scales/biases shapes (host-only) |
 | `0003-dsv41-affine-tensor-reader.patch` | Read U32/BF16 named images, preserve stacked experts, and keep the whole `wo_a` |
 | `0004-dsv41-affine-plan.patch` | Enumerate affine linears and expert stacks from headers; default unlisted modules to dense |
-| `0005-dsv41-192-experts.patch` | Make expert count, top-k, and DSpark expert counts data-driven |
-| `0006-dsv41-world1.patch` | Admit and run the single-rank serving path |
-| `0007-dsv41-mixed-dspark.patch` | Load the DSpark MXFP8 and MXFP4 modules |
-| `0008-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
+| `0005-dsv41-affine-boot-guard.patch` | Build and validate the affine plan at boot; return `AffineForwardNotPorted` before the EXL3 path |
+| `0006-dsv41-192-experts.patch` | Make expert count, top-k, and DSpark expert counts data-driven |
+| `0007-dsv41-world1.patch` | Admit and run the single-rank serving path |
+| `0008-dsv41-mixed-dspark.patch` | Load the DSpark MXFP8 and MXFP4 modules |
+| `0009-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001`-`0004`. Planned: `0005`-`0008`.
+Implemented: `0001`-`0005`. Planned: `0006`-`0009`.
 
 Rules:
 
