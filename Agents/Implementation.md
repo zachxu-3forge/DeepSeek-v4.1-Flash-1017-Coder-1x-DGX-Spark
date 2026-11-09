@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1f committed (192-expert plan + world-1 admission); image build pending |
+| Overall status | Stage 1g committed (mixed DSpark planning); image build pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1f 192-expert/world-1 tests committed; forward mapping pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1g mixed DSpark planning committed; forward mapping pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -60,6 +60,18 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-09 - Stage 1g: mixed DSpark planning
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0007-dsv41-mixed-dspark.patch`: `affine_plan` now records
+  MXFP8/MXFP4 modules in a `mixed` list instead of only skipping them; boot logs the mixed
+  count. Added a test with `mtp.0.attn.wq_a` (MXFP8) and `mtp.0.ffn.experts.w1` (MXFP4).
+- **Approach used:** plan and report only; no MXFP8/MXFP4 reader or kernel yet.
+- **Verification:** `0007` applies on top of `0001`-`0006`; `affine_plan` suite passes 17
+  tests.
+- **Artifacts:** `patches-mlx/0007-dsv41-mixed-dspark.patch`.
+- **Next:** stage 1h, map affine images into the forward; the MXFP8/MXFP4 reader follows.
 
 ### 2026-11-09 - Stage 1f: 192 experts and world 1
 
@@ -238,6 +250,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | Affine plan | Enumerate modules from headers | Header-only `affine_plan.zig`; dense/non-affine/Engram listed as skipped | Keeps the first binding pass free of payload reads | `0004` committed; 15-test host suite passes |
 | Boot admission | Wire the plan into `cuda_model` and load weights | Plan + header validation run at boot, then `AffineForwardNotPorted` | Avoids a half-wired forward and keeps the EXL3 path untouched | `0005` committed |
 | 192 experts / world 1 | Data-driven expert count; single-rank path | `affine_plan` exercises 192; `block_admission` test proves world 1 | Plan already uses `cfg.experts`; no hardcoded 384 in the affine path | `0006` committed |
+| Mixed DSpark | Load MXFP8/MXFP4 modules | Plan lists them in `mixed`; boot logs the count | Keeps affine and mixed formats separate until readers exist | `0007` committed; 17 tests |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
@@ -257,6 +270,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | `0005` patch apply | `git apply` on `0001`-`0004` | Pass | Boot guard |
 | 2026-11-09 | `0005` syntax | `zig ast-check` on `cuda_model`/`affine_load` | Pass | Guard compiles syntactically |
 | 2026-11-09 | `0006` patch apply | `git apply` on `0001`-`0005` | Pass | 192-expert/world-1 tests |
+| 2026-11-09 | `0007` patch apply | `git apply` on `0001`-`0006` | Pass | Mixed DSpark planning |
+| 2026-11-09 | Mixed DSpark planning | `zig test` on `affine_plan.zig` | Pass | 17-test host suite |
 | 2026-11-09 | 192-expert plan | `zig test` on `affine_plan.zig` | Pass | 16-test host suite |
 | 2026-11-09 | World-1 admission | `zig test` on `block_admission.zig` | Pass | 9 tests |
 | 2026-11-09 | Affine plan enumeration | `zig test` on `affine_plan.zig` | Pass | 15-test host suite |
@@ -269,7 +284,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1f admit metadata, read bytes, enumerate the plan, validate it at boot, and exercise 192 experts plus world 1; the affine path deliberately returns `AffineForwardNotPorted`, so forward mapping and kernels are still missing.
+- Stage 1a-1g admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, and list mixed DSpark modules; the affine path deliberately returns `AffineForwardNotPorted`, so forward mapping and kernels are still missing.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -280,7 +295,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Implement stage 1g: mixed MXFP8/MXFP4 DSpark plan and loader handling.
-2. Implement stage 1h: map the affine images into the forward (expert gather and linear kernels).
-3. Implement stage 1i: one-layer forward harness; keep runtime verification deferred.
+1. Implement stage 1h: map the affine images into the forward (expert gather and linear kernels).
+2. Implement stage 1i: add the MXFP8/MXFP4 DSpark reader.
+3. Implement stage 1j: one-layer forward harness; keep runtime verification deferred.
 4. At the end, build the container, run the one-layer reference, and record all results here.

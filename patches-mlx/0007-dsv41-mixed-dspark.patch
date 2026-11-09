@@ -1,0 +1,111 @@
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index 8bf8137..a611438 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -19,6 +19,14 @@ pub const Module = struct {
+     layout: affine.Layout,
+ };
+ 
++/// A module whose declared format is not affine (MXFP8/MXFP4); the affine loader leaves it
++/// for a later mixed-format pass.
++pub const Mixed = struct {
++    kind: Kind,
++    name: []const u8,
++    spec: affine.Spec,
++};
++
+ pub const Reason = enum { dense, non_affine, engram };
+ 
+ pub const Skipped = struct {
+@@ -36,6 +44,7 @@ pub const Plan = struct {
+     arena: std.heap.ArenaAllocator,
+     layers: []Layer,
+     skipped: []Skipped,
++    mixed: []Mixed,
+ 
+     pub fn deinit(p: *Plan) void {
+         p.arena.deinit();
+@@ -49,6 +58,7 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+     const a = arena.allocator();
+     const layers = try a.alloc(Layer, cfg.allLayers());
+     var skipped: std.ArrayList(Skipped) = .empty;
++    var mixed: std.ArrayList(Mixed) = .empty;
+     var name_buf: [160]u8 = undefined;
+     var prefix_buf: [32]u8 = undefined;
+     for (layers, 0..) |*layer, i| {
+@@ -68,7 +78,7 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 continue;
+             }
+             if (spec.?.mode != .affine) {
+-                try skipped.append(a, .{ .name = name, .reason = .non_affine });
++                try mixed.append(a, .{ .kind = .linear, .name = name, .spec = spec.? });
+                 continue;
+             }
+             if (r.k == 0 or r.n == 0) {
+@@ -90,7 +100,7 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 continue;
+             }
+             if (spec.?.mode != .affine) {
+-                try skipped.append(a, .{ .name = name, .reason = .non_affine });
++                try mixed.append(a, .{ .kind = .expert, .name = name, .spec = spec.? });
+                 continue;
+             }
+             const kn = names.ExpertProj.kn(p, cfg);
+@@ -103,7 +113,7 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+         }
+         layer.* = .{ .index = @intCast(i), .prefix = prefix, .modules = try modules.toOwnedSlice(a) };
+     }
+-    return .{ .arena = arena, .layers = layers, .skipped = try skipped.toOwnedSlice(a) };
++    return .{ .arena = arena, .layers = layers, .skipped = try skipped.toOwnedSlice(a), .mixed = try mixed.toOwnedSlice(a) };
+ }
+ 
+ test "a 192-expert layer plans three expert stacks without loading headers" {
+@@ -138,6 +148,35 @@ test "a 192-expert layer plans three expert stacks without loading headers" {
+     }
+ }
+ 
++test "MTP MXFP8 and MXFP4 modules are listed as mixed, not affine" {
++    const a = std.testing.allocator;
++    var cfg = @import("config.zig").tiny();
++    cfg.layers = 1;
++    cfg.mtp_layers = 1;
++    cfg.q_lora = 64;
++    cfg.compress_ratios = @import("config.zig").Ids.of(&.{0});
++    cfg.kv_sources = .{};
++    cfg.index_sources = .{};
++    cfg.engram_layers = .{};
++    cfg.engram_rows = @import("config.zig").List(u64, 8).of(&.{});
++    const json =
++        \\{"quantization":{"quant_method":"affine","bits":4,"group_size":64,"dense_by_default":true,
++        \\"mtp.0.attn.wq_a":{"bits":8,"mode":"mxfp8"},
++        \\"mtp.0.ffn.experts.w1":{"bits":4,"mode":"mxfp4"}}}
++    ;
++    var formats = try affine.Formats.init(a, json);
++    defer formats.deinit();
++    var p = Pack.init(a);
++    defer p.deinit();
++    var plan = try build(a, &cfg, &p, &formats);
++    defer plan.deinit();
++    try std.testing.expectEqual(@as(usize, 2), plan.mixed.len);
++    try std.testing.expectEqual(affine.Mode.mxfp8, plan.mixed[0].spec.mode);
++    try std.testing.expectEqual(Kind.linear, plan.mixed[0].kind);
++    try std.testing.expectEqual(affine.Mode.mxfp4, plan.mixed[1].spec.mode);
++    try std.testing.expectEqual(Kind.expert, plan.mixed[1].kind);
++}
++
+ test "one tiny layer plans four linears and three expert stacks; wo_a is dense" {
+     const a = std.testing.allocator;
+     var cfg = @import("config.zig").tiny();
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index fcce9c4..86871db 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -244,7 +244,7 @@ pub const Model = struct {
+                     modules += 1;
+                 }
+             }
+-            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} skipped; forward not ported yet", .{ ap.layers.len, modules, ap.skipped.len });
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len });
+             return error.AffineForwardNotPorted;
+         }
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
