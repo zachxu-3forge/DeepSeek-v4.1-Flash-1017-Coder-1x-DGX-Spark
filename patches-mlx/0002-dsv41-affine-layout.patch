@@ -1,0 +1,226 @@
+diff --git a/zig/src/families/deepseek_v41/affine.zig b/zig/src/families/deepseek_v41/affine.zig
+new file mode 100644
+index 0000000..8844688
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine.zig
+@@ -0,0 +1,208 @@
++//! MLX affine metadata and packed-shape checks for DeepSeek V4.1.
++//!
++//! The checkpoint stores each quantized projection as packed U32 words plus BF16 scales and
++//! biases: `packed_last = K * bits / 32`, `groups = K / group`. This module resolves the
++//! translated omlx map and checks those shapes before any weight is read. It performs no
++//! device work and does not choose kernels.
++
++const std = @import("std");
++const keys = @import("core").quant.keys;
++
++pub const Mode = enum { affine, mxfp8, mxfp4 };
++
++pub const Spec = struct {
++    bits: u8,
++    group: u32 = 0,
++    mode: Mode = .affine,
++
++    pub fn check(s: Spec) !void {
++        if (std.mem.indexOfScalar(u8, &.{ 2, 3, 4, 5, 6, 8 }, s.bits) == null) return error.BadAffine;
++        switch (s.mode) {
++            .affine => if (std.mem.indexOfScalar(u32, &.{ 32, 64, 128 }, s.group) == null) return error.BadAffine,
++            .mxfp8, .mxfp4 => {},
++        }
++    }
++
++    pub fn layout(s: Spec, n: u32, k: u32) !Layout {
++        if (s.mode != .affine) return error.NotAffine;
++        const l: Layout = .{ .n = n, .k = k, .bits = s.bits, .group = s.group };
++        try l.checkShape(&.{}, &.{}, &.{});
++        return l;
++    }
++};
++
++pub const Layout = struct {
++    n: u32,
++    k: u32,
++    bits: u8,
++    group: u32,
++
++    pub fn packedK(l: Layout) !u32 {
++        const bits = std.math.mul(u64, l.k, l.bits) catch return error.BadAffine;
++        if (bits % 32 != 0) return error.BadAffine;
++        return std.math.cast(u32, bits / 32) orelse error.BadAffine;
++    }
++
++    pub fn groups(l: Layout) !u32 {
++        if (l.group == 0 or l.k % l.group != 0) return error.BadAffine;
++        return std.math.cast(u32, l.k / l.group) orelse error.BadAffine;
++    }
++
++    /// Check a `[N, packed]` or `[E, N, packed]` weight and its matching scales/biases.
++    /// Empty slices skip that tensor; the caller may check metadata and bytes separately.
++    pub fn checkShape(l: Layout, weight: []const usize, scales: []const usize, biases: []const usize) !void {
++        const packed_k = try l.packedK();
++        const group_count = try l.groups();
++        try checkOne(l, weight, packed_k);
++        try checkOne(l, scales, group_count);
++        try checkOne(l, biases, group_count);
++        if (weight.len != 0 and scales.len != 0 and weight.len != scales.len) return error.BadAffine;
++        if (weight.len != 0 and biases.len != 0 and weight.len != biases.len) return error.BadAffine;
++        if (weight.len == 3 and scales.len == 3 and weight[0] != scales[0]) return error.BadAffine;
++        if (weight.len == 3 and biases.len == 3 and weight[0] != biases[0]) return error.BadAffine;
++    }
++
++    fn checkOne(l: Layout, shape: []const usize, want: u32) !void {
++        if (shape.len == 0) return;
++        if (shape.len != 2 and shape.len != 3) return error.BadAffine;
++        if (shape[shape.len - 2] != l.n) return error.BadAffine;
++        if (shape[shape.len - 1] != want) return error.BadAffine;
++        if (shape.len == 3 and shape[0] == 0) return error.BadAffine;
++    }
++};
++
++/// The translated `quantization`/`quantization_config` block, with per-module overrides.
++pub const Formats = struct {
++    parsed: std.json.Parsed(std.json.Value),
++    quant: ?std.json.ObjectMap,
++    non_affine: ?std.json.ObjectMap,
++    global: ?Spec,
++
++    pub fn init(gpa: std.mem.Allocator, json: []const u8) !Formats {
++        const p = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
++        errdefer p.deinit();
++        const root = try object(p.value);
++        const q = try block(root);
++        if (q) |o| {
++            if (o.get("quant_method")) |v| {
++                if (v != .null and !(v == .string and
++                    (std.mem.eql(u8, v.string, "mlx") or std.mem.eql(u8, v.string, "affine"))))
++                    return error.NotAffine;
++            }
++            const non = if (o.get("non_affine_modules")) |v| blk: {
++                if (v != .object) return error.BadAffine;
++                break :blk v.object;
++            } else null;
++            return .{
++                .parsed = p,
++                .quant = o,
++                .non_affine = non,
++                .global = try spec(o, null),
++            };
++        }
++        return .{ .parsed = p, .quant = null, .non_affine = null, .global = null };
++    }
++
++    pub fn deinit(f: *Formats) void {
++        f.parsed.deinit();
++        f.* = undefined;
++    }
++
++    pub fn resolve(f: *const Formats, path: ?[]const u8) !?Spec {
++        const wanted = keys.canonical(path orelse return f.global);
++        if (f.non_affine) |m| {
++            if (m.get(wanted)) |v| {
++                if (v != .object) return error.BadAffine;
++                return try spec(v.object, null);
++            }
++        }
++        const q = f.quant orelse return null;
++        var matched = false;
++        var found: ?Spec = null;
++        var it = q.iterator();
++        while (it.next()) |item| {
++            if (!std.mem.eql(u8, keys.canonical(item.key_ptr.*), wanted)) continue;
++            const v = item.value_ptr.*;
++            const own: ?Spec = switch (v) {
++                .bool => |yes| if (yes) f.global else null,
++                .object => |o| if (o.count() == 0) null else try spec(o, 4),
++                else => return error.BadAffine,
++            };
++            if (matched and !std.meta.eql(found, own)) return error.ConflictingAliases;
++            found = own;
++            matched = true;
++        }
++        return if (matched) found else f.global;
++    }
++};
++
++fn object(v: std.json.Value) !std.json.ObjectMap {
++    return switch (v) {
++        .object => |o| o,
++        else => error.BadConfig,
++    };
++}
++
++fn block(root: std.json.ObjectMap) !?std.json.ObjectMap {
++    const text = if (root.get("text_config")) |v| try object(v) else root;
++    for ([_]std.json.ObjectMap{ root, text }) |o| {
++        for ([_][]const u8{ "quantization", "quantization_config" }) |key| {
++            if (o.get(key)) |v| if (v == .object and v.object.count() > 0) return v.object;
++        }
++    }
++    return null;
++}
++
++fn spec(o: std.json.ObjectMap, fallback: ?u8) !Spec {
++    const mode: Mode = if (o.get("mode")) |v| blk: {
++        if (v == .null) break :blk .affine;
++        if (v != .string) return error.BadAffine;
++        if (std.mem.eql(u8, v.string, "affine")) break :blk .affine;
++        if (std.mem.eql(u8, v.string, "mxfp8")) break :blk .mxfp8;
++        if (std.mem.eql(u8, v.string, "mxfp4")) break :blk .mxfp4;
++        return error.BadAffine;
++    } else .affine;
++    const bits = if (o.get("bits")) |v| blk: {
++        if (v != .integer or v.integer < 0 or v.integer > 8) return error.BadAffine;
++        break :blk @as(u8, @intCast(v.integer));
++    } else fallback orelse return error.BadAffine;
++    const group = if (o.get("group_size")) |v| blk: {
++        if (v != .integer or v.integer < 0 or v.integer > 128) return error.BadAffine;
++        break :blk @as(u32, @intCast(v.integer));
++    } else 64;
++    const s: Spec = .{ .bits = bits, .group = if (mode == .affine) group else 0, .mode = mode };
++    try s.check();
++    return s;
++}
++
++test "the published 2-bit expert and 6/8-bit layouts pass; a wrong packed width fails" {
++    const w1: Layout = .{ .n = 2304, .k = 5120, .bits = 2, .group = 64 };
++    try w1.checkShape(&.{ 192, 2304, 320 }, &.{ 192, 2304, 80 }, &.{ 192, 2304, 80 });
++    try std.testing.expectEqual(@as(u32, 320), try w1.packedK());
++    try std.testing.expectEqual(@as(u32, 80), try w1.groups());
++    try std.testing.expectError(error.BadAffine, w1.checkShape(&.{ 192, 2304, 319 }, &.{ 192, 2304, 80 }, &.{ 192, 2304, 80 }));
++
++    const wkv: Layout = .{ .n = 25600, .k = 6144, .bits = 6, .group = 64 };
++    try wkv.checkShape(&.{ 25600, 1152 }, &.{ 25600, 96 }, &.{ 25600, 96 });
++
++    const engram: Layout = .{ .n = 384006168, .k = 256, .bits = 4, .group = 32 };
++    try engram.checkShape(&.{ 384006168, 32 }, &.{ 384006168, 8 }, &.{ 384006168, 8 });
++}
++
++test "translated affine metadata resolves per module and keeps MXFP8/MXFP4 separate" {
++    const json =
++        \\{"text_config":{"quantization":{"quant_method":"affine","bits":4,"group_size":64,
++        \\"layers.0.ffn.experts.w1":{"bits":2,"group_size":64,"mode":"affine"},
++        \\"layers.0.attn.wkv":{"bits":8,"group_size":64,"mode":"affine"},
++        \\"layers.0.attn.wo_a":false,
++        \\"non_affine_modules":{"mtp.0.attn.wkv":{"mode":"mxfp8","bits":8},
++        \\"mtp.0.ffn.experts.w1":{"mode":"mxfp4","bits":4}}}}}
++    ;
++    var f = try Formats.init(std.testing.allocator, json);
++    defer f.deinit();
++    try std.testing.expectEqual(Spec{ .bits = 2, .group = 64 }, (try f.resolve("language_model.layers.0.ffn.experts.w1")).?);
++    try std.testing.expectEqual(Spec{ .bits = 8, .group = 64 }, (try f.resolve("language_model.layers.0.attn.wkv.weight")).?);
++    try std.testing.expectEqual(@as(?Spec, null), try f.resolve("layers.0.attn.wo_a"));
++    try std.testing.expectEqual(Spec{ .bits = 8, .mode = .mxfp8 }, (try f.resolve("mtp.0.attn.wkv")).?);
++    try std.testing.expectEqual(Spec{ .bits = 4, .mode = .mxfp4 }, (try f.resolve("mtp.0.ffn.experts.w1")).?);
++}
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 00d3089..ec77313 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -394,3 +394,7 @@ test "CUDA rank planning selects EXL3 over a kept dense sibling from headers alo
+     try p.addHeader("dense-only.safetensors", dense, 5242880);
+     try testing.expectError(error.UnsupportedDenseProjection, p.group(prefix, &buf));
+ }
++
++test {
++    _ = @import("affine.zig");
++}

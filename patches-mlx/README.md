@@ -6,13 +6,13 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | Patch | Purpose |
 | --- | --- |
 | `0001-admit-omlx-affine.patch` | Read `omlx_deepseek_v41.quantized_modules`, translate it to the engine's affine block, and admit `quant_method = "affine"` in the dsv41 config path |
-| `0002-dsv41-affine-loader.patch` | Load packed U32 affine words, scales, and biases for dsv41 linears; keep dense/bf16 tensors as-is |
+| `0002-dsv41-affine-layout.patch` | Resolve translated affine metadata and validate packed U32/scales/biases shapes (host-only) |
 | `0003-stacked-experts.patch` | Admit the target's `[192, ...]` expert tensors, either by native gather or a load-time split |
 | `0004-dsv41-192-experts.patch` | Make expert count, top-k, layouts, and DSpark expert counts data-driven |
 | `0005-dsv41-world1.patch` | Admit and run the single-rank serving path |
 | `0006-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001-admit-omlx-affine.patch` (config gate and server family list). `0002`-`0006` are planned.
+Implemented: `0001-admit-omlx-affine.patch` and `0002-dsv41-affine-layout.patch`. `0003`-`0006` are planned.
 
 Rules:
 
