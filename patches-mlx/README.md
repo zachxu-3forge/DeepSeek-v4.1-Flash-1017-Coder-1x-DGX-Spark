@@ -12,10 +12,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0005-dsv41-affine-boot-guard.patch` | Build and validate the affine plan at boot; return `AffineForwardNotPorted` before the EXL3 path |
 | `0006-dsv41-192-world1.patch` | Exercise a 192-expert affine plan and single-rank admission |
 | `0007-dsv41-mixed-dspark.patch` | List DSpark MXFP8/MXFP4 modules as mixed and log them at boot |
-| `0008-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0009-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
+| `0008-dsv41-affine-reference.patch` | CPU reference for the MLX bit-stream dequantization and row dot |
+| `0009-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0010-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001`-`0007`. Planned: `0008`-`0009`.
+Implemented: `0001`-`0008`. Planned: `0009`-`0010`.
 
 Rules:
 

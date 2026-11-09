@@ -1,0 +1,121 @@
+diff --git a/zig/src/families/deepseek_v41/affine_ref.zig b/zig/src/families/deepseek_v41/affine_ref.zig
+new file mode 100644
+index 0000000..8b338ee
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_ref.zig
+@@ -0,0 +1,105 @@
++//! Host reference for MLX affine rows: a little-endian bit stream of `bits`-wide codes,
++//! with a BF16 scale and bias every `group` inputs.
++//!
++//! This is the CPU oracle for the eventual CUDA gather/linear kernels. It performs no
++//! device work and allocates nothing.
++
++const std = @import("std");
++
++pub fn bf16Widen(h: u16) f32 {
++    return @bitCast(@as(u32, h) << 16);
++}
++
++/// The unmasked code starting `bit` bits into the little-endian word stream.
++pub fn codeAt(words: []const u32, bit: usize) !u64 {
++    const at = bit / 32;
++    if (at >= words.len) return error.BadAffine;
++    const lo: u64 = words[at];
++    const hi: u64 = if ((bit & 31) != 0 and at + 1 < words.len) words[at + 1] else 0;
++    return (lo | hi << 32) >> @intCast(bit & 31);
++}
++
++fn mask(bits: u8) u64 {
++    return (@as(u64, 1) << @intCast(bits)) - 1;
++}
++
++/// Dequantize one row of `out.len` inputs at `bits`, `group`; `words` must hold
++/// `out.len * bits / 32` words.
++pub fn dequantizeRow(words: []const u32, scales: []const u16, biases: []const u16, bits: u8, group: usize, out: []f32) !void {
++    if (std.mem.indexOfScalar(u8, &.{ 2, 3, 4, 5, 6, 8 }, bits) == null) return error.BadAffine;
++    if (group == 0 or out.len % group != 0) return error.BadAffine;
++    const groups = out.len / group;
++    if (scales.len != groups or biases.len != groups) return error.BadAffine;
++    if (words.len != out.len * bits / 32) return error.BadAffine;
++    const m = mask(bits);
++    for (out, 0..) |*y, i| {
++        const q = try codeAt(words, i * bits) & m;
++        const g = i / group;
++        y.* = @as(f32, @floatFromInt(q)) * bf16Widen(scales[g]) + bf16Widen(biases[g]);
++    }
++}
++
++/// One output row's dot with `x` (the same `bits`/`group` row).
++pub fn dotRow(words: []const u32, scales: []const u16, biases: []const u16, bits: u8, group: usize, x: []const f32) !f32 {
++    if (x.len == 0 or group == 0 or x.len % group != 0) return error.BadAffine;
++    const groups = x.len / group;
++    if (scales.len != groups or biases.len != groups) return error.BadAffine;
++    if (words.len != x.len * bits / 32) return error.BadAffine;
++    const m = mask(bits);
++    var y: f32 = 0;
++    for (x, 0..) |v, i| {
++        const q = try codeAt(words, i * bits) & m;
++        const g = i / group;
++        const w = @as(f32, @floatFromInt(q)) * bf16Widen(scales[g]) + bf16Widen(biases[g]);
++        y += w * v;
++    }
++    return y;
++}
++
++const testing = std.testing;
++
++fn setCode(words: []u32, i: usize, bits: u8, code: u32) void {
++    for (0..bits) |b| {
++        if ((code >> @intCast(b)) & 1 != 0) {
++            const at = i * bits + b;
++            words[at / 32] |= @as(u32, 1) << @intCast(at % 32);
++        }
++    }
++}
++
++test "2-bit codes dequantize with one BF16 scale and bias per group" {
++    var words: [4]u32 = @splat(0); // 64 inputs * 2 bits / 32
++    setCode(&words, 0, 2, 1);
++    setCode(&words, 1, 2, 2);
++    setCode(&words, 63, 2, 3);
++    const scales = [_]u16{0x3f80}; // 1.0
++    const biases = [_]u16{0x3f00}; // 0.5
++    var out: [64]f32 = undefined;
++    try dequantizeRow(&words, &scales, &biases, 2, 64, &out);
++    try testing.expectEqual(@as(f32, 1.5), out[0]);
++    try testing.expectEqual(@as(f32, 2.5), out[1]);
++    try testing.expectEqual(@as(f32, 3.5), out[63]);
++}
++
++test "6-bit codes cross word boundaries" {
++    var words: [12]u32 = @splat(0); // 64 inputs * 6 bits / 32
++    setCode(&words, 63, 6, 42);
++    const scales = [_]u16{0x3f80};
++    const biases = [_]u16{0};
++    var out: [64]f32 = undefined;
++    try dequantizeRow(&words, &scales, &biases, 6, 64, &out);
++    try testing.expectEqual(@as(f32, 42), out[63]);
++}
++
++test "8-bit codes and a dot row" {
++    var words: [8]u32 = @splat(0); // 32 inputs * 8 bits / 32
++    setCode(&words, 31, 8, 200);
++    const scales = [_]u16{0x4000}; // 2.0
++    const biases = [_]u16{0xbf80}; // -1.0
++    var out: [32]f32 = undefined;
++    try dequantizeRow(&words, &scales, &biases, 8, 32, &out);
++    try testing.expectEqual(@as(f32, 399), out[31]);
++    var x: [32]f32 = @splat(0);
++    x[31] = 1;
++    try testing.expectEqual(@as(f32, 399), try dotRow(&words, &scales, &biases, 8, 32, &x));
++}
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index 7de3844..741bd9c 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -399,4 +399,5 @@ test {
+     _ = @import("affine.zig");
+     _ = @import("affine_load.zig");
+     _ = @import("affine_plan.zig");
++    _ = @import("affine_ref.zig");
+ }
