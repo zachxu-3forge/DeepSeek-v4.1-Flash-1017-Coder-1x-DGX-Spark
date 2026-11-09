@@ -61,6 +61,17 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
 
+### 2026-11-09 - Stage 1a fix: expert-count admission
+
+- **Phase:** 1.
+- **Done:** replaced the affine `continue` in `validateRelease` with a runtime `keep`
+  condition. The old form was comptime control flow inside an `inline for` and would not
+  compile; the new form skips only the `experts` comparison for affine packs.
+- **Verification:** `zig test config.zig` passes all 8 tests, including the existing DSQ
+  admission tests.
+- **Artifacts:** updated `patches-mlx/0001-admit-omlx-affine.patch`.
+- **Next:** continue stage 1c.
+
 ### 2026-11-09 - Stage 1b: affine layout parser
 
 - **Phase:** 1.
@@ -182,6 +193,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | `0001` patch apply | `git apply --check patches-mlx/0001-admit-omlx-affine.patch` | Pass | Against pinned `26e1b074` |
 | 2026-11-09 | `0002` patch apply | `git apply` in a fresh worktree with `0001` | Pass | Both patches apply |
 | 2026-11-09 | Affine parser/layout | `zig test` on `affine.zig` | Pass | 2 unit tests; Zig 0.17.0 |
+| 2026-11-09 | Config admission | `zig test` on `config.zig` | Pass | 8 tests; fixed affine expert-count path |
 | 2026-11-09 | Synthetic fixture | `inspect_checkpoint.py` + `translate_config.py` | Pass | 5 modules; stacked experts and Engram detected; missing w2/w3 intentional |
 | 2026-11-09 | Real config translation | `translate_config.py --check` on published config/index | Pass | 460 modules: 429 affine, 22 MXFP8, 9 MXFP4; all pieces present |
 | 2026-11-09 | Real index inspection | `inspect_checkpoint.py` on published config/index | Pass | 21 shards, 2286 tensors, 211.4 GiB; 378 stacked expert tensors; 16 Engram tensors |

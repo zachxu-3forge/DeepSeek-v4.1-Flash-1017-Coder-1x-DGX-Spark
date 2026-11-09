@@ -1,5 +1,5 @@
 diff --git a/zig/src/families/deepseek_v41/config.zig b/zig/src/families/deepseek_v41/config.zig
-index 71aefd8..a3a10ca 100644
+index 71aefd8..033f9f6 100644
 --- a/zig/src/families/deepseek_v41/config.zig
 +++ b/zig/src/families/deepseek_v41/config.zig
 @@ -47,8 +47,9 @@ pub const Rope = struct {
@@ -14,15 +14,17 @@ index 71aefd8..a3a10ca 100644
  
  pub const Config = struct {
      /// how the checkpoint stores its weights; the release's own format is admitted beside the EXL3 trellises
-@@ -230,6 +231,8 @@ pub const Config = struct {
+@@ -230,7 +231,9 @@ pub const Config = struct {
          try c.validate();
          const release: Config = .{};
          inline for (.{ "vocab", "hidden", "layers", "heads", "head_dim", "rope_dim", "q_lora", "o_lora", "o_groups", "window", "experts", "shared_experts", "topk", "expert_width", "routed_scale", "norm_topk", "swiglu_limit", "index_heads", "index_dim", "index_topk", "candidate_source", "candidate_blocks", "candidate_block_size", "hc_mult", "hc_sinkhorn_iters", "hc_post_alpha", "engram_max_ngram", "engram_vocab", "engram_heads", "engram_head_dim", "engram_pad", "engram_compressed_vocab", "mtp_layers", "dspark_block", "dspark_noise_token", "dspark_markov_rank", "dspark_experts", "dspark_topk", "bos", "eos" }) |name| {
+-            if (@field(c.*, name) != @field(release, name)) return error.UnsupportedArchitecture;
 +            // A pruned affine pack keeps the release's geometry but may select fewer routed experts.
-+            if (c.format == .affine and std.mem.eql(u8, name, "experts")) continue;
-             if (@field(c.*, name) != @field(release, name)) return error.UnsupportedArchitecture;
++            const keep = c.format == .affine and std.mem.eql(u8, name, "experts");
++            if (!keep and @field(c.*, name) != @field(release, name)) return error.UnsupportedArchitecture;
          }
          inline for (.{ "compress_ratios", "kv_sources", "index_sources", "engram_layers", "dspark_targets" }) |name| {
+             if (!std.mem.eql(u32, @field(c.*, name).items(), @field(release, name).items()))
 @@ -468,6 +471,10 @@ fn requireFormat(top: std.json.ObjectMap) !Format {
          return .exl3;
      }
