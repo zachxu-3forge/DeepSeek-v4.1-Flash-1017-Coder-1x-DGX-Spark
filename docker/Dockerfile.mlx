@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+# DeepSeek-V4.1 MLX on one DGX Spark. Builds upstream TensorFold's dsv41 pair.
+# No host CUDA, Zig, or TensorFold is used; only the NVIDIA container runtime is needed.
+# BASE_IMAGE may include an @sha256:<digest>. After the first pull on the Spark:
+#   docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/pytorch:26.07-py3
+# rebuild with BASE_IMAGE=<repo>@sha256:<digest>, and record it in Agents/Implementation.md.
+# Override with a newer arm64 PyTorch tag when available; 26.07 is the known-good sm_121 base.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG TF_REPO=https://github.com/ashhart/TensorFold.git
+ARG TF_REF=26e1b074b1512d645698eba269ccfb8ebc974c10
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+ARG ZIG_MIRRORS=https://zig.linus.dev/zig
+ARG SM=121
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl xz-utils ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN ok=0; \
+    for base in ${ZIG_MIRRORS} "https://ziglang.org/download/${ZIG_VERSION}"; do \
+      url="${base%/}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; echo "zig: trying ${url}"; \
+      if curl --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/zig.tar.xz "${url}" && \
+         echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -; then ok=1; break; fi; \
+      rm -f /tmp/zig.tar.xz; \
+    done; \
+    [ "$ok" = 1 ] || { echo "zig ${ZIG_VERSION}: no source served the pinned sha256" >&2; exit 1; }; \
+    mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && \
+    rm /tmp/zig.tar.xz && /opt/zig/zig version
+
+RUN git init -q /tensorfold && cd /tensorfold && \
+    git remote add origin "${TF_REPO}" && \
+    git fetch -q --depth 1 origin "${TF_REF}" && \
+    git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${TF_REF}"
+
+COPY patches-mlx /opt/tf-patches
+RUN cd /tensorfold && \
+    for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; \
+      git apply --check "$p" && git apply "$p" || exit 1; done
+
+RUN cd /tensorfold && /opt/zig/zig build dsv41-serve \
+      -Dnvcc=/usr/local/cuda/bin/nvcc \
+      -Ddsv41-nvcc=/usr/local/cuda/bin/nvcc \
+      -Dsm=${SM} -Doptimize=ReleaseFast \
+      --prefix /opt/tensorfold -j"$(nproc)" && \
+    test -x /opt/tensorfold/bin/tensorfold-dsv41 && \
+    test -x /opt/tensorfold/bin/tf-dsv41 && \
+    rm -rf /tensorfold /root/.cache/zig
+
+COPY scripts/mlx /opt/tf-mlx/scripts
+COPY Agents.md /opt/tf-mlx/docs/Agents.md
+COPY Agents/Blockers.md /opt/tf-mlx/docs/Blockers.md
+COPY Agents/Implementation.md /opt/tf-mlx/docs/Implementation.md
+
+LABEL tf.engine=upstream tf.ref=${TF_REF} tf.format=mlx-affine tf.sm=${SM}
+ENV PATH=/opt/tensorfold/bin:${PATH}
+ENV HF_HOME=/hf
+WORKDIR /workspace

@@ -1,0 +1,185 @@
+# Implementation Plan: MLX DeepSeek-V4.1 on one DGX Spark
+
+Status: proposed. Read `Agents/Blockers.md` first; this plan assumes we attempt the exact
+`mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` checkpoint, not the GGUF fallback.
+Implementation progress, decisions, and the approaches actually used are recorded in
+`Agents/Implementation.md`; update that file as work proceeds.
+
+## Constraints
+
+- **Docker only.** The host stays untouched: no host CUDA toolkit, driver, TensorFold, Zig, or
+  Python install. Everything is built and run in the container.
+- **`docker run --rm`.** No state outside mounted volumes. Model, Engram, HF cache, and outputs
+  are host directories mounted read-only or read-write as needed.
+- **Latest CUDA/TensorFold in the image.** The image pins a CUDA base by digest and a
+  TensorFold ref by commit. "Latest" is allowed for experiments, but every milestone records
+  the exact digest/SHA; `main` is not a reproducible pin.
+- **One GB10, 128 GB.** Target short context first (32K-64K). 1M context is out of scope for
+  the first working milestone.
+- **Exact checkpoint.** The MLX weights are the source of truth; no conversion to EXL3 unless
+  the port is abandoned.
+
+## Recommended base
+
+Use **upstream TensorFold `main`** as the base, not the pinned fork.
+
+Why: upstream already has the MLX affine readers (2/3/4/5/6/8-bit, groups 32/64/128) and a
+DeepSeek-V4.1 family with a lane backend and world-1/3/4 tests. The pinned fork has the proven
+GB10/TP2 serving path but is EXL3-only. Porting affine into upstream is less work than porting
+the whole dsv41 family into the fork.
+
+Risk: upstream's DeepSeek-V4.1 family is unreleased and PR #827 is closed/unmerged. Phase 0
+must prove the family builds and runs a tiny fixture before committing to it. If it does not,
+fall back to the fork base and port affine + world 1 into it.
+
+## Docker contract
+
+Add `docker/Dockerfile.mlx` (or extend `zig/Dockerfile` behind a build arg) that:
+
+1. Starts from an arm64 CUDA devel/PyTorch image pinned by digest. Default candidate:
+   `nvcr.io/nvidia/pytorch:26.07-py3` (known good for `sm_121`), with an override for a newer
+   tag. Do not rely on the host's CUDA.
+2. Installs Zig at a pinned version (currently 0.17.0) and any build deps.
+3. Fetches TensorFold at `TF_REF` (default: tested upstream commit; `main` only for spikes),
+   applies `patches-mlx/*.patch`, and builds `tensorfold-dsv41` and `tf-dsv41` for `sm_121`
+   with `zig build dsv41-serve`.
+4. Copies only the binaries, licenses, and any helper scripts into a small runtime stage.
+5. Has no model weights baked in.
+
+Run shape:
+
+```sh
+docker build -f docker/Dockerfile.mlx \
+  --build-arg BASE_IMAGE=<digest> --build-arg TF_REF=<sha> \
+  -t tf-dsv41-mlx:dev .
+
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/.cache/huggingface:/hf" \
+  -v "/path/to/model:/model:ro" \
+  -v "/path/to/engram:/engram:ro" \
+  -v "$PWD/out:/out" \
+  tf-dsv41-mlx:dev <command>
+```
+
+`--gpus all` needs the NVIDIA container runtime on the host; that is a host prerequisite, not
+a host CUDA/TensorFold install. Record the driver version in every run log.
+
+## Phases
+
+### Phase 0 - Harness and admission spike (1-3 days)
+
+Deliverables:
+
+- `docker/Dockerfile.mlx` builds an arm64 image with a pinned CUDA base and TensorFold ref.
+- `scripts/mlx/inspect_checkpoint.py`: reads the index and config, prints per-module format,
+  shapes, expert counts, and memory estimates.
+- `scripts/mlx/translate_config.py`: emits a canonical `quantization_config` (or the engine's
+  expected metadata) from `omlx_deepseek_v41.quantized_modules`, without modifying the source
+  checkpoint.
+- A one-layer or tiny-fixture checkpoint that the engine can open.
+
+Gate: the engine parses the translated config and admits a 192-expert, world-1 fixture with
+affine and mixed-format modules. No full-model load yet.
+
+### Phase 1 - Affine loader and layout adapter (1-2 weeks)
+
+Tasks:
+
+- Add MLX affine packed-word/scales/biases loading for dsv41 linears.
+- Add stacked-expert loading: split `[192, ...]` tensors into the engine's per-expert layout,
+  or teach the engine the stacked layout directly. Prefer the latter if the kernels can gather
+  from it; otherwise convert once at load.
+- Support mixed modules: affine 2/6/8-bit, MXFP8 (22 DSpark modules), MXFP4 (9 DSpark
+  expert modules), bf16/MXFP8 `wo_a`, and unquantized tensors.
+- Make expert count, top-k, and DSpark expert count data-driven (192/6, 128/3).
+- Add world-1 admission to the serving path.
+
+Gate: one full layer runs a forward pass on GPU and matches a dequantized reference within a
+documented tolerance. Compare against a PyTorch/MLX dequant of the same layer, not against the
+EXL3 model.
+
+### Phase 2 - Full model, short context (1-2 weeks)
+
+Tasks:
+
+- Load all 40 layers plus DSpark and the vision tower on one rank.
+- Implement or adapt 2-bit affine expert gather kernels; verify decode and prefill rows.
+- Add memory admission for ~98 GB weights plus KV; enforce a conservative default context.
+- Validate greedy generation against omlx on a fixed prompt for 64-256 tokens (accept small
+  divergence only where documented).
+
+Gate: `tensorfold-dsv41 serve` answers a text prompt on one Spark; peak device/host memory
+stays under the safety floor; 32K context is stable; no host libraries are loaded.
+
+### Phase 3 - Engram (1-2 weeks)
+
+Choose one:
+
+- **Convert (recommended first):** offline converter from the target's 4-bit/group-32 affine
+  Engram tables to the engine's `TF_DS_ENGRAM` format, plus the token map. Verify hashes and
+  row counts; keep the source checkpoint unchanged.
+- **Read (later):** add an affine Engram reader in the engine and stream from the target
+  shards. More faithful, but more engine work.
+
+Gate: Engram lookups match the reference for sampled tokens; memory stays within budget;
+SSD streaming works under `--rm` with a read-only mount.
+
+### Phase 4 - Server, tools, vision (1 week)
+
+Tasks:
+
+- Rebase the portable server/API patches (`0004`, `0027`-`0032`, `0036`, `0046`-`0049`,
+  `0057`, `0058`, `0064`-`0067`) onto the chosen base.
+- Wire tokenizer and chat template; verify tool calling and thinking on/off.
+- Wire the vision tower and image input; test one image request.
+- Keep engine/CUDA patches that depend on TP2/RDMA out of the single-rank build unless needed.
+
+Gate: OpenAI-compatible `/v1/chat/completions`, streaming, tools, and one image request work
+inside the container.
+
+### Phase 5 - Qualification and documentation (3-5 days)
+
+- Measure TTFT, decode tok/s, peak memory, and context limits on one GB10.
+- Run a fixed regression suite (greedy determinism, draft on/off equality where applicable,
+  concurrent streams).
+- Document the exact image digest, TensorFold SHA, patch set, and run command.
+- Record what is still missing for 1M context.
+
+## Repo layout
+
+```
+docker/Dockerfile.mlx          # container build, pinned base + TF ref
+patches-mlx/                   # engine changes, filename order
+scripts/mlx/inspect_checkpoint.py
+scripts/mlx/translate_config.py
+scripts/mlx/convert_engram.py
+scripts/mlx/reference_layer.py # dequantized reference for Phase 1
+scripts/mlx/run_container.sh   # docker run --rm wrapper
+Agents/Blockers.md
+Agents.md                      # this plan
+Agents/Implementation.md       # progress and actual approaches
+```
+
+## Decision points
+
+1. **Base:** upstream `main` vs pinned fork. Decide after the Phase 0 build/admission spike.
+2. **Expert layout:** load-time conversion to per-expert vs native stacked gather. Decide by
+   measuring load time and decode speed on one layer.
+3. **Engram:** convert vs reader. Start with convert; add reader only if quality or disk
+   layout demands it.
+4. **Context target:** 32K for milestone 1; revisit 128K/1M only after memory measurements.
+
+## Fallback
+
+If Phase 1 shows the affine path is not tractable in the time box, switch to the source GGUF
+with llama.cpp CUDA in the same `--rm` container. That runs the model, but not this engine and
+not this repo's patch set. Keep it as a parallel sanity baseline, not a silent pivot.
+
+## First actions
+
+1. Pin the CUDA base digest and the TensorFold SHA; write `docker/Dockerfile.mlx`.
+2. Build the image on the Spark and run `tensorfold-dsv41 --version` plus a tiny fixture.
+3. Write `inspect_checkpoint.py` and `translate_config.py`.
+4. Produce the one-layer affine fixture and get it admitted.
+5. Only then start the loader and kernel work.

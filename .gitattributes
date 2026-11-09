@@ -1,0 +1,5 @@
+# Keep container scripts and patches LF-only on every checkout.
+*.sh text eol=lf
+*.py text eol=lf
+*.patch text eol=lf
+Dockerfile* text eol=lf

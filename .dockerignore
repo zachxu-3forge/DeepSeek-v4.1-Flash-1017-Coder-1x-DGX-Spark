@@ -1,0 +1,15 @@
+# Keep the build context small; the image needs only the Dockerfile, patches, scripts, and docs.
+.git
+.gitignore
+out
+runs
+model
+*.safetensors
+*.bin
+*.pt
+*.pth
+__pycache__
+*.pyc
+.venv
+venv
+hf
