@@ -54,6 +54,18 @@ The image builds upstream TensorFold (`TF_REF` in `docker/Dockerfile.mlx`) with 
 `sm_121`; no host CUDA or TensorFold is used. The host needs Docker and the NVIDIA container
 runtime only.
 
+## Stage 1 verification
+
+```sh
+MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh --host-only
+CONTAINER=1 BUILD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
+CONTAINER=1 EXPECT_FORWARD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
+```
+
+`test_stage1.sh` runs the inspector, translator, dispatch counter, CPU golden rows, Engram
+checks, and optionally the container boot. Results land in `out/stage1/<timestamp>/` with a
+`summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
+
 ## Phase 0 gate
 
 The harness is ready when the image builds, `tensorfold-dsv41 --version` runs, and the engine

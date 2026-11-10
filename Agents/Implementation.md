@@ -18,14 +18,14 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1l committed (forward dispatch table); image build pending |
+| Overall status | Stage 1 test harness committed; 1m next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
 | Container image | `tf-dsv41-mlx:dev` (not built) |
-| Last updated | 2026-11-09 |
+| Last updated | 2026-11-10 |
 
 ## Phase tracker
 
@@ -55,11 +55,27 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D8 | 2026-11-09 | Default the CUDA base to `nvcr.io/nvidia/pytorch:26.07-py3` by tag until the digest is captured on the Spark | An unverified newer tag | 26.07 is the repo's known-good `sm_121` base; the digest is recorded in the first successful build |
 | D9 | 2026-11-09 | Build and run with `--platform linux/arm64` by default | Let Docker pick the host platform | Prevents an accidental x86 image on a non-Spark build host; the Spark is arm64 |
 | D10 | 2026-11-09 | Commit stages separately: stage 0 harness, stage 1a config admission, then stage 1b-1d layout/reader/plan | One large commit | Keeps each patch reviewable and reversible; multiple commits per stage are allowed |
+| D11 | 2026-11-10 | Write the Stage 1 verification harness before 1m/1n/1o | Verify ad hoc later | Captures golden rows, Engram checks, and dispatch counts before the launch code changes |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1 test harness
+
+- **Phase:** 1 (preparation for 1m/1n/1o).
+- **Done:** added `plan_dispatch.py` (expected 309 affine8 linears, 120 expert fallbacks,
+  22 MXFP8, 9 MXFP4), `reference_layer.py` (golden CPU dots for 8/6/2-bit and mixed modules),
+  `test_engram.py` (golden dots and row counts), `test_stage1.sh` (orchestrator and summary),
+  and `stage1_tests.md`. The container wrapper now passes `TF_DSV41_*`, `TF_TP_*`, `TF_DS_*`,
+  and `TENSORFOLD_*` variables through.
+- **Approach used:** independent Python bit-stream decoders, separate from the Zig reference.
+- **Verification:** Python/shell syntax passes; `plan_dispatch.py` reproduces the published
+  460-module split exactly. Full host run requires the model shards.
+- **Artifacts:** `scripts/mlx/plan_dispatch.py`, `reference_layer.py`, `test_engram.py`,
+  `test_stage1.sh`, `stage1_tests.md`.
+- **Next:** stage 1m; run `test_stage1.sh` before and after.
 
 ### 2026-11-09 - Stage 1l: forward dispatch table
 
@@ -344,6 +360,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | `0011` patch apply | `git apply` on `0001`-`0010` | Pass | MXFP8/MXFP4 reader |
 | 2026-11-09 | `0012` patch apply | `git apply` on `0001`-`0011` | Pass | Forward dispatch table |
 | 2026-11-09 | Dispatch table | `zig test` on `affine_dispatch.zig` | Pass | 18-test host suite |
+| 2026-11-10 | Stage 1 scripts syntax | `python -m py_compile` + `bash -n` | Pass | plan/reference/engram/orchestrator |
+| 2026-11-10 | Dispatch dry-run | `plan_dispatch.py` on published config | Pass | 309 affine8 / 120 fallback / 22 MXFP8 / 9 MXFP4 |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -372,7 +390,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Implement stage 1m: bind the dispatch entries to device buffers and launch the one-layer affine path.
-2. Implement stage 1n: one-layer forward harness; keep runtime verification deferred.
-3. Implement stage 1o: the Engram affine reader/converter.
-4. At the end, build the container, run the one-layer reference, and record all results here.
+1. Run `scripts/mlx/test_stage1.sh --host-only` with the real checkpoint and keep the result directory.
+2. Implement stage 1m: bind the dispatch entries to device buffers and launch the one-layer affine path.
+3. Implement stage 1n: one-layer forward harness; keep runtime verification deferred.
+4. Implement stage 1o: the Engram affine reader/converter.
+5. At the end, build the container, run `EXPECT_FORWARD=1 test_stage1.sh`, and record all results here.

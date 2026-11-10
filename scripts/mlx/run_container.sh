@@ -73,6 +73,13 @@ fi
 ASSETS_DIR=${ASSETS_DIR:-/model}
 args+=(-e TF_DSV41_ASSETS="$ASSETS_DIR")
 
+# Pass the engine's own environment through to the container (layers, drafts, world, ...).
+while IFS= read -r v; do
+  case "$v" in
+    TF_DSV41_*|TF_TP_*|TF_DS_*|TENSORFOLD_*) args+=(-e "$v=${!v}") ;;
+  esac
+done < <(compgen -e)
+
 cmd=(docker run --platform "$PLATFORM" "${args[@]}" "$IMAGE")
 
 if [[ $# -eq 0 ]]; then
