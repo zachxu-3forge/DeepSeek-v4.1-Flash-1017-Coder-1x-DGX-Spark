@@ -1,0 +1,171 @@
+diff --git a/zig/src/core/profile.zig b/zig/src/core/profile.zig
+index 1d19657..55190e1 100644
+--- a/zig/src/core/profile.zig
++++ b/zig/src/core/profile.zig
+@@ -45,6 +45,7 @@ pub const Switch = enum {
+     TF_DSV41_MHC_DEFER,
+     TF_DSV41_DRAFTS,
+     TF_DSV41_AFFINE_SMOKE,
++    TF_DSV41_AFFINE_LOAD,
+     TF_DSV41_SAMPLING,
+     TF_DSV41_IMAGES,
+     TF_DSV41_BIAS_VL,
+@@ -178,6 +179,7 @@ pub const entries = [_]Entry{
+     .{ .id = .TF_DSV41_MHC_DEFER, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "Deferred mHC coefficient launches", .evidence = "#2370" },
+     .{ .id = .TF_DSV41_DRAFTS, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "DSpark drafting policy", .evidence = "#2370" },
+     .{ .id = .TF_DSV41_AFFINE_SMOKE, .families = &.{"deepseek_v41"}, .class = .debug, .syntax = .present, .effect = "One-projection affine smoke test", .evidence = "#2370" },
++    .{ .id = .TF_DSV41_AFFINE_LOAD, .families = &.{"deepseek_v41"}, .class = .debug, .syntax = .present, .effect = "Pack every affine linear into a resident name-addressed set", .evidence = "#2370" },
+     .{ .id = .TF_DSV41_SAMPLING, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "Device sampler", .evidence = "#2370" },
+     .{ .id = .TF_DSV41_IMAGES, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "Native image segments in the AOT plan", .evidence = "#2370" },
+     .{ .id = .TF_DSV41_BIAS_VL, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "Vision-bias calls in the AOT plan", .evidence = "#2370" },
+diff --git a/zig/src/families/deepseek_v41/affine_linears.zig b/zig/src/families/deepseek_v41/affine_linears.zig
+new file mode 100644
+index 0000000..960e0da
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_linears.zig
+@@ -0,0 +1,98 @@
++//! Every affine linear packed once into `AffineN` tiles, addressable by module name.
++//!
++//! The budget says all linears are ~4.3 GiB packed, so keeping them resident is cheap.
++//! Routed experts are not loaded here: they stay raw and pack one expert at a time.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const Pack = @import("pack.zig").Pack;
++const load = @import("cuda_weights.zig");
++const named = @import("named.zig");
++const affine_load = @import("affine_load.zig");
++const affine_bind = @import("affine_bind.zig");
++const affine_pack = @import("affine_pack.zig");
++const affine_exec = @import("affine_exec.zig");
++
++pub const Item = struct {
++    name: []const u8,
++    tiles: affine_pack.Packed,
++    n: u32,
++    k: u32,
++    bits: u8,
++};
++
++pub const Set = struct {
++    arena: std.heap.ArenaAllocator,
++    items: []Item,
++    map: std.StringHashMapUnmanaged(usize) = .empty,
++
++    pub fn deinit(s: *Set) void {
++        for (s.items) |*item| item.tiles.deinit();
++        s.map.deinit(s.arena.child_allocator);
++        s.arena.deinit();
++        s.* = undefined;
++    }
++
++    pub fn get(s: *const Set, name: []const u8) ?*const Item {
++        const at = s.map.get(name) orelse return null;
++        return &s.items[at];
++    }
++
++    pub fn bytes(s: *const Set) u64 {
++        var total: u64 = 0;
++        for (s.items) |item| {
++            total += item.tiles.words.len + item.tiles.scales.len + item.tiles.biases.len;
++        }
++        return total;
++    }
++};
++
++pub fn loadAll(
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    pack: *const Pack,
++    bindings: []const affine_exec.Binding,
++) !Set {
++    var count: usize = 0;
++    for (bindings) |b| {
++        if (b.mode == .affine8_linear and b.affine_layout != null) count += 1;
++    }
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    const items = try gpa.alloc(Item, count);
++    var made: usize = 0;
++    errdefer {
++        for (items[0..made]) |*item| item.tiles.deinit();
++        gpa.free(items);
++    }
++    var map: std.StringHashMapUnmanaged(usize) = .empty;
++    errdefer map.deinit(gpa);
++
++    for (bindings) |b| {
++        if (b.mode != .affine8_linear or b.affine_layout == null) continue;
++        const layout = b.affine_layout.?;
++        var images = try affine_load.readModule(gpa, io, pack, b.name, layout);
++        var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++        defer builder.deinit();
++        try builder.add(images.weight);
++        try builder.add(images.scales);
++        try builder.add(images.biases);
++        images = undefined; // the builder owns the three images
++
++        var weights: load.Weights = .{ .gpa = gpa, .digest = false };
++        defer weights.close() catch {};
++        try weights.upload(driver, &builder);
++        const dev = try affine_bind.bind(&weights, &b, 1);
++        const tiles = try affine_pack.packLinear(driver, stream, kernels, &dev, b.n, b.k, b.spec.bits);
++        const name = try a.dupe(u8, b.name);
++        try map.put(gpa, name, made);
++        items[made] = .{ .name = name, .tiles = tiles, .n = b.n, .k = b.k, .bits = b.spec.bits };
++        made += 1;
++    }
++    if (made != items.len) return error.AffineSetMismatch;
++    return .{ .arena = arena, .items = items, .map = map };
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 10182b8..88034d5 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -250,6 +250,24 @@ pub const Model = struct {
+                 @as(f64, @floatFromInt(budget.totalRaw())) / (1 << 30),
+                 @as(f64, @floatFromInt(budget.totalPacked())) / (1 << 30),
+             });
++            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", false)) {
++                const kk = cuda.kernels;
++                if (!kk.available) return error.BuiltWithoutKernels;
++                var m8 = try cuda.Module.load(&m.driver, kk.affine8);
++                defer m8.unload();
++                var mp = try cuda.Module.load(&m.driver, kk.affine_prefill);
++                defer mp.unload();
++                var m4 = try cuda.Module.load(&m.driver, kk.affine4_pack);
++                defer m4.unload();
++                const sms: usize = @intCast(try m.ctx.attribute(.multiprocessor_count));
++                const major = try m.ctx.attribute(.compute_capability_major);
++                const minor = try m.ctx.attribute(.compute_capability_minor);
++                var wide = try cuda.qlinear.AffineNKernels.resolve(&m.driver, m8, mp, m4, sms, major == 12 and minor == 1);
++                defer wide.deinit();
++                var set = try @import("affine_linears.zig").loadAll(gpa, io, &m.driver, m.stream, &wide, &m.pack, bindings.items);
++                defer set.deinit();
++                if (!quiet) std.log.info("dsv41 affine load: {d} linears packed, {d:.2} GiB", .{ set.items.len, @as(f64, @floatFromInt(set.bytes())) / (1 << 30) });
++            }
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
+                 m.weights = .{ .gpa = gpa, .digest = false };
+                 defer {
+@@ -642,4 +660,5 @@ test {
+     _ = @import("affine_launch.zig");
+     _ = @import("affine_smoke.zig");
+     _ = @import("affine_budget.zig");
++    _ = @import("affine_linears.zig");
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 6364a92..6aeeef9 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -80,6 +80,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_DSV41_OWN_PREFILL", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_DRAFTS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_SMOKE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_DSV41_AFFINE_LOAD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_GRAPHS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AOT_GUARD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_ENGRAM_PREFETCH", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
