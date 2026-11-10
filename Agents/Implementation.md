@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1q/0026 prepared; GPU run deferred while `dgx1` is shared |
+| Overall status | Stage 1q/0026 + Engram 64-row check done; GPU smoke deferred while `dgx1` is shared |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -34,7 +34,7 @@ needed. This file is the history.
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
 | 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference (0.12% / 0.08%); full layer next |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
-| 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
+| 3. Engram | In progress | Sampled lookups match reference; SSD streaming works | Golden rows and 64-row FP8 conversion pass; `engram.json` assets and full conversion remain |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
 | 5. Qualification and docs | Not started | Metrics, regression suite, reproducible run record | - |
 
@@ -61,6 +61,25 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Engram spec inferred; 64-row conversion verified
+
+- **Phase:** 3 (host-side).
+- **Found:** the OMLX map lists `engram.wkv` but not the `engram.embed` table. Both
+  `test_engram.py` and `convert_engram.py` skipped the two tables and exited success,
+  so the host check was a false pass.
+- **Fix:** when `engram.embed` is absent from the map but its tensors are in the index,
+  infer affine 4-bit/group-32 from the shapes (`U32 [rows,32]`, `BF16 [rows,8]`).
+  Both scripts now return an error if no table is found.
+- **Golden rows:** layer 1 `ones=-11.0615`, `alt=-17.5068`; layer 14
+  `ones=11.1914`, `alt=17.4917`; `k=256`, rows `384006168` / `384016682`.
+- **Converter:** dry-run `188.83 GiB`; `--limit-rows 64 --verify` wrote two 21 KB
+  shards with max 0.125 and RMS 0.0232/0.0256. Ran CPU-only in the image with
+  `--cpus=2 --memory=2g`, no GPU.
+- **Memory:** weights 98.0 GiB; 32K total 112.71 GiB (15.29 GiB headroom); 128K
+  114.85 GiB; 1M 134.81 GiB (does not fit).
+- **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
+  smoke; then the one-layer forward.
 
 ### 2026-11-10 - Stage 1q: expert and 6-bit smoke prepared
 

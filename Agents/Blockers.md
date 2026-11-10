@@ -84,6 +84,11 @@ converts to the engine format (output ~203 GB, with E4M3 requantization loss); a
 4-bit reader would preserve the smaller tables but needs engine work. The `engram.json`
 token map is still required either way.
 
+The OMLX map lists `engram.wkv` but omits the `engram.embed` table. The table tensors are
+present (`U32 [rows,32]`, `BF16 [rows,8]` scales/biases), so the converter and golden test
+infer affine 4-bit/group-32 from the shapes. On 2026-11-10 the dry-run reported
+188.83 GiB; a 64-row conversion verified with max 0.125 and RMS 0.0232/0.0256.
+
 ### B6. Mixed affine/MXFP8/MXFP4/unquantized modules
 
 The target is not uniformly affine. Its omlx map has:

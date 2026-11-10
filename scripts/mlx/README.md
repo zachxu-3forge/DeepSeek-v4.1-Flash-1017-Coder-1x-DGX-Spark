@@ -115,8 +115,10 @@ python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --limit-row
 
 Writes `engram-l<layer>-r0of1.bin` in the engine's FP8/E8M0 row format. The full output
 is ~203 GB; the conversion dequantizes the target's 4-bit groups and requantizes to E4M3,
-so it is slightly lossy. The `engram.json` token map/kit is still required. Use
-`--limit-rows` first and `--verify` to see max/RMS error.
+so it is slightly lossy. The OMLX map lists `engram.wkv` but omits `engram.embed`; the
+scripts infer affine 4-bit/group-32 when the table tensors are present. The `engram.json`
+token map/kit is still required. Use `--limit-rows` first and `--verify` to see max/RMS
+error.
 
 ## Phase 0 gate
 
