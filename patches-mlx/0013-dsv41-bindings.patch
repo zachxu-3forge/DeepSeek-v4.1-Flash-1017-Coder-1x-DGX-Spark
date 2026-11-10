@@ -1,0 +1,171 @@
+diff --git a/zig/src/families/deepseek_v41/affine_dispatch.zig b/zig/src/families/deepseek_v41/affine_dispatch.zig
+index af47f8f..9b77255 100644
+--- a/zig/src/families/deepseek_v41/affine_dispatch.zig
++++ b/zig/src/families/deepseek_v41/affine_dispatch.zig
+@@ -15,6 +15,8 @@ pub const Entry = struct {
+     name: []const u8,
+     spec: affine.Spec,
+     mode: Mode,
++    n: u32,
++    k: u32,
+ };
+ 
+ pub const Dispatch = struct {
+@@ -56,7 +58,7 @@ pub fn build(gpa: std.mem.Allocator, p: *const plan.Plan) !Dispatch {
+     for (p.layers) |layer| {
+         for (layer.modules) |mod| {
+             const mode = try modeFor(mod.kind, mod.spec);
+-            try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode });
++            try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode, .n = mod.layout.n, .k = mod.layout.k });
+             switch (mode) {
+                 .affine8_linear => out.linear += 1,
+                 .affine_n_expert => out.expert += 1,
+@@ -67,7 +69,7 @@ pub fn build(gpa: std.mem.Allocator, p: *const plan.Plan) !Dispatch {
+     }
+     for (p.mixed) |mod| {
+         const mode = try modeFor(mod.kind, mod.spec);
+-        try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode });
++        try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode, .n = mod.n, .k = mod.k });
+         switch (mode) {
+             .affine8_linear => out.linear += 1,
+             .affine_n_expert => out.expert += 1,
+diff --git a/zig/src/families/deepseek_v41/affine_exec.zig b/zig/src/families/deepseek_v41/affine_exec.zig
+new file mode 100644
+index 0000000..6010812
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_exec.zig
+@@ -0,0 +1,75 @@
++//! Host-side bindings for the forward dispatch table.
++//!
++//! Each dispatch entry becomes the layout the launcher needs: an affine layout for
++//! `affine8.cu` linears and the per-expert fallback, or a mixed layout for MXFP8/MXFP4.
++//! Device buffers are bound later; this module only freezes shapes and formats.
++
++const std = @import("std");
++const affine = @import("affine.zig");
++const mixed = @import("mixed.zig");
++const plan = @import("affine_plan.zig");
++const dispatch = @import("affine_dispatch.zig");
++
++pub const Binding = struct {
++    kind: plan.Kind,
++    name: []const u8,
++    spec: affine.Spec,
++    mode: dispatch.Mode,
++    n: u32,
++    k: u32,
++    affine_layout: ?affine.Layout = null,
++    mixed_layout: ?mixed.Layout = null,
++};
++
++pub const Bindings = struct {
++    arena: std.heap.ArenaAllocator,
++    items: []Binding,
++
++    pub fn deinit(b: *Bindings) void {
++        b.arena.deinit();
++        b.* = undefined;
++    }
++};
++
++pub fn build(gpa: std.mem.Allocator, d: *const dispatch.Dispatch) !Bindings {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    const items = try a.alloc(Binding, d.entries.len);
++    for (d.entries, items) |e, *b| {
++        b.* = .{
++            .kind = e.kind,
++            .name = e.name,
++            .spec = e.spec,
++            .mode = e.mode,
++            .n = e.n,
++            .k = e.k,
++        };
++        switch (e.mode) {
++            .affine8_linear, .affine_n_expert => {
++                b.affine_layout = .{ .n = e.n, .k = e.k, .bits = e.spec.bits, .group = e.spec.group };
++            },
++            .mxfp8, .mxfp4 => {
++                b.mixed_layout = .{ .n = e.n, .k = e.k, .bits = e.spec.bits };
++            },
++        }
++    }
++    return .{ .arena = arena, .items = items };
++}
++
++test "bindings freeze affine and mixed layouts" {
++    const a = std.testing.allocator;
++    var entries = [_]dispatch.Entry{
++        .{ .kind = .linear, .name = "layers.0.attn.wq_a", .spec = .{ .bits = 6, .group = 64 }, .mode = .affine8_linear, .n = 1280, .k = 5120 },
++        .{ .kind = .expert, .name = "layers.0.ffn.experts.w1", .spec = .{ .bits = 2, .group = 64 }, .mode = .affine_n_expert, .n = 2304, .k = 5120 },
++        .{ .kind = .linear, .name = "mtp.0.attn.wq_a", .spec = .{ .bits = 8, .mode = .mxfp8 }, .mode = .mxfp8, .n = 1280, .k = 5120 },
++    };
++    var d: dispatch.Dispatch = .{ .arena = std.heap.ArenaAllocator.init(a), .entries = &entries };
++    defer d.deinit();
++    var b = try build(a, &d);
++    defer b.deinit();
++    try std.testing.expectEqual(@as(usize, 3), b.items.len);
++    try std.testing.expectEqual(@as(u32, 64), b.items[0].affine_layout.?.group);
++    try std.testing.expectEqual(@as(u32, 2), b.items[1].affine_layout.?.bits);
++    try std.testing.expectEqual(@as(u8, 8), b.items[2].mixed_layout.?.bits);
++}
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index a611438..02c974c 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -25,6 +25,8 @@ pub const Mixed = struct {
+     kind: Kind,
+     name: []const u8,
+     spec: affine.Spec,
++    n: u32,
++    k: u32,
+ };
+ 
+ pub const Reason = enum { dense, non_affine, engram };
+@@ -78,7 +80,7 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 continue;
+             }
+             if (spec.?.mode != .affine) {
+-                try mixed.append(a, .{ .kind = .linear, .name = name, .spec = spec.? });
++                try mixed.append(a, .{ .kind = .linear, .name = name, .spec = spec.?, .n = r.n, .k = r.k });
+                 continue;
+             }
+             if (r.k == 0 or r.n == 0) {
+@@ -99,11 +101,11 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 try skipped.append(a, .{ .name = name, .reason = .dense });
+                 continue;
+             }
++            const kn = names.ExpertProj.kn(p, cfg);
+             if (spec.?.mode != .affine) {
+-                try mixed.append(a, .{ .kind = .expert, .name = name, .spec = spec.? });
++                try mixed.append(a, .{ .kind = .expert, .name = name, .spec = spec.?, .n = kn[1], .k = kn[0] });
+                 continue;
+             }
+-            const kn = names.ExpertProj.kn(p, cfg);
+             try modules.append(a, .{
+                 .kind = .expert,
+                 .name = name,
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 4fffaf5..58db841 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -239,6 +239,8 @@ pub const Model = struct {
+             defer ap.deinit();
+             var dispatch = try @import("affine_dispatch.zig").build(gpa, &ap);
+             defer dispatch.deinit();
++            var bindings = try @import("affine_exec.zig").build(gpa, &dispatch);
++            defer bindings.deinit();
+             var modules: usize = 0;
+             var native_experts: usize = 0;
+             var fallback_experts: usize = 0;
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index e20447d..94b0344 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -404,4 +404,5 @@ test {
+     _ = @import("mixed.zig");
+     _ = @import("mixed_load.zig");
+     _ = @import("affine_dispatch.zig");
++    _ = @import("affine_exec.zig");
+ }
