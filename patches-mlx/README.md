@@ -29,10 +29,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0022-dsv41-affine-group-sums.patch` | Fill the affine decode's per-row 64-value group sums before launch |
 | `0023-dsv41-smoke-oracle.patch` | Log the CPU oracle for the smoke row and zero the output buffer |
 | `0024-dsv41-smoke-raw.patch` | Log the loaded row's raw words/scales/biases and tensor kinds |
-| `0025-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0026-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0025-dsv41-expert-smoke.patch` | Run expert 0 of `layers.0.ffn.experts.w1` through the per-expert fallback and log `y[0]` |
+| `0026-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0027-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0024`. Planned: `0025`-`0026`.
+Implemented: `0001`-`0025`. Planned: `0026`-`0027`.
 
 Rules:
 

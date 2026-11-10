@@ -1,0 +1,94 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 3fe57ef..6802404 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -15,6 +15,7 @@ const affine_pack = @import("affine_pack.zig");
+ const affine_launch = @import("affine_launch.zig");
+ const affine_plan = @import("affine_plan.zig");
+ const affine_exec = @import("affine_exec.zig");
++const affine_cuda = @import("affine_cuda.zig");
+ 
+ pub const module_name = "layers.0.attn.wq_a";
+ 
+@@ -127,4 +128,81 @@ pub fn run(
+     const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+     std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ module_name, v1, v2 });
++    try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide);
++}
++
++fn runExpert(
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    pack: *const Pack,
++    bindings: *const affine_exec.Bindings,
++    weights: *load.Weights,
++    wide: *const cuda.qlinear.AffineNKernels,
++) !void {
++    const expert_name = "layers.0.ffn.experts.w1";
++    const experts = 192;
++    var chosen: ?*const affine_exec.Binding = null;
++    for (bindings.items) |*b| {
++        if (std.mem.endsWith(u8, b.name, expert_name)) {
++            chosen = b;
++            break;
++        }
++    }
++    const e = chosen orelse return error.SmokeExpertMissing;
++    if (e.mode != .affine_n_expert or e.affine_layout == null or e.kind != .expert) return error.SmokeNotExpert;
++    const layout = e.affine_layout.?;
++    const k: usize = e.k;
++    const bits = e.spec.bits;
++    const group: usize = e.spec.group;
++
++    var images = try affine_load.readModule(gpa, io, pack, e.name, layout);
++    const packed_k = k * bits / 32;
++    const groups = k / group;
++    const w0: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, images.weight.bytes[0 .. packed_k * 4]));
++    const s0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.scales.bytes[0 .. groups * 2]));
++    const b0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.biases.bytes[0 .. groups * 2]));
++    const x1f = try gpa.alloc(f32, k);
++    defer gpa.free(x1f);
++    const x2f = try gpa.alloc(f32, k);
++    defer gpa.free(x2f);
++    for (0..k) |i| {
++        x1f[i] = 1.0;
++        x2f[i] = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
++    }
++    const cpu1 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x1f);
++    const cpu2 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x2f);
++    std.log.info("affine smoke expert cpu {s}: expert0 row0 ones={d:.6} alt={d:.6}", .{ expert_name, cpu1, cpu2 });
++
++    var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++    defer builder.deinit();
++    try builder.add(images.weight);
++    try builder.add(images.scales);
++    try builder.add(images.biases);
++    images = undefined;
++    try weights.upload(driver, &builder);
++    const dev = try affine_bind.bind(weights, e, experts);
++    const view = try affine_cuda.expertView(layout, experts, 0, dev.weight_len, dev.scales_len, dev.biases_len);
++
++    var x1 = try gpa.alloc(u8, k * 2);
++    defer gpa.free(x1);
++    var x2 = try gpa.alloc(u8, k * 2);
++    defer gpa.free(x2);
++    for (0..k) |i| {
++        std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
++        const v: f32 = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
++        std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
++    }
++    var y1 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x1, 1);
++    defer y1.deinit();
++    var y2 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x2, 1);
++    defer y2.deinit();
++    const b1 = try y1.download(driver, gpa);
++    defer gpa.free(b1);
++    const b2 = try y2.download(driver, gpa);
++    defer gpa.free(b2);
++    const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
++    const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
++    std.log.info("affine smoke expert {s}: y[0] ones={d:.6} alt={d:.6}", .{ expert_name, v1, v2 });
+ }
