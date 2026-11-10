@@ -75,11 +75,11 @@ def main(argv: list[str] | None = None) -> int:
         shard = weight_map[name]
         if shard not in headers:
             headers[shard] = read_header(os.path.join(model, shard))
-        header, _ = headers[shard]
+        header, base = headers[shard]
         info = header[name]
-        start, end = info["data_offsets"]
-        entries.append((name, info["dtype"], info["shape"], shard, start, end - start))
-        total += end - start
+        begin, end = info["data_offsets"]
+        entries.append((name, info["dtype"], info["shape"], shard, base + begin, end - begin))
+        total += end - begin
 
     # safetensors header, padded to 8 bytes
     head = {"__metadata__": {"format": "pt"}}
