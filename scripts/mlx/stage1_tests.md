@@ -33,6 +33,7 @@ Runs:
 
 ```sh
 CONTAINER=1 BUILD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
+CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
 Adds a `tensorfold-dsv41` boot with `TF_DSV41_LAYERS=0-0` and `TF_DSV41_DRAFTS=0`,
@@ -49,6 +50,10 @@ The GPU harness must reproduce `reference_layer.json`:
 - the same module/row/expert,
 - the same `dot_ones` and `dot_alt` within the documented tolerance,
 - the same dispatch counts as `plan_dispatch.json`.
+
+`SMOKE=1` adds a one-projection run: `smoke.log` must contain
+`affine smoke layers.0.attn.wq_a: y[0] ones=... alt=...`; compare those two values with
+the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
 For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report

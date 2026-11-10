@@ -60,6 +60,7 @@ runtime only.
 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh --host-only
 CONTAINER=1 BUILD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 CONTAINER=1 EXPECT_FORWARD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
+CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
 `test_stage1.sh` runs the inspector, translator, dispatch counter, CPU golden rows, Engram

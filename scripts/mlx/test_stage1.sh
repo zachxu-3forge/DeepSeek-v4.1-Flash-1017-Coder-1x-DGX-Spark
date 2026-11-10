@@ -24,6 +24,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 MODEL_DIR=${MODEL_DIR:-}
 CONTAINER=${CONTAINER:-0}
 EXPECT_FORWARD=${EXPECT_FORWARD:-0}
+SMOKE=${SMOKE:-0}
 SERVE_ARGS=${SERVE_ARGS:-serve /model}
 IMAGE=${IMAGE:-tf-dsv41-mlx:dev}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -34,6 +35,7 @@ for arg in "$@"; do
     --host-only) CONTAINER=0 ;;
     --container) CONTAINER=1 ;;
     --expect-forward) EXPECT_FORWARD=1 ;;
+    --smoke) SMOKE=1 ;;
     --build) BUILD=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
@@ -106,6 +108,22 @@ if [[ "$CONTAINER" == "1" ]]; then
   else
     lines+=("| engine | FAIL ($rc) | \`engine.log\` |")
     fail=1
+  fi
+
+  if [[ "$SMOKE" == "1" ]]; then
+    echo "== affine smoke"
+    set +e
+    TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_SMOKE=1 \
+      timeout 300 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
+      >"$OUT_DIR/smoke.log" 2>&1
+    rc_smoke=$?
+    set -e
+    if grep -q "affine smoke" "$OUT_DIR/smoke.log"; then
+      lines+=("| affine smoke | PASS | \`smoke.log\` |")
+    else
+      lines+=("| affine smoke | FAIL ($rc_smoke) | \`smoke.log\` |")
+      fail=1
+    fi
   fi
 
   if [[ -f "$OUT_DIR/plan_dispatch.json" && -f "$OUT_DIR/engine.log" ]]; then

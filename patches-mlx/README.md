@@ -22,10 +22,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0015-dsv41-one-layer-selection.patch` | Make the affine boot guard check only `TF_DSV41_LAYERS`, enabling one-layer fixtures |
 | `0016-dsv41-affine-pack.patch` | Pack affine projections into `AffineN` device tiles; no kernel launch yet |
 | `0017-dsv41-affine-launch.patch` | Launch `AffineNKernels.decode`/`prompt` with x, group sums, and output buffers |
-| `0018-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0019-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0018-dsv41-affine-smoke.patch` | One-projection smoke test: load `wq_a`, pack, decode two rows, log `y[0]` |
+| `0019-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0020-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0017`. Planned: `0018`-`0019`.
+Implemented: `0001`-`0018`. Planned: `0019`-`0020`.
 
 Rules:
 

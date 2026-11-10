@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1o launch committed; wire one-layer path next |
+| Overall status | Stage 1p smoke test committed; Spark run next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1o decode/prompt launch committed; one-layer wiring pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1p smoke committed; GPU comparison pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -61,6 +61,21 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1p: affine smoke test
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0018-dsv41-affine-smoke.patch` with `affine_smoke.zig`:
+  under `TF_DSV41_AFFINE_SMOKE=1`, loads `layers.0.attn.wq_a`, uploads it, loads the
+  `AffineN` kernels, packs the projection, and decodes two deterministic rows. Logs
+  `affine smoke layers.0.attn.wq_a: y[0] ones=... alt=...`.
+- **Approach used:** one projection only; the normal affine boot still returns
+  `AffineForwardNotPorted`.
+- **Verification:** `0018` applies on top of `0001`-`0017`; ast-check passes. The smoke
+  needs the Spark build/GPU.
+- **Artifacts:** `patches-mlx/0018-dsv41-affine-smoke.patch`.
+- **Next:** run `CONTAINER=1 SMOKE=1 test_stage1.sh` and compare the two logged values
+  with `reference_layer.json`.
 
 ### 2026-11-10 - Stage 1o: AffineN launch
 
@@ -423,6 +438,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | One-layer fixture | Test one layer without 211 GiB load | `make_one_layer.py` + layer-selection patch | Shortens the 1o/1p loop and memory footprint | `0015` committed; 48 tensors |
 | AffineN packing | Device tiles for the launch | `affine_pack.zig` allocates and packs word/scale/bias buffers | First device-side affine step | `0016` committed; stub-CUDA test |
 | AffineN launch | Run a projection | `affine_launch.zig` allocates x/sums/out and calls decode/prompt | First actual affine kernel call | `0017` committed; stub-CUDA test |
+| Affine smoke | Compare one projection to golden | `affine_smoke.zig` loads `wq_a`, packs/decodes two rows | Proves reader→pack→launch before the full layer | `0018` committed; GPU run pending |
 | Engram | Convert 4-bit affine tables to engine rows | FP8 E4M3/E8M0 row shards (`264 B/row`) | Matches `engram_rows.zig` without engine changes | Converter + unit checks pass; ~203 GB output |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
@@ -465,6 +481,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | AffineN packing | `zig test` on `affine_pack.zig` with stub CUDA | Pass | Target tile sizes non-zero |
 | 2026-11-10 | `0017` patch apply | `git apply` on `0001`-`0016` | Pass | AffineN launch |
 | 2026-11-10 | AffineN launch | stub-CUDA test of `affine_launch.linear` | Pass | Allocates x/sums/output |
+| 2026-11-10 | `0018` patch apply | `git apply` on `0001`-`0017` | Pass | Affine smoke |
+| 2026-11-10 | Affine smoke syntax | `zig ast-check` on `affine_smoke`/`cuda_model`/`named` | Pass | GPU run pending |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -482,7 +500,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, pack `AffineN` tiles, and launch single-projection decode/prompt. The remaining work is wiring the one-layer forward and the per-expert loop; the affine path deliberately returns `AffineForwardNotPorted`.
+- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, pack and launch `AffineN`, and add a one-projection smoke test. The next gate is the Spark run of `SMOKE=1`; the per-expert loop and full forward remain.
 - Engram conversion is ready but expands to ~203 GB and requantizes to E4M3; a native 4-bit reader would avoid both, at the cost of engine work. The `engram.json` token map is still required.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
@@ -494,7 +512,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Run `convert_engram.py --dry-run/--limit-rows` and `make_one_layer.py` with the real checkpoint.
-2. Wire a one-layer test that packs `attn.wq_a`, runs `affine_launch.linear`, and compares against the golden row.
-3. Wire the per-expert fallback loop and the MXFP4 decision.
-4. At the end, build the container, run `EXPECT_FORWARD=1 test_stage1.sh`, and record all results here.
+1. On the Spark: build the image, create the one-layer fixture, and run `CONTAINER=1 SMOKE=1 test_stage1.sh`.
+2. Compare the smoke `y[0]` values with `reference_layer.json`; record the error in this file.
+3. Wire the per-expert fallback loop and decide the MXFP4 path.
+4. Then move to the full model and server qualification.

@@ -1,0 +1,143 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+new file mode 100644
+index 0000000..e2a6b05
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -0,0 +1,96 @@
++//! One-projection smoke test for the affine path.
++//!
++//! Loads `layers.0.attn.wq_a`, packs it into `AffineN` tiles, runs one decode row with
++//! two deterministic inputs, and logs `y[0]` for comparison with `reference_layer.py`.
++//! Enabled by `TF_DSV41_AFFINE_SMOKE=1`; the normal affine boot remains guarded.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const Pack = @import("pack.zig").Pack;
++const named = @import("named.zig");
++const load = @import("cuda_weights.zig");
++const affine_load = @import("affine_load.zig");
++const affine_bind = @import("affine_bind.zig");
++const affine_pack = @import("affine_pack.zig");
++const affine_launch = @import("affine_launch.zig");
++const affine_plan = @import("affine_plan.zig");
++const affine_exec = @import("affine_exec.zig");
++
++pub const module_name = "layers.0.attn.wq_a";
++
++fn find(bindings: *const affine_exec.Bindings) ?*const affine_exec.Binding {
++    for (bindings.items) |*b| {
++        if (std.mem.eql(u8, b.name, module_name)) return b;
++    }
++    return null;
++}
++
++fn bf16(x: f32) u16 {
++    return named.bf16Round(x);
++}
++
++pub fn run(
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *const cuda.Driver,
++    ctx: *const cuda.Context,
++    stream: cuda.Stream,
++    pack: *const Pack,
++    plan: *const affine_plan.Plan,
++    bindings: *const affine_exec.Bindings,
++    weights: *load.Weights,
++) !void {
++    _ = plan;
++    const chosen = find(bindings) orelse return error.SmokeModuleMissing;
++    if (chosen.mode != .affine8_linear or chosen.affine_layout == null) return error.SmokeNotAffine;
++    const layout = chosen.affine_layout.?;
++
++    var images = try affine_load.readModule(gpa, io, pack, chosen.name, layout);
++    var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++    defer builder.deinit();
++    try builder.add(images.weight);
++    try builder.add(images.scales);
++    try builder.add(images.biases);
++    images = undefined; // the builder owns the three images
++    try weights.upload(driver, &builder);
++
++    const dev = try affine_bind.bind(weights, chosen, 1);
++    const kk = cuda.kernels;    if (!kk.available) return error.BuiltWithoutKernels;
++    var m8 = try cuda.Module.load(driver, kk.affine8);
++    defer m8.unload();
++    var mp = try cuda.Module.load(driver, kk.affine_prefill);
++    defer mp.unload();
++    var m4 = try cuda.Module.load(driver, kk.affine4_pack);
++    defer m4.unload();
++    const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
++    const major = try ctx.attribute(.compute_capability_major);
++    const minor = try ctx.attribute(.compute_capability_minor);
++    var wide = try cuda.qlinear.AffineNKernels.resolve(driver, m8, mp, m4, sms, major == 12 and minor == 1);
++    defer wide.deinit();
++
++    var tiles = try affine_pack.packLinear(driver, stream, &wide, &dev, chosen.n, chosen.k, chosen.spec.bits);
++    defer tiles.deinit();
++
++    const k = chosen.k;
++    var x1 = try gpa.alloc(u8, @as(usize, k) * 2);
++    defer gpa.free(x1);
++    var x2 = try gpa.alloc(u8, @as(usize, k) * 2);
++    defer gpa.free(x2);
++    for (0..k) |i| {
++        std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
++        const v: f32 = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
++        std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
++    }
++
++    var y1 = try affine_launch.linear(driver, stream, &wide, &tiles, x1, 1);
++    defer y1.deinit();
++    var y2 = try affine_launch.linear(driver, stream, &wide, &tiles, x2, 1);
++    defer y2.deinit();
++    const b1 = try y1.download(driver, gpa);
++    defer gpa.free(b1);
++    const b2 = try y2.download(driver, gpa);
++    defer gpa.free(b2);
++    const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
++    const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
++    std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ module_name, v1, v2 });
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index b4aa547..1890841 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -241,6 +241,13 @@ pub const Model = struct {
+             defer dispatch.deinit();
+             var bindings = try @import("affine_exec.zig").build(gpa, &dispatch);
+             defer bindings.deinit();
++            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
++                m.weights = .{ .gpa = gpa, .digest = false };
++                defer {
++                    m.weights.close() catch {};
++                }
++                try @import("affine_smoke.zig").run(gpa, io, &m.driver, &m.ctx, m.stream, &m.pack, &ap, &bindings, &m.weights);
++            }
+             var modules: usize = 0;
+             var native_experts: usize = 0;
+             var fallback_experts: usize = 0;
+@@ -624,4 +631,5 @@ test "Draft state: failed model drain retains its context and allocation owner"
+ test {
+     _ = @import("affine_pack.zig");
+     _ = @import("affine_launch.zig");
++    _ = @import("affine_smoke.zig");
+ }
+diff --git a/zig/src/families/deepseek_v41/named.zig b/zig/src/families/deepseek_v41/named.zig
+index 0ea1588..13f1654 100644
+--- a/zig/src/families/deepseek_v41/named.zig
++++ b/zig/src/families/deepseek_v41/named.zig
+@@ -121,6 +121,12 @@ pub const Builder = struct {
+         b.out.appendAssumeCapacity(n);
+     }
+ 
++    /// Append an image whose name and bytes the builder now owns.
++    pub fn add(b: *Builder, n: Named) !void {
++        try b.out.ensureUnusedCapacity(b.gpa, 1);
++        b.out.appendAssumeCapacity(n);
++    }
++
+     fn copy(b: *Builder, src: []const u8) ![]align(16) u8 {
+         const d = try b.gpa.alignedAlloc(u8, .@"16", src.len);
+         @memcpy(d, src);
