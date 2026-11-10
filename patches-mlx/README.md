@@ -19,10 +19,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0012-dsv41-affine-dispatch.patch` | Build the forward dispatch table: affine8 linears, per-expert fallback, MXFP8/MXFP4 |
 | `0013-dsv41-bindings.patch` | Freeze affine/mixed layouts for the dispatch entries; bind device buffers later |
 | `0014-dsv41-device-bindings.patch` | Bind the dispatch layouts to loaded device tensors with byte-size checks |
-| `0015-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0016-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
+| `0015-dsv41-one-layer-selection.patch` | Make the affine boot guard check only `TF_DSV41_LAYERS`, enabling one-layer fixtures |
+| `0016-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0017-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
 
-Implemented: `0001`-`0014`. Planned: `0015`-`0016`.
+Implemented: `0001`-`0015`. Planned: `0016`-`0017`.
 
 Rules:
 

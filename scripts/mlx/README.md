@@ -66,6 +66,17 @@ CONTAINER=1 EXPECT_FORWARD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 checks, and optionally the container boot. Results land in `out/stage1/<timestamp>/` with a
 `summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
 
+## One-layer fixture and memory
+
+```sh
+python3 scripts/mlx/make_one_layer.py "$MODEL_DIR" /models/mlx-one-layer --layer 0
+python3 scripts/mlx/memory_estimate.py "$MODEL_DIR"
+```
+
+`make_one_layer.py` copies layer 0 plus the embedding, final norm, and head into a translated
+fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` reports weights + conservative KV +
+reserve against 128 GiB at each context.
+
 ## Phase 0 gate
 
 The harness is ready when the image builds, `tensorfold-dsv41 --version` runs, and the engine

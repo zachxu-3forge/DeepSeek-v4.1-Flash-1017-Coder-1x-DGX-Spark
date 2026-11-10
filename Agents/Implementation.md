@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1n committed (device bindings); kernel launch next |
+| Overall status | Stage 1prep committed (one-layer fixture + memory estimate); 1o launch next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1n device bindings committed; kernel launch pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | One-layer fixture + layer-selection patch committed; launch pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -61,6 +61,21 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1prep: one-layer fixture and memory estimate
+
+- **Phase:** 1 (preparation for 1o).
+- **Done:** added `make_one_layer.py` (copies one layer + embed/norm/head into a translated
+  fixture), `memory_estimate.py` (weights + 584 B/layer/token KV + reserve vs 128 GiB), and
+  `patches-mlx/0015-dsv41-one-layer-selection.patch` so the affine guard checks only the
+  layers selected by `TF_DSV41_LAYERS`.
+- **Approach used:** one-layer fixture reduces a full-model load to a few GiB; the memory
+  estimator uses the engine's KV record size and exposes the inputs for live calibration.
+- **Verification:** `0015` applies on top of `0001`-`0014`; `make_one_layer.py --list` sees
+  48 tensors for layer 0; the estimate puts 32K at ~112.7 GiB and 1M at ~134.8 GiB.
+- **Artifacts:** `scripts/mlx/make_one_layer.py`, `scripts/mlx/memory_estimate.py`,
+  `patches-mlx/0015-dsv41-one-layer-selection.patch`.
+- **Next:** stage 1o; run the one-layer fixture on the Spark.
 
 ### 2026-11-10 - Stage 1n: device bindings
 
@@ -362,6 +377,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | Forward dispatch | Map modules to kernels | `.affine8_linear`, `.affine_n_expert`, `.mxfp8`, `.mxfp4` table | Separates format selection from buffer binding | `0012` committed; 18 tests |
 | Binding layouts | Freeze shapes for device binding | `affine_exec.zig` carries n/k/bits/group per entry | Device allocation and launch remain separate | `0013` committed; 25 tests |
 | Device bindings | Resolve loaded tensors to addresses | `affine_bind.zig` checks bytes and freezes ptr/len | Verifies the loader and binding contract before launch | `0014` committed; 26 tests |
+| One-layer fixture | Test one layer without 211 GiB load | `make_one_layer.py` + layer-selection patch | Shortens the 1o/1p loop and memory footprint | `0015` committed; 48 tensors |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
@@ -394,6 +410,9 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | Binding layouts | `zig test` on `affine_exec.zig` | Pass | 25-test host suite |
 | 2026-11-10 | `0014` patch apply | `git apply` on `0001`-`0013` | Pass | Device bindings |
 | 2026-11-10 | Device bindings | `zig test` on `affine_bind.zig` | Pass | 26-test host suite |
+| 2026-11-10 | `0015` patch apply | `git apply` on `0001`-`0014` | Pass | One-layer selection |
+| 2026-11-10 | One-layer fixture list | `make_one_layer.py --list` | Pass | 48 tensors for layer 0 |
+| 2026-11-10 | Memory estimate | `memory_estimate.py` | Pass | 32K ≈112.7 GiB, 1M ≈134.8 GiB |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -411,7 +430,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1n admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, and resolve device addresses. The remaining work is the actual kernel launch; the affine path deliberately returns `AffineForwardNotPorted`.
+- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, and build a one-layer fixture. The remaining work is the actual kernel launch; the affine path deliberately returns `AffineForwardNotPorted`.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -422,7 +441,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Run `scripts/mlx/test_stage1.sh --host-only` with the real checkpoint and keep the result directory.
-2. Implement stage 1o: launch the affine8 linears and the per-expert fallback on one layer.
+1. Run `scripts/mlx/make_one_layer.py "$MODEL_DIR" /models/mlx-one-layer --layer 0` and `scripts/mlx/test_stage1.sh --host-only`.
+2. Implement stage 1o: launch the affine8 linears and the per-expert fallback on the one-layer fixture.
 3. Implement stage 1p: the Engram affine reader/converter.
 4. At the end, build the container, run `EXPECT_FORWARD=1 test_stage1.sh`, and record all results here.

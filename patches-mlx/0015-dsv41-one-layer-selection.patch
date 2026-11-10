@@ -1,0 +1,14 @@
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 58db841..df440ce 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -246,6 +246,9 @@ pub const Model = struct {
+             var fallback_experts: usize = 0;
+             var unsupported_linears: usize = 0;
+             for (ap.layers) |layer| {
++                if (o.layers) |want| {
++                    if (std.mem.indexOfScalar(u32, want, layer.index) == null) continue;
++                }
+                 for (layer.modules) |mod| {
+                     try @import("affine_load.zig").checkModule(&m.pack, mod.name, mod.layout);
+                     modules += 1;
