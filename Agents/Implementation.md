@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1p guard + affine smoke PASS on Spark; full layer forward next |
+| Overall status | Stage 1q/0026 prepared; GPU run deferred while `dgx1` is shared |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` |
+| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`/`0026` rebuild pending) |
 | Last updated | 2026-11-10 |
 
 ## Phase tracker
@@ -61,6 +61,23 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1q: expert and 6-bit smoke prepared
+
+- **Phase:** 1.
+- **Done:** `0025-dsv41-expert-smoke.patch` runs expert 0 of
+  `layers.0.ffn.experts.w1` through `affine_cuda.expertView` + `affine_launch.expert`,
+  with a CPU `affine_ref.dotRow` oracle. `0026-dsv41-smoke-6bit.patch` refactors the
+  smoke to run the 8-bit `wq_a`, the 6-bit `ffn.shared_experts.w1`, and the 2-bit expert.
+  The harness now compares all three GPU lines with `reference_layer.json`.
+- **Golden rows:** `wq_a` `-0.153510/2.451196`, `shared_experts.w1` `0.084923/3.316952`,
+  `experts.w1` expert 0 `0.134277/0.107697`.
+- **Verification:** patches `0001`-`0026` apply cleanly; `zig ast-check` passes. Host-only
+  `test_stage1.sh` passes, including the new fixture/translator/dispatch unit checks.
+- **Not run:** GPU smoke/guard. `dgx1` is serving another workload; the build and model
+  runs were stopped to leave the GPU and CPU free. The next GPU window should rebuild
+  with `0025`/`0026` and rerun `CONTAINER=1 SMOKE=1`.
+- **Next:** one attention block, then one MoE block, then the full layer forward.
 
 ### 2026-11-10 - Stage 1p smoke passes on Spark
 

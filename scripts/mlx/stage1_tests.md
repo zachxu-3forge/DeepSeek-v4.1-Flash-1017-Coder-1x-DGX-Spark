@@ -85,8 +85,8 @@ the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`. The har
 
 On the published checkpoint the CPU row is `ones=-0.153510`, `alt=2.451196`; the first
 Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%). The same smoke also
-runs expert 0 of `layers.0.ffn.experts.w1` through the 2-bit per-expert fallback; its CPU
-row is `ones=0.134277`, `alt=0.107697`.
+runs the 6-bit `layers.0.ffn.shared_experts.w1` (CPU `0.084923/3.316952`) and expert 0 of
+the 2-bit `layers.0.ffn.experts.w1` (CPU `0.134277/0.107697`).
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
 For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report

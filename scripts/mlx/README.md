@@ -122,5 +122,6 @@ so it is slightly lossy. The `engram.json` token map/kit is still required. Use
 
 The harness is ready: the image builds, `tensorfold-dsv41 --version` runs, and the engine
 admits the 192-expert, world-1 affine plan. The Stage 1p guard logs
-`307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and the one-projection
-smoke matches the CPU row within BF16 rounding.
+`307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and the projection smoke
+(8-bit `wq_a`, 6-bit `shared_experts.w1`, 2-bit expert 0) matches the CPU rows within BF16
+rounding.

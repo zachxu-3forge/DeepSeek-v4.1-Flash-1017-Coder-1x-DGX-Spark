@@ -136,6 +136,7 @@ ref = json.load(open(sys.argv[1], encoding="utf-8"))
 text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
 checks = (
     ("layers.0.attn.wq_a", r"affine smoke layers\.0\.attn\.wq_a: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"),
+    ("layers.0.ffn.shared_experts.w1", r"affine smoke layers\.0\.ffn\.shared_experts\.w1: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"),
     ("layers.0.ffn.experts.w1", r"affine smoke expert layers\.0\.ffn\.experts\.w1: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"),
 )
 for canonical, pattern in checks:

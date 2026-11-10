@@ -30,10 +30,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0023-dsv41-smoke-oracle.patch` | Log the CPU oracle for the smoke row and zero the output buffer |
 | `0024-dsv41-smoke-raw.patch` | Log the loaded row's raw words/scales/biases and tensor kinds |
 | `0025-dsv41-expert-smoke.patch` | Run expert 0 of `layers.0.ffn.experts.w1` through the per-expert fallback and log `y[0]` |
-| `0026-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0027-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0026-dsv41-smoke-6bit.patch` | Also smoke the 6-bit `layers.0.ffn.shared_experts.w1` linear |
+| `0027-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0028-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0025`. Planned: `0026`-`0027`.
+Implemented: `0001`-`0026`. Planned: `0027`-`0028`.
 
 Rules:
 

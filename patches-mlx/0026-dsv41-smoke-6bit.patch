@@ -1,0 +1,186 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 6802404..d4155f0 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -1,7 +1,8 @@
+ //! One-projection smoke test for the affine path.
+ //!
+-//! Loads `layers.0.attn.wq_a`, packs it into `AffineN` tiles, runs one decode row with
+-//! two deterministic inputs, and logs `y[0]` for comparison with `reference_layer.py`.
++//! Loads one 8-bit linear (`wq_a`), one 6-bit linear (`shared_experts.w1`), and expert 0
++//! of a 2-bit routed stack, packs them, runs one decode row with two deterministic inputs,
++//! and logs `y[0]` for comparison with `reference_layer.py`.
+ //! Enabled by `TF_DSV41_AFFINE_SMOKE=1`; the normal affine boot remains guarded.
+ 
+ const std = @import("std");
+@@ -18,10 +19,12 @@ const affine_exec = @import("affine_exec.zig");
+ const affine_cuda = @import("affine_cuda.zig");
+ 
+ pub const module_name = "layers.0.attn.wq_a";
++const shared_name = "layers.0.ffn.shared_experts.w1";
++const expert_name = "layers.0.ffn.experts.w1";
+ 
+-fn find(bindings: *const affine_exec.Bindings) ?*const affine_exec.Binding {
++fn find(bindings: *const affine_exec.Bindings, name: []const u8) ?*const affine_exec.Binding {
+     for (bindings.items) |*b| {
+-        if (std.mem.endsWith(u8, b.name, module_name)) return b;
++        if (std.mem.endsWith(u8, b.name, name)) return b;
+     }
+     return null;
+ }
+@@ -42,16 +45,46 @@ pub fn run(
+     weights: *load.Weights,
+ ) !void {
+     _ = plan;
+-    const chosen = find(bindings) orelse return error.SmokeModuleMissing;
++    const kk = cuda.kernels;
++    if (!kk.available) return error.BuiltWithoutKernels;
++    var m8 = try cuda.Module.load(driver, kk.affine8);
++    defer m8.unload();
++    var mp = try cuda.Module.load(driver, kk.affine_prefill);
++    defer mp.unload();
++    var m4 = try cuda.Module.load(driver, kk.affine4_pack);
++    defer m4.unload();
++    const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
++    const major = try ctx.attribute(.compute_capability_major);
++    const minor = try ctx.attribute(.compute_capability_minor);
++    var wide = try cuda.qlinear.AffineNKernels.resolve(driver, m8, mp, m4, sms, major == 12 and minor == 1);
++    defer wide.deinit();
++
++    try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, module_name);
++    try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, shared_name);
++    try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide);
++}
++
++fn runLinear(
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    pack: *const Pack,
++    bindings: *const affine_exec.Bindings,
++    weights: *load.Weights,
++    wide: *const cuda.qlinear.AffineNKernels,
++    name: []const u8,
++) !void {
++    const chosen = find(bindings, name) orelse return error.SmokeModuleMissing;
+     if (chosen.mode != .affine8_linear or chosen.affine_layout == null) return error.SmokeNotAffine;
+     const layout = chosen.affine_layout.?;
+ 
+     var images = try affine_load.readModule(gpa, io, pack, chosen.name, layout);
+-    const k = chosen.k;
++    const k: usize = chosen.k;
+     const bits = chosen.spec.bits;
+     const group: usize = chosen.spec.group;
+-    const packed_k = @as(usize, k) * bits / 32;
+-    const groups = @as(usize, k) / group;
++    const packed_k = k * bits / 32;
++    const groups = k / group;
+     const w0: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, images.weight.bytes[0 .. packed_k * 4]));
+     const s0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.scales.bytes[0 .. groups * 2]));
+     const b0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.biases.bytes[0 .. groups * 2]));
+@@ -65,21 +98,7 @@ pub fn run(
+     }
+     const cpu1 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x1f);
+     const cpu2 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x2f);
+-    std.log.info("affine smoke raw {s}: kinds {s}/{s}/{s} lens {d}/{d}/{d} w0={x} s0={x} b0={x} s1={x} b1={x}", .{
+-        module_name,
+-        @tagName(images.weight.kind),
+-        @tagName(images.scales.kind),
+-        @tagName(images.biases.kind),
+-        images.weight.bytes.len,
+-        images.scales.bytes.len,
+-        images.biases.bytes.len,
+-        w0[0],
+-        s0[0],
+-        b0[0],
+-        s0[1],
+-        b0[1],
+-    });
+-    std.log.info("affine smoke cpu {s}: row0 ones={d:.6} alt={d:.6}", .{ module_name, cpu1, cpu2 });
++    std.log.info("affine smoke cpu {s}: row0 ones={d:.6} alt={d:.6}", .{ name, cpu1, cpu2 });
+ 
+     var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+     defer builder.deinit();
+@@ -90,26 +109,12 @@ pub fn run(
+     try weights.upload(driver, &builder);
+ 
+     const dev = try affine_bind.bind(weights, chosen, 1);
+-    const kk = cuda.kernels;
+-    if (!kk.available) return error.BuiltWithoutKernels;
+-    var m8 = try cuda.Module.load(driver, kk.affine8);
+-    defer m8.unload();
+-    var mp = try cuda.Module.load(driver, kk.affine_prefill);
+-    defer mp.unload();
+-    var m4 = try cuda.Module.load(driver, kk.affine4_pack);
+-    defer m4.unload();
+-    const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
+-    const major = try ctx.attribute(.compute_capability_major);
+-    const minor = try ctx.attribute(.compute_capability_minor);
+-    var wide = try cuda.qlinear.AffineNKernels.resolve(driver, m8, mp, m4, sms, major == 12 and minor == 1);
+-    defer wide.deinit();
+-
+-    var tiles = try affine_pack.packLinear(driver, stream, &wide, &dev, chosen.n, chosen.k, chosen.spec.bits);
++    var tiles = try affine_pack.packLinear(driver, stream, wide, &dev, chosen.n, chosen.k, chosen.spec.bits);
+     defer tiles.deinit();
+ 
+-    var x1 = try gpa.alloc(u8, @as(usize, k) * 2);
++    const x1 = try gpa.alloc(u8, k * 2);
+     defer gpa.free(x1);
+-    var x2 = try gpa.alloc(u8, @as(usize, k) * 2);
++    const x2 = try gpa.alloc(u8, k * 2);
+     defer gpa.free(x2);
+     for (0..k) |i| {
+         std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
+@@ -117,9 +122,9 @@ pub fn run(
+         std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
+     }
+ 
+-    var y1 = try affine_launch.linear(gpa, driver, stream, &wide, &tiles, x1, 1);
++    var y1 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x1, 1);
+     defer y1.deinit();
+-    var y2 = try affine_launch.linear(gpa, driver, stream, &wide, &tiles, x2, 1);
++    var y2 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x2, 1);
+     defer y2.deinit();
+     const b1 = try y1.download(driver, gpa);
+     defer gpa.free(b1);
+@@ -127,8 +132,7 @@ pub fn run(
+     defer gpa.free(b2);
+     const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+-    std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ module_name, v1, v2 });
+-    try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide);
++    std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
+ }
+ 
+ fn runExpert(
+@@ -141,16 +145,8 @@ fn runExpert(
+     weights: *load.Weights,
+     wide: *const cuda.qlinear.AffineNKernels,
+ ) !void {
+-    const expert_name = "layers.0.ffn.experts.w1";
+     const experts = 192;
+-    var chosen: ?*const affine_exec.Binding = null;
+-    for (bindings.items) |*b| {
+-        if (std.mem.endsWith(u8, b.name, expert_name)) {
+-            chosen = b;
+-            break;
+-        }
+-    }
+-    const e = chosen orelse return error.SmokeExpertMissing;
++    const e = find(bindings, expert_name) orelse return error.SmokeExpertMissing;
+     if (e.mode != .affine_n_expert or e.affine_layout == null or e.kind != .expert) return error.SmokeNotExpert;
+     const layout = e.affine_layout.?;
+     const k: usize = e.k;
+@@ -185,9 +181,9 @@ fn runExpert(
+     const dev = try affine_bind.bind(weights, e, experts);
+     const view = try affine_cuda.expertView(layout, experts, 0, dev.weight_len, dev.scales_len, dev.biases_len);
+ 
+-    var x1 = try gpa.alloc(u8, k * 2);
++    const x1 = try gpa.alloc(u8, k * 2);
+     defer gpa.free(x1);
+-    var x2 = try gpa.alloc(u8, k * 2);
++    const x2 = try gpa.alloc(u8, k * 2);
+     defer gpa.free(x2);
+     for (0..k) |i| {
+         std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
