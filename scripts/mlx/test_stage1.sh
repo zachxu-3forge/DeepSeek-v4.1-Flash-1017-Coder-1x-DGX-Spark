@@ -73,12 +73,15 @@ step translate_config "$PY" "$ROOT/scripts/mlx/translate_config.py" "$MODEL_DIR"
   --out "$OUT_DIR/quantization.json" --write-config "$OUT_DIR/config.translated.json"
 step plan_dispatch "$PY" "$ROOT/scripts/mlx/plan_dispatch.py" "$MODEL_DIR" --json "$OUT_DIR/plan_dispatch.json"
 
-if [[ -f "$MODEL_DIR/model-00001-of-00021.safetensors" ]]; then
+if [[ -f "$MODEL_DIR/model-00001-of-00021.safetensors" && -f "$MODEL_DIR/model-00020-of-00021.safetensors" ]]; then
   step reference_layer "$PY" "$ROOT/scripts/mlx/reference_layer.py" "$MODEL_DIR" --out "$OUT_DIR/reference_layer.json"
+else
+  lines+=("| reference_layer | SKIP | shard 20 not downloaded |")
+fi
+if [[ -f "$MODEL_DIR/model-00018-of-00021.safetensors" && -f "$MODEL_DIR/model-00019-of-00021.safetensors" ]]; then
   step engram "$PY" "$ROOT/scripts/mlx/test_engram.py" "$MODEL_DIR" --out "$OUT_DIR/engram.json"
 else
-  lines+=("| reference_layer | SKIP | shards not downloaded |")
-  lines+=("| engram | SKIP | shards not downloaded |")
+  lines+=("| engram | SKIP | Engram shards not downloaded |")
 fi
 
 if [[ "$CONTAINER" == "1" ]]; then
