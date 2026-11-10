@@ -611,6 +611,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | Spark affine smoke | one-layer fixture, `TF_DSV41_AFFINE_SMOKE=1` | Pass | GPU `-0.153320/2.453125` vs CPU `-0.153510/2.451196` |
 | 2026-11-10 | One-layer fixture bytes | `test_make_one_layer.py` | Pass | Fixture bytes equal the source shard |
 | 2026-11-10 | Full harness | `CONTAINER=1 SMOKE=1 test_stage1.sh` | Pass | Smoke match and dispatch match PASS |
+| 2026-11-10 | Host checks with real Engram | `test_stage1.sh --host-only` | Pass | Engram rows tested; 9 checks PASS |
+| 2026-11-10 | Engram 64-row conversion | CPU-only container, `--limit-rows 64 --verify` | Pass | max 0.125, RMS 0.0232/0.0256; 188.83 GiB dry-run |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
