@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1q/0026 + Engram 64-row check done; GPU smoke deferred while `dgx1` is shared |
+| Overall status | Stage 1q/0027/0028 migration done offline; GPU smoke deferred while `dgx1` is shared |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -80,6 +80,22 @@ next step.
   114.85 GiB; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-10 - Affine byte budget from the plan
+
+- **Phase:** 1/2 (host-side).
+- **Done:** `0028-dsv41-affine-budget.patch` adds `affine_budget.zig`; the affine boot now
+  logs raw and packed bytes from the actual dispatch bindings. Experts are counted once
+  per stacked projection and multiplied by 192 (backbone) or 128 (DSpark); they are packed
+  one expert at a time, so only their raw bytes are resident.
+- **Expected on the published checkpoint:** 309 linears, 120 expert stacks,
+  `linear raw 4.27 GiB`, `packed 4.28 GiB`, `expert raw 79.10 GiB`, largest packed expert
+  `3.52 MiB`, total affine raw `83.37 GiB`. The remaining ~14.6 GiB of the card's 98 GB is
+  dense/native, MXFP8/MXFP4, head, and norms.
+- **Verification:** `0001`-`0028` apply; `zig ast-check` passes. The Python cross-check uses
+  the same n/k map and agrees.
+- **Next:** the one-layer forward; the budget says packing all linears at load is cheap,
+  while experts must stay raw and pack on demand.
 
 ### 2026-11-10 - Stage 1q: expert and 6-bit smoke prepared
 

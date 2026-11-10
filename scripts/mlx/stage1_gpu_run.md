@@ -58,6 +58,7 @@ CONTAINER=1 MODEL_DIR="$OVERLAY" OUT_DIR="$WORK/stage1-q" \
 Expected guard line:
 
 ```text
+dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; experts raw 79.10 GiB (largest packed expert 3.52 MiB); total raw 83.37 GiB, resident with packed linears 83.38 GiB
 dsv41 affine: 43 layers, ... dispatch: 307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4
 AffineForwardNotPorted
 ```

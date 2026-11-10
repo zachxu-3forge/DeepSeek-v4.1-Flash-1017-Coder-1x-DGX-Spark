@@ -1,0 +1,144 @@
+diff --git a/zig/src/families/deepseek_v41/affine_budget.zig b/zig/src/families/deepseek_v41/affine_budget.zig
+new file mode 100644
+index 0000000..f2b0658
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_budget.zig
+@@ -0,0 +1,112 @@
++//! Host-side affine byte budget from the dispatch bindings.
++//!
++//! The full model's admission needs the real affine bytes, not the model card's rounded
++//! number: raw U32/BF16 bytes, the packed `AffineN` tiles for linears, and the stacked
++//! expert bytes. Experts are packed one at a time, so only their raw bytes are resident.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const exec = @import("affine_exec.zig");
++
++pub const Report = struct {
++    /// U32 words + BF16 scales + BF16 biases of every affine linear
++    linear_raw: u64 = 0,
++    /// `AffineN` words + padded scales/biases of every affine linear
++    linear_packed_bytes: u64 = 0,
++    /// U32 words + BF16 scales + BF16 biases of every stacked expert projection
++    expert_raw: u64 = 0,
++    /// the largest single expert's packed tiles (the fallback packs one at a time)
++    expert_packed_one: u64 = 0,
++    modules: u32 = 0,
++    expert_stacks: u32 = 0,
++
++    pub fn totalRaw(r: Report) u64 {
++        return r.linear_raw + r.expert_raw;
++    }
++
++    pub fn totalPacked(r: Report) u64 {
++        return r.linear_packed_bytes + r.expert_raw;
++    }
++};
++
++const Bytes = struct { raw: u64, packed_bytes: u64 };
++
++fn linearBytes(n: u64, k: u64, bits: u8, group: u32) !Bytes {
++    if (bits == 0 or group == 0 or k % group != 0) return error.BadAffine;
++    const bits_total = std.math.mul(u64, k, bits) catch return error.BadAffine;
++    if (bits_total % 8 != 0) return error.BadAffine;
++    const words = bits_total / 8;
++    const groups = k / group;
++    const table = std.math.mul(u64, groups, 2) catch return error.BadAffine;
++    const per_row = std.math.add(u64, words, 2 * table) catch return error.BadAffine;
++    const raw = std.math.mul(u64, n, per_row) catch return error.BadAffine;
++    const l = cuda.qlinear.AffineN.layout(
++        std.math.cast(usize, n) orelse return error.BadAffine,
++        std.math.cast(usize, k) orelse return error.BadAffine,
++        cuda.qlinear.servedBits(bits),
++    );
++    const packed_bytes = std.math.add(u64, @intCast(l.words), 2 * @as(u64, @intCast(l.scales))) catch return error.BadAffine;
++    return .{ .raw = raw, .packed_bytes = packed_bytes };
++}
++
++pub fn compute(bindings: []const exec.Binding, experts: u32, dspark_experts: u32) !Report {
++    var r: Report = .{};
++    for (bindings) |b| {
++        if (b.mode != .affine8_linear and b.mode != .affine_n_expert) continue;
++        const n: u64 = b.n;
++        const k: u64 = b.k;
++        const bytes = try linearBytes(n, k, b.spec.bits, b.spec.group);
++        switch (b.kind) {
++            .linear => {
++                r.linear_raw = std.math.add(u64, r.linear_raw, bytes.raw) catch return error.BadAffine;
++                r.linear_packed_bytes = std.math.add(u64, r.linear_packed_bytes, bytes.packed_bytes) catch return error.BadAffine;
++                r.modules += 1;
++            },
++            .expert => {
++                const count: u64 = if (std.mem.indexOf(u8, b.name, "mtp.") != null) dspark_experts else experts;
++                const raw = std.math.mul(u64, bytes.raw, count) catch return error.BadAffine;
++                r.expert_raw = std.math.add(u64, r.expert_raw, raw) catch return error.BadAffine;
++                r.expert_packed_one = @max(r.expert_packed_one, bytes.packed_bytes);
++                r.expert_stacks += 1;
++            },
++        }
++    }
++    return r;
++}
++
++fn binding(kind: @import("affine_plan.zig").Kind, name: []const u8, n: u32, k: u32, bits: u8, mode: @import("affine_dispatch.zig").Mode) exec.Binding {
++    return .{
++        .kind = kind,
++        .name = name,
++        .spec = .{ .bits = bits, .group = 64 },
++        .mode = mode,
++        .n = n,
++        .k = k,
++        .affine_layout = .{ .n = n, .k = k, .bits = bits, .group = 64 },
++    };
++}
++
++test "budget counts a linear once and an expert stack by its expert count" {
++    const b = [_]exec.Binding{
++        binding(.linear, "layers.0.attn.wq_a", 1280, 5120, 8, .affine8_linear),
++        binding(.expert, "layers.0.ffn.experts.w1", 2304, 5120, 2, .affine_n_expert),
++    };
++    const r = try compute(&b, 192, 128);
++    try std.testing.expectEqual(@as(u32, 1), r.modules);
++    try std.testing.expectEqual(@as(u32, 1), r.expert_stacks);
++    try std.testing.expect(r.linear_raw > 0 and r.linear_packed_bytes > 0);
++    try std.testing.expect(r.expert_raw > r.linear_raw);
++    try std.testing.expect(r.expert_packed_one > 0);
++    try std.testing.expectEqual(r.linear_raw + r.expert_raw, r.totalRaw());
++    try std.testing.expectEqual(r.linear_packed_bytes + r.expert_raw, r.totalPacked());
++}
++
++test "MTP experts use the DSpark expert count" {
++    const b = [_]exec.Binding{
++        binding(.expert, "mtp.0.ffn.experts.w1", 2304, 5120, 4, .affine_n_expert),
++    };
++    const r = try compute(&b, 192, 128);
++    try std.testing.expect(r.expert_raw > 0);
++    const two = try compute(&b, 192, 256);
++    try std.testing.expectEqual(r.expert_raw * 2, two.expert_raw);
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 1890841..10182b8 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -241,6 +241,15 @@ pub const Model = struct {
+             defer dispatch.deinit();
+             var bindings = try @import("affine_exec.zig").build(gpa, &dispatch);
+             defer bindings.deinit();
++            const budget = try @import("affine_budget.zig").compute(bindings.items, m.cfg.experts, m.cfg.dspark_experts);
++            if (!quiet) std.log.info("dsv41 affine bytes: linears raw {d:.2} GiB, packed {d:.2} GiB; experts raw {d:.2} GiB (largest packed expert {d:.2} MiB); total raw {d:.2} GiB, resident with packed linears {d:.2} GiB", .{
++                @as(f64, @floatFromInt(budget.linear_raw)) / (1 << 30),
++                @as(f64, @floatFromInt(budget.linear_packed_bytes)) / (1 << 30),
++                @as(f64, @floatFromInt(budget.expert_raw)) / (1 << 30),
++                @as(f64, @floatFromInt(budget.expert_packed_one)) / (1 << 20),
++                @as(f64, @floatFromInt(budget.totalRaw())) / (1 << 30),
++                @as(f64, @floatFromInt(budget.totalPacked())) / (1 << 30),
++            });
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
+                 m.weights = .{ .gpa = gpa, .digest = false };
+                 defer {
+@@ -632,4 +641,5 @@ test {
+     _ = @import("affine_pack.zig");
+     _ = @import("affine_launch.zig");
+     _ = @import("affine_smoke.zig");
++    _ = @import("affine_budget.zig");
+ }
