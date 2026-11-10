@@ -64,9 +64,11 @@ Environment:
 - `HF_CACHE` — Hugging Face cache, mounted at `/hf`.
 - `ASSETS_HOST` — optional runtime assets directory (RoPE tables, `engram.json`), mounted at
   `/assets`; `TF_DSV41_ASSETS` points there when set.
-- `OUT_DIR` — output directory, mounted at `/out`.
-- `BUILD=1` — build the image first.
-- `DRY_RUN=1` — print the `docker run` command without running it.
+- `OUT_DIR` - output directory, mounted at `/out`.
+- `BUILD=1` - build the image first.
+- `DRY_RUN=1` - print the `docker run` command without running it.
+- `TF_EXPERIMENTAL=deepseek` - required by the engine's gated DeepSeek-V4.1 family;
+  `test_stage1.sh` sets it for the guard and smoke runs.
 
 The image builds upstream TensorFold (`TF_REF` in `docker/Dockerfile.mlx`) with Zig 0.17.0 and
 `sm_121`; no host CUDA or TensorFold is used. The host needs Docker and the NVIDIA container
