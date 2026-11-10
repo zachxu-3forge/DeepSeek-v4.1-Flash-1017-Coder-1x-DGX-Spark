@@ -69,6 +69,7 @@ echo "model: $MODEL_DIR"
 echo "out:   $OUT_DIR"
 
 step inspect_checkpoint "$PY" "$ROOT/scripts/mlx/inspect_checkpoint.py" "$MODEL_DIR" --json "$OUT_DIR/inspect.json"
+step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
 step translate_config "$PY" "$ROOT/scripts/mlx/translate_config.py" "$MODEL_DIR" --check \
   --out "$OUT_DIR/quantization.json" --write-config "$OUT_DIR/config.translated.json"
 step plan_dispatch "$PY" "$ROOT/scripts/mlx/plan_dispatch.py" "$MODEL_DIR" --json "$OUT_DIR/plan_dispatch.json"

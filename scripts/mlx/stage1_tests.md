@@ -22,6 +22,7 @@ MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh --host-only
 Runs:
 
 - `inspect_checkpoint.py`: shard/tensor/expert/Engram structure.
+- `test_make_one_layer.py`: the one-layer fixture's tensor bytes match the source shard.
 - `translate_config.py --check`: every quantized module has its tensors.
 - `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
   fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`

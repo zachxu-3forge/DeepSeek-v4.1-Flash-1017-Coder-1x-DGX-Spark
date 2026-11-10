@@ -91,9 +91,9 @@ CONTAINER=1 EXPECT_FORWARD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
-`test_stage1.sh` runs the inspector, translator, dispatch counter, CPU golden rows, Engram
-checks, and optionally the container boot. Results land in `out/stage1/<timestamp>/` with a
-`summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
+`test_stage1.sh` runs the inspector, the one-layer fixture byte check, translator, dispatch
+counter, CPU golden rows, Engram checks, and optionally the container boot. Results land in
+`out/stage1/<timestamp>/` with a `summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
 
 ## One-layer fixture and memory
 
@@ -120,6 +120,7 @@ so it is slightly lossy. The `engram.json` token map/kit is still required. Use
 
 ## Phase 0 gate
 
-The harness is ready when the image builds, `tensorfold-dsv41 --version` runs, and the engine
-admits a 192-expert, world-1 fixture with affine and mixed-format modules. The last step needs
-the first `patches-mlx` change; until then the gate stays open.
+The harness is ready: the image builds, `tensorfold-dsv41 --version` runs, and the engine
+admits the 192-expert, world-1 affine plan. The Stage 1p guard logs
+`307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and the one-projection
+smoke matches the CPU row within BF16 rounding.

@@ -18,21 +18,21 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Guard passes 307/120/21/9; rebuilding with affine group sums for smoke |
+| Overall status | Stage 1p guard + affine smoke PASS on Spark; full layer forward next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, ID `sha256:54c3f67c043aa2a0a5f4fc33ffb09307d841fdd4e6dc23f7602c0781a42164d6` |
+| Container image | `tf-dsv41-mlx:dev`, ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` |
 | Last updated | 2026-11-10 |
 
 ## Phase tracker
 
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
-| 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; affine plan admits 192-expert/world-1; GPU guard pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1p image built; GPU comparison pending |
+| 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference (0.12% / 0.08%); full layer next |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -61,6 +61,33 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1p smoke passes on Spark
+
+- **Phase:** 1.
+- **Image:** `tf-dsv41-mlx:dev` ID
+  `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702`,
+  base digest `sha256:2140e699...`, TensorFold `26e1b074...`, patches `0001`-`0024`.
+- **Guard:** `CONTAINER=1 MODEL_DIR=$OVERLAY test_stage1.sh` →
+  `dsv41 affine: 43 layers, 419 modules, 30 mixed, 47 skipped; dispatch: 307 affine8
+  linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4`, then `AffineForwardNotPorted`.
+  `summary.md`: all PASS including `dispatch match`.
+- **Smoke:** one-layer fixture (48 tensors, 4.61 GiB), `TF_DSV41_LAYERS=0-0`,
+  `TF_DSV41_AFFINE_SMOKE=1`. CPU oracle and GPU:
+  - CPU `wq_a` row 0: `ones=-0.153510`, `alt=2.451196`
+  - GPU BF16: `ones=-0.153320`, `alt=2.453125`
+  - deltas: `+0.000190` (0.12%), `+0.001929` (0.08%)
+- **Fixture bug:** `make_one_layer.py` sought safetensors-relative offsets without the
+  header base, and its `read_header` returned the header length rather than the data
+  section start. The fixture loaded garbage bytes (both CPU and GPU were `nan`). Fixed both
+  offsets; the fixture's first words/scales/biases now match the source shard byte for byte.
+- **Harness:** `SMOKE=1` now compares the GPU line with `reference_layer.json` using
+  `abs(gpu - ref) <= 0.01 + 0.01 * abs(ref)`, not just a grep.
+- **Artifacts:** `stage1-final2/summary.md`, `smoke.log`, `reference_layer.json`;
+  `patches-mlx/0024-dsv41-smoke-raw.patch`; `scripts/mlx/make_one_layer.py` fixes;
+  `scripts/mlx/test_make_one_layer.py` (fixture bytes against the source shard).
+- **Next:** wire the per-expert fallback loop and the full one-layer forward; then the
+  MXFP4 path and full-model wiring.
 
 ### 2026-11-10 - Stage 1p Spark boot fixes
 
@@ -543,6 +570,11 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | AffineN launch | stub-CUDA test of `affine_launch.linear` | Pass | Allocates x/sums/output |
 | 2026-11-10 | `0018` patch apply | `git apply` on `0001`-`0017` | Pass | Affine smoke |
 | 2026-11-10 | Affine smoke syntax | `zig ast-check` on `affine_smoke`/`cuda_model`/`named` | Pass | GPU run pending |
+| 2026-11-10 | `0019`-`0024` apply | `git apply` on `0001`-`0018` and ast-check | Pass | Env, pack names, weights_proj, sums, oracle, raw |
+| 2026-11-10 | Spark guard | `CONTAINER=1 test_stage1.sh` on translated overlay | Pass | 307/120/21/9; `AffineForwardNotPorted` |
+| 2026-11-10 | Spark affine smoke | one-layer fixture, `TF_DSV41_AFFINE_SMOKE=1` | Pass | GPU `-0.153320/2.453125` vs CPU `-0.153510/2.451196` |
+| 2026-11-10 | One-layer fixture bytes | `test_make_one_layer.py` | Pass | Fixture bytes equal the source shard |
+| 2026-11-10 | Full harness | `CONTAINER=1 SMOKE=1 test_stage1.sh` | Pass | Smoke match and dispatch match PASS |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -560,19 +592,19 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, pack and launch `AffineN`, and add a one-projection smoke test. The next gate is the Spark run of `SMOKE=1`; the per-expert loop and full forward remain.
+- Stage 1a-1p plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, pack and launch `AffineN`, and verify one projection on the Spark. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The per-expert loop and full forward remain.
 - Engram conversion is ready but expands to ~203 GB and requantizes to E4M3; a native 4-bit reader would avoid both, at the cost of engine work. The `engram.json` token map is still required.
-- Phase 0 harness is committed; the image build is still pending on the Spark.
-- Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
-- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
+- Phase 0 harness and image build are done; the guard and one-projection smoke pass on the Spark.
+- Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture. It builds and admits.
+- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan.
 - Runtime assets: `TF_DSV41_ASSETS` expects RoPE tables and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load.
-- Docker is not installed on the local Windows host; the build must run on the Spark or a Linux host with the NVIDIA container runtime.
-- The base-image digest is not captured yet.
-- The `dsv41-serve` build command and the upstream dsv41 family are unverified.
+- Docker is not installed on the local Windows host; the build runs on the Spark.
+- The base-image digest is `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`.
+- The `dsv41-serve` build and the upstream dsv41 family are verified by the Spark guard and smoke.
 
 ## Next actions
 
-1. On the Spark: build the image, create the one-layer fixture, and run `CONTAINER=1 SMOKE=1 test_stage1.sh`.
-2. Compare the smoke `y[0]` values with `reference_layer.json`; record the error in this file.
-3. Wire the per-expert fallback loop and decide the MXFP4 path.
-4. Then move to the full model and server qualification.
+1. Wire the per-expert fallback loop for the 120 two-bit expert stacks.
+2. Build the full one-layer forward on GPU and compare it with a dequantized layer reference.
+3. Decide the MXFP4 path: no native CUDA kernel; options are a kernel, group-64 requant, or E8M0→BF16 affine-4.
+4. Then full model, Engram assets, server/vision, and qualification.
