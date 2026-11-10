@@ -91,9 +91,9 @@ CONTAINER=1 EXPECT_FORWARD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
-`test_stage1.sh` runs the inspector, the one-layer fixture byte check, translator, dispatch
-counter, CPU golden rows, Engram checks, and optionally the container boot. Results land in
-`out/stage1/<timestamp>/` with a `summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
+`test_stage1.sh` runs the inspector, the one-layer fixture byte check, the translator and
+dispatch checks, CPU golden rows, Engram checks, and optionally the container boot. Results
+land in `out/stage1/<timestamp>/` with a `summary.md`. The detailed acceptance criteria are in `stage1_tests.md`.
 
 ## One-layer fixture and memory
 

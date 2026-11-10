@@ -23,6 +23,8 @@ Runs:
 
 - `inspect_checkpoint.py`: shard/tensor/expert/Engram structure.
 - `test_make_one_layer.py`: the one-layer fixture's tensor bytes match the source shard.
+- `test_translate_config.py`: non-affine `group_size: null` is omitted.
+- `test_plan_dispatch.py`: Engram and `main_proj` are counted in their own buckets.
 - `translate_config.py --check`: every quantized module has its tensors.
 - `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
   fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`
@@ -82,7 +84,9 @@ the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`. The har
 `abs(gpu - ref) <= 0.01 + 0.01 * abs(ref)`, which accepts BF16 output rounding.
 
 On the published checkpoint the CPU row is `ones=-0.153510`, `alt=2.451196`; the first
-Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%).
+Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%). The same smoke also
+runs expert 0 of `layers.0.ffn.experts.w1` through the 2-bit per-expert fallback; its CPU
+row is `ones=0.134277`, `alt=0.107697`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
 For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report

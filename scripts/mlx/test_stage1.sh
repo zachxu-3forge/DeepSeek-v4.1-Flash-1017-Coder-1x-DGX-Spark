@@ -70,6 +70,8 @@ echo "out:   $OUT_DIR"
 
 step inspect_checkpoint "$PY" "$ROOT/scripts/mlx/inspect_checkpoint.py" "$MODEL_DIR" --json "$OUT_DIR/inspect.json"
 step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
+step test_translate_config "$PY" "$ROOT/scripts/mlx/test_translate_config.py"
+step test_plan_dispatch "$PY" "$ROOT/scripts/mlx/test_plan_dispatch.py"
 step translate_config "$PY" "$ROOT/scripts/mlx/translate_config.py" "$MODEL_DIR" --check \
   --out "$OUT_DIR/quantization.json" --write-config "$OUT_DIR/config.translated.json"
 step plan_dispatch "$PY" "$ROOT/scripts/mlx/plan_dispatch.py" "$MODEL_DIR" --json "$OUT_DIR/plan_dispatch.json"
@@ -131,21 +133,27 @@ if [[ "$CONTAINER" == "1" ]]; then
         if "$PY" - "$OUT_DIR/reference_layer.json" "$OUT_DIR/smoke.log" <<'PY'
 import json, re, sys
 ref = json.load(open(sys.argv[1], encoding="utf-8"))
-entry = next((x for x in ref if x.get("canonical") == "layers.0.attn.wq_a"), None)
-if entry is None:
-    print("reference has no layers.0.attn.wq_a", file=sys.stderr)
-    raise SystemExit(1)
 text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
-m = re.search(r"affine smoke layers\.0\.attn\.wq_a: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)", text)
-if not m:
-    print("no GPU smoke line", file=sys.stderr)
-    raise SystemExit(1)
-ones, alt = float(m.group(1)), float(m.group(2))
-for label, got, want in (("ones", ones, entry["dot_ones"]), ("alt", alt, entry["dot_alt"])):
-    tol = 0.01 + 0.01 * abs(want)
-    if abs(got - want) > tol:
-        print(f"{label}: gpu {got} ref {want} delta {got - want} tol {tol}", file=sys.stderr)
+checks = (
+    ("layers.0.attn.wq_a", r"affine smoke layers\.0\.attn\.wq_a: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"),
+    ("layers.0.ffn.experts.w1", r"affine smoke expert layers\.0\.ffn\.experts\.w1: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"),
+)
+for canonical, pattern in checks:
+    entry = next((x for x in ref if x.get("canonical") == canonical), None)
+    if entry is None:
+        print(f"reference has no {canonical}", file=sys.stderr)
         raise SystemExit(1)
+    m = re.search(pattern, text)
+    if not m:
+        print(f"no GPU smoke line for {canonical}", file=sys.stderr)
+        raise SystemExit(1)
+    ones, alt = float(m.group(1)), float(m.group(2))
+    for label, got, want in (("ones", ones, entry["dot_ones"]), ("alt", alt, entry["dot_alt"])):
+        tol = 0.01 + 0.01 * abs(want)
+        if abs(got - want) > tol:
+            print(f"{canonical} {label}: gpu {got} ref {want} delta {got - want} tol {tol}", file=sys.stderr)
+            raise SystemExit(1)
+    print(f"{canonical}: gpu {ones}/{alt} ref {entry['dot_ones']}/{entry['dot_alt']}")
 print("smoke values match")
 PY
         then
