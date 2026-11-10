@@ -93,7 +93,7 @@ if [[ "$CONTAINER" == "1" ]]; then
   # the dispatch line comparable with plan_dispatch.json; the smoke run below loads
   # only layer 0.
   set +e
-  TF_EXPERIMENTAL=deepseek TF_DSV41_DRAFTS=0 \
+  TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 \
     timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
     >"$OUT_DIR/engine.log" 2>&1
   rc=$?
@@ -119,7 +119,7 @@ if [[ "$CONTAINER" == "1" ]]; then
   if [[ "$SMOKE" == "1" ]]; then
     echo "== affine smoke"
     set +e
-    TF_EXPERIMENTAL=deepseek TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_SMOKE=1 \
+    TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_SMOKE=1 \
       timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
       >"$OUT_DIR/smoke.log" 2>&1
     rc_smoke=$?

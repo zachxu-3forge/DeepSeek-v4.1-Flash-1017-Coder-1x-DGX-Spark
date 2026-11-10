@@ -69,6 +69,8 @@ Environment:
 - `DRY_RUN=1` - print the `docker run` command without running it.
 - `TF_EXPERIMENTAL=deepseek` - required by the engine's gated DeepSeek-V4.1 family;
   `test_stage1.sh` sets it for the guard and smoke runs.
+- `TF_TP_WORLD=1` - single-Spark run. The engine defaults to world 2 and waits 300 s
+  for a peer otherwise; `test_stage1.sh` sets it for the container runs.
 
 The image builds upstream TensorFold (`TF_REF` in `docker/Dockerfile.mlx`) with Zig 0.17.0 and
 `sm_121`; no host CUDA or TensorFold is used. The host needs Docker and the NVIDIA container

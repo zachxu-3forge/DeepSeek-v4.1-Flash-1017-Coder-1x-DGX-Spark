@@ -36,10 +36,11 @@ CONTAINER=1 BUILD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
-Adds a `tensorfold-dsv41` boot with `TF_DSV41_DRAFTS=0`, captures the log, and compares
-its `dispatch:` line with `plan_dispatch.py`. The guard returns before any weight upload,
-so it plans all layers and must report the full counts (309/120/22/9). The `SMOKE=1` run
-then loads only layer 0 (`TF_DSV41_LAYERS=0-0`).
+Adds a `tensorfold-dsv41` boot with `TF_EXPERIMENTAL=deepseek`, `TF_TP_WORLD=1`, and
+`TF_DSV41_DRAFTS=0`, captures the log, and compares its `dispatch:` line with
+`plan_dispatch.py`. The guard returns before any weight upload, so it plans all layers and
+must report the full counts (309/120/22/9). The `SMOKE=1` run then loads only layer 0
+(`TF_DSV41_LAYERS=0-0`).
 
 The engine needs `quantization_config` in `config.json`. If the checkpoint only has the
 OMLX map, point `MODEL_DIR` at a translated overlay rather than editing the source:
