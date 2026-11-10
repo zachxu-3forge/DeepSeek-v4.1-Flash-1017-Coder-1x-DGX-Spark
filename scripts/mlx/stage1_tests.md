@@ -87,7 +87,8 @@ On the published checkpoint the CPU row is `ones=-0.153510`, `alt=2.451196`; the
 Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%). The smoke also
 sweeps every layer-0 linear (8/6-bit) and all three 2-bit expert stacks; the harness
 compares each GPU line with its CPU oracle and checks `wq_a`, `shared_experts.w1` and
-expert 0 against `reference_layer.json`. CPU rows: `wq_a -0.153510/2.451196`,
+expert 0 against `reference_layer.json`. A `affine smoke dev ...` line also checks the
+device-to-device group-sums path. CPU rows: `wq_a -0.153510/2.451196`,
 `shared_experts.w1 0.084923/3.316952`, `experts.w1` expert 0 `0.134277/0.107697`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.

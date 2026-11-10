@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1q/0027/0028 migration done offline; GPU smoke deferred while `dgx1` is shared |
+| Overall status | Stage 1q sweep, budget, resident linear set, and device linear added offline; GPU runs deferred |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -80,6 +80,33 @@ next step.
   114.85 GiB; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-10 - Device-to-device affine linear
+
+- **Phase:** 1 (forward primitive).
+- **Done:** `0030-dsv41-affine-linear-dev.patch` adds `affine_launch.linearDev`:
+  it allocates the row group sums, calls `act_rows.groupSums` on device x, and launches
+  `AffineNKernels.decode` into a caller-owned output. No host round trip and no sync; the
+  caller synchronizes. The smoke also runs the device path for `wq_a` and logs
+  `affine smoke dev ...`.
+- **Why:** the forward works on device buffers; the host `linear()` path was only for the
+  smoke.
+- **Verification:** patches `0001`-`0030` apply; `zig ast-check` passes. GPU run pending.
+- **Next:** a layer-0 attention projection chain using the resident linear set and
+  `linearDev`.
+
+### 2026-11-10 - Resident affine linear set
+
+- **Phase:** 1/2 (host/device code, unrun).
+- **Done:** `0029-dsv41-affine-linears.patch` adds `affine_linears.zig`:
+  `loadAll` walks the affine bindings, loads each linear, uploads it through a temporary
+  `Weights`, packs it with `AffineN`, frees the raw device copy, and keeps the packed tiles
+  in a name-addressed set. `TF_DSV41_AFFINE_LOAD=1` runs it at boot and logs the count and
+  packed GiB. Experts are not loaded; they stay raw and pack one at a time.
+- **Why:** the forward needs packed linears addressable by module name; the budget says the
+  whole set is ~4.3 GiB, so keeping it resident is cheaper than re-packing per window.
+- **Verification:** `0001`-`0029` apply; `zig ast-check` passes. Not run on GPU yet.
+- **Next:** a forward that consumes this set; the first target is layer 0's attention block.
 
 ### 2026-11-10 - Affine byte budget from the plan
 

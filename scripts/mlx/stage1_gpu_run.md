@@ -74,6 +74,7 @@ Expected in `smoke.log`:
 
 - one `affine smoke cpu <module>: row0 ...` and one `affine smoke <module>: y[0] ...`
   line for every layer-0 linear and all three expert stacks;
+- `affine smoke dev layers.0.attn.wq_a: y[0] ones=...` matching the host `wq_a` line;
 - `smoke values match`;
 - `dispatch counts match`;
 - `AffineForwardNotPorted` after the smoke.
@@ -81,7 +82,28 @@ Expected in `smoke.log`:
 The harness compares every CPU/GPU pair with `abs(gpu - cpu) <= 0.01 + 0.01 * abs(cpu)`
 and checks `wq_a`, `shared_experts.w1`, and expert 0 against `reference_layer.json`.
 
-## 4. If a smoke line fails
+## 4. Resident affine linears
+
+When the GPU is idle and the sweep is clean, verify the full packed-linear set:
+
+```sh
+TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_LOAD=1 \
+MODEL_DIR="$OVERLAY" OUT_DIR="$WORK/stage1-load" \
+  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model \
+  2>&1 | tee "$WORK/affine-load.log"
+```
+
+Expected:
+
+```text
+dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; ...
+dsv41 affine load: 309 linears packed, 4.30 GiB
+AffineForwardNotPorted
+```
+
+The set is freed before exit; the log proves all linears pack without OOM.
+
+## 5. If a smoke line fails
 
 Save `summary.md`, `smoke.log`, and the relevant `cpu`/`y[0]` lines. Do not change the
 checkpoint. The likely causes are:
@@ -93,7 +115,7 @@ checkpoint. The likely causes are:
 
 Stop and send the failing module plus its CPU/GPU values.
 
-## 5. Next after the sweep passes
+## 6. Next after the sweep passes
 
 The remaining Stage 1 gate is the one-layer forward. The sweep proves every layer-0
 affine projection and expert stack; the forward still needs the attention and MoE

@@ -1,0 +1,76 @@
+diff --git a/zig/src/families/deepseek_v41/affine_launch.zig b/zig/src/families/deepseek_v41/affine_launch.zig
+index 2a9f9eb..87fa3a1 100644
+--- a/zig/src/families/deepseek_v41/affine_launch.zig
++++ b/zig/src/families/deepseek_v41/affine_launch.zig
+@@ -73,6 +73,27 @@ pub fn linear(
+     return .{ .buffer = out };
+ }
+ 
++/// Decode device rows: `x` is a device bf16 `[rows, k]`, `out` a device bf16
++/// `[rows, n]`. The group sums are computed on the device; the caller synchronizes.
++pub fn linearDev(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    act: *const cuda.act_rows.ActRows,
++    p: *const pack.Packed,
++    x: u64,
++    rows: usize,
++    out: u64,
++) !void {
++    if (rows == 0 or p.an.k == 0 or p.an.k % 64 != 0) return error.BadShape;
++    const groups = p.an.k / 64;
++    const sums_bytes = try std.math.mul(usize, rows, groups * 4);
++    var sums = try cuda.DeviceBuffer.alloc(driver, sums_bytes);
++    defer sums.free();
++    try act.groupSums(stream, x, p.an.k, sums.ptr, rows, p.an.k);
++    try kernels.decode(stream, x, sums.ptr, p.an, out, rows);
++}
++
+ /// Prompt rows: `x` is bf16 `[rows, k]`; the result is bf16 `[rows, n]`.
+ pub fn prompt(
+     driver: *const cuda.Driver,
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 0aceebc..4399f86 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -72,8 +72,10 @@ pub fn run(
+     const minor = try ctx.attribute(.compute_capability_minor);
+     var wide = try cuda.qlinear.AffineNKernels.resolve(driver, m8, mp, m4, sms, major == 12 and minor == 1);
+     defer wide.deinit();
++    var act = try cuda.act_rows.ActRows.load(driver);
++    defer act.mod.unload();
+ 
+-    for (layer0_linears) |name| try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, name);
++    for (layer0_linears) |name| try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, &act, name);
+     for (layer0_experts) |name| try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide, name);
+ }
+ 
+@@ -86,6 +88,7 @@ fn runLinear(
+     bindings: *const affine_exec.Bindings,
+     weights: *load.Weights,
+     wide: *const cuda.qlinear.AffineNKernels,
++    act: *const cuda.act_rows.ActRows,
+     name: []const u8,
+ ) !void {
+     const chosen = find(bindings, name) orelse return error.SmokeModuleMissing;
+@@ -146,6 +149,19 @@ fn runLinear(
+     const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+     std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
++
++    if (std.mem.eql(u8, name, module_name)) {
++        const xd = try cuda.DeviceBuffer.fromHost(driver, x1);
++        defer xd.free();
++        var od = try cuda.DeviceBuffer.alloc(driver, chosen.n * 2);
++        defer od.free();
++        try affine_launch.linearDev(driver, stream, wide, act, &tiles, xd.ptr, 1, od.ptr);
++        try stream.synchronize();
++        const bd = try od.download(driver, gpa);
++        defer gpa.free(bd);
++        const vd = named.bf16Widen(std.mem.readInt(u16, bd[0..2], .little));
++        std.log.info("affine smoke dev {s}: y[0] ones={d:.6}", .{ name, vd });
++    }
+ }
+ 
+ fn runExpert(

@@ -33,10 +33,12 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0026-dsv41-smoke-6bit.patch` | Also smoke the 6-bit `layers.0.ffn.shared_experts.w1` linear |
 | `0027-dsv41-layer0-sweep.patch` | Sweep every layer-0 linear and all three 2-bit expert stacks in the smoke |
 | `0028-dsv41-affine-budget.patch` | Log raw/packed affine bytes and the largest packed expert at boot |
-| `0029-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0030-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0029-dsv41-affine-linears.patch` | Pack every affine linear into a resident name-addressed device set (`TF_DSV41_AFFINE_LOAD=1`) |
+| `0030-dsv41-affine-linear-dev.patch` | Device-to-device `AffineN` linear with `act_rows.groupSums`; smoke checks the dev path |
+| `0031-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0032-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0028`. Planned: `0029`-`0030`.
+Implemented: `0001`-`0030`. Planned: `0031`-`0032`.
 
 Rules:
 
