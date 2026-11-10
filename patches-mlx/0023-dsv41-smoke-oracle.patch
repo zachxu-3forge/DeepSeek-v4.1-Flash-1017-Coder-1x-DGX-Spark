@@ -1,0 +1,61 @@
+diff --git a/zig/src/families/deepseek_v41/affine_launch.zig b/zig/src/families/deepseek_v41/affine_launch.zig
+index 128486d..2a9f9eb 100644
+--- a/zig/src/families/deepseek_v41/affine_launch.zig
++++ b/zig/src/families/deepseek_v41/affine_launch.zig
+@@ -67,6 +67,7 @@ pub fn linear(
+     try cuda.DeviceBuffer.upload(.{ .d = driver, .ptr = sums.ptr, .len = sums_bytes }, 0, std.mem.sliceAsBytes(host_sums));
+     var out = try cuda.DeviceBuffer.alloc(driver, rows * p.an.n * 2);
+     errdefer out.free();
++    try out.fill8(0, null);
+     try kernels.decode(stream, xb.ptr, sums.ptr, p.an, out.ptr, rows);
+     try stream.synchronize();
+     return .{ .buffer = out };
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 9101d14..bc7ac16 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -46,6 +46,26 @@ pub fn run(
+     const layout = chosen.affine_layout.?;
+ 
+     var images = try affine_load.readModule(gpa, io, pack, chosen.name, layout);
++    const k = chosen.k;
++    const bits = chosen.spec.bits;
++    const group: usize = chosen.spec.group;
++    const packed_k = @as(usize, k) * bits / 32;
++    const groups = @as(usize, k) / group;
++    const w0: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, images.weight.bytes[0 .. packed_k * 4]));
++    const s0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.scales.bytes[0 .. groups * 2]));
++    const b0: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, images.biases.bytes[0 .. groups * 2]));
++    const x1f = try gpa.alloc(f32, k);
++    defer gpa.free(x1f);
++    const x2f = try gpa.alloc(f32, k);
++    defer gpa.free(x2f);
++    for (0..k) |i| {
++        x1f[i] = 1.0;
++        x2f[i] = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
++    }
++    const cpu1 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x1f);
++    const cpu2 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x2f);
++    std.log.info("affine smoke cpu {s}: row0 ones={d:.6} alt={d:.6}", .{ module_name, cpu1, cpu2 });
++
+     var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+     defer builder.deinit();
+     try builder.add(images.weight);
+@@ -55,7 +75,8 @@ pub fn run(
+     try weights.upload(driver, &builder);
+ 
+     const dev = try affine_bind.bind(weights, chosen, 1);
+-    const kk = cuda.kernels;    if (!kk.available) return error.BuiltWithoutKernels;
++    const kk = cuda.kernels;
++    if (!kk.available) return error.BuiltWithoutKernels;
+     var m8 = try cuda.Module.load(driver, kk.affine8);
+     defer m8.unload();
+     var mp = try cuda.Module.load(driver, kk.affine_prefill);
+@@ -71,7 +92,6 @@ pub fn run(
+     var tiles = try affine_pack.packLinear(driver, stream, &wide, &dev, chosen.n, chosen.k, chosen.spec.bits);
+     defer tiles.deinit();
+ 
+-    const k = chosen.k;
+     var x1 = try gpa.alloc(u8, @as(usize, k) * 2);
+     defer gpa.free(x1);
+     var x2 = try gpa.alloc(u8, @as(usize, k) * 2);

@@ -96,10 +96,13 @@ next step.
   `dispatch: 307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and
   `AffineForwardNotPorted`, matching `plan_dispatch.py`.
 - **Smoke:** the one-layer fixture (48 tensors, 4.61 GiB) ran and logged the smoke line, but
-  both `y[0]` values were `nan`. `affine_launch.linear` allocated the kernel's `xs` buffer
-  (per-row 64-value group sums) and never filled it. `0022-dsv41-affine-group-sums.patch`
-  computes those sums from the BF16 input rows and uploads them before `decode`.
-- **Next:** rebuild with `0022`, rerun the smoke, compare `y[0]` with `reference_layer.py`.
+  both `y[0]` values were `nan`. `0022-dsv41-affine-group-sums.patch` filled the kernel's
+  `xs` buffer (per-row 64-value group sums), which was previously uninitialized, but the
+  values stayed `nan`. `0023-dsv41-smoke-oracle.patch` adds a CPU `affine_ref.dotRow` line
+  from the same loaded row and zeroes the output buffer, so the next run distinguishes a
+  loader/byte error from a kernel/launch error.
+- **Next:** rebuild with `0023`, compare the CPU and GPU smoke lines; fix the packing or
+  launch accordingly.
 
 ### 2026-11-10 - Spark image verified; harness dispatch/overlay fixes
 
