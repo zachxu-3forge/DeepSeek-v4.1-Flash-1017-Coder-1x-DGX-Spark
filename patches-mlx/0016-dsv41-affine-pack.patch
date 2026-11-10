@@ -1,0 +1,120 @@
+diff --git a/zig/src/families/deepseek_v41/affine_pack.zig b/zig/src/families/deepseek_v41/affine_pack.zig
+new file mode 100644
+index 0000000..1bbae1c
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_pack.zig
+@@ -0,0 +1,102 @@
++//! Pack an affine projection into `AffineN` tiles and keep the device buffers alive.
++//!
++//! This is the first device-side step of the affine launch: raw U32 words plus BF16
++//! scales/biases from `affine_bind.Device` become the packed `AffineN` layout that
++//! `cuda.qlinear.AffineNKernels.decode/prompt` reads. No kernel is launched here.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const affine = @import("affine.zig");
++const bind = @import("affine_bind.zig");
++
++pub const Packed = struct {
++    an: cuda.qlinear.AffineN,
++    words: cuda.DeviceBuffer,
++    scales: cuda.DeviceBuffer,
++    biases: cuda.DeviceBuffer,
++
++    pub fn deinit(p: *Packed) void {
++        p.words.free();
++        p.scales.free();
++        p.biases.free();
++        p.* = undefined;
++    }
++};
++
++/// The packed tile bytes for an n-by-k projection at `bits` (served width).
++pub fn packedBytes(n: usize, k: usize, bits: u8) usize {
++    const l = cuda.qlinear.AffineN.layout(n, k, cuda.qlinear.servedBits(bits));
++    return l.words + 2 * l.scales;
++}
++
++pub fn packLinear(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    d: *const bind.Device,
++    n: usize,
++    k: usize,
++    bits: u8,
++) !Packed {
++    if (d.weight_len == 0 or d.scales_len == 0) return error.BadBinding;
++    const served = cuda.qlinear.servedBits(bits);
++    const l = cuda.qlinear.AffineN.layout(n, k, served);
++    var words = try cuda.DeviceBuffer.alloc(driver, l.words);
++    errdefer words.free();
++    var scales = try cuda.DeviceBuffer.alloc(driver, l.scales);
++    errdefer scales.free();
++    var biases = try cuda.DeviceBuffer.alloc(driver, l.scales);
++    errdefer biases.free();
++    const an: cuda.qlinear.AffineN = .{
++        .w = words.ptr,
++        .s = scales.ptr,
++        .b = biases.ptr,
++        .n = n,
++        .k = k,
++        .npad = l.npad,
++        .bits = served,
++    };
++    try kernels.packWords(stream, d.weight, bits, n, k, an.w);
++    try kernels.packTable(stream, d.scales, n, k, l.npad, an.s);
++    try kernels.packTable(stream, d.biases, n, k, l.npad, an.b);
++    try stream.synchronize();
++    return .{ .an = an, .words = words, .scales = scales, .biases = biases };
++}
++
++/// Pack expert `e` from a stacked projection; the caller supplies the byte view.
++pub fn packExpert(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    d: *const bind.Device,
++    view: affine_cuda.ExpertView,
++) !Packed {
++    const wo = std.math.cast(usize, view.weight_off) orelse return error.BadBinding;
++    const so = std.math.cast(usize, view.scales_off) orelse return error.BadBinding;
++    const bo = std.math.cast(usize, view.biases_off) orelse return error.BadBinding;
++    if (wo > d.weight_len or so > d.scales_len or bo > d.biases_len) return error.BadBinding;
++    const raw: bind.Device = .{
++        .kind = d.kind,
++        .name = d.name,
++        .mode = d.mode,
++        .weight = d.weight + view.weight_off,
++        .weight_len = d.weight_len - wo,
++        .scales = d.scales + view.scales_off,
++        .scales_len = d.scales_len - so,
++        .biases = d.biases + view.biases_off,
++        .biases_len = d.biases_len - bo,
++        .experts = 1,
++        .bits = d.bits,
++        .group = d.group,
++    };
++    return packLinear(driver, stream, kernels, &raw, view.n, view.k, view.bits);
++}
++
++const affine_cuda = @import("affine_cuda.zig");
++
++test "target tile sizes are non-zero and scale with width" {
++    const a = packedBytes(1280, 5120, 8);
++    const b = packedBytes(2304, 5120, 2);
++    try std.testing.expect(a > 0 and b > 0);
++    try std.testing.expect(a != b);
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index df440ce..a2f7b21 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -620,3 +620,7 @@ test "Draft state: failed model drain retains its context and allocation owner"
+     try std.testing.expect(retained_models == m);
+     try std.testing.expectEqual(@as(usize, 0), mock.freed);
+ }
++
++test {
++    _ = @import("affine_pack.zig");
++}

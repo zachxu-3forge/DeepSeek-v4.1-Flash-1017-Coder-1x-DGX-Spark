@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1prep + Engram converter committed; 1o launch next |
+| Overall status | Stage 1o-prep committed (AffineN packing); launch next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | One-layer fixture + layer-selection patch committed; launch pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1o-prep AffineN packing committed; launch pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -61,6 +61,18 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1o-prep: AffineN packing
+
+- **Phase:** 1.
+- **Done:** added `patches-mlx/0016-dsv41-affine-pack.patch` with `affine_pack.zig`:
+  `packedBytes`, `packLinear`, and `packExpert` allocate `AffineN` word/scale/bias
+  buffers and call `AffineNKernels.packWords/packTable`; `Packed` owns and frees them.
+- **Approach used:** the qwen3_5/spark25 `AffineN` pattern; no kernel launch yet.
+- **Verification:** `0016` applies on top of `0001`-`0015`; `affine_pack` passes with a
+  stub CUDA module; target tile sizes are non-zero.
+- **Artifacts:** `patches-mlx/0016-dsv41-affine-pack.patch`.
+- **Next:** stage 1o launch: call `AffineNKernels.decode/prompt` on one layer.
 
 ### 2026-11-10 - Engram converter
 
@@ -395,6 +407,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | Binding layouts | Freeze shapes for device binding | `affine_exec.zig` carries n/k/bits/group per entry | Device allocation and launch remain separate | `0013` committed; 25 tests |
 | Device bindings | Resolve loaded tensors to addresses | `affine_bind.zig` checks bytes and freezes ptr/len | Verifies the loader and binding contract before launch | `0014` committed; 26 tests |
 | One-layer fixture | Test one layer without 211 GiB load | `make_one_layer.py` + layer-selection patch | Shortens the 1o/1p loop and memory footprint | `0015` committed; 48 tensors |
+| AffineN packing | Device tiles for the launch | `affine_pack.zig` allocates and packs word/scale/bias buffers | First device-side affine step | `0016` committed; stub-CUDA test |
 | Engram | Convert 4-bit affine tables to engine rows | FP8 E4M3/E8M0 row shards (`264 B/row`) | Matches `engram_rows.zig` without engine changes | Converter + unit checks pass; ~203 GB output |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
@@ -433,6 +446,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | Memory estimate | `memory_estimate.py` | Pass | 32K ≈112.7 GiB, 1M ≈134.8 GiB |
 | 2026-11-10 | Engram converter math | `test_convert_engram.py` | Pass | E4M3/E8M0 roundtrip rms 0.0793 |
 | 2026-11-10 | Engram converter fixture | `convert_engram.py --limit-rows 4 --verify` | Pass | 5152-byte shard; max/RMS 0 |
+| 2026-11-10 | `0016` patch apply | `git apply` on `0001`-`0015` | Pass | AffineN packing |
+| 2026-11-10 | AffineN packing | `zig test` on `affine_pack.zig` with stub CUDA | Pass | Target tile sizes non-zero |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -450,7 +465,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, and build a one-layer fixture. The remaining work is the actual kernel launch; the affine path deliberately returns `AffineForwardNotPorted`.
+- Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, and pack `AffineN` tiles. The remaining work is the actual `decode`/`prompt` launch; the affine path deliberately returns `AffineForwardNotPorted`.
 - Engram conversion is ready but expands to ~203 GB and requantizes to E4M3; a native 4-bit reader would avoid both, at the cost of engine work. The `engram.json` token map is still required.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
@@ -462,7 +477,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Run `convert_engram.py --dry-run` and `--limit-rows 64 --verify`, and `make_one_layer.py "$MODEL_DIR" /models/mlx-one-layer --layer 0`.
-2. Implement stage 1o: launch the affine8 linears and the per-expert fallback on the one-layer fixture.
-3. Decide the final Engram path: FP8 conversion (~203 GB) or a native 4-bit reader (~114 GB); wire the token map/kit.
+1. Run `convert_engram.py --dry-run/--limit-rows` and `make_one_layer.py` with the real checkpoint.
+2. Implement stage 1o: call `AffineNKernels.decode/prompt` on the one-layer fixture and compare against the golden rows.
+3. Wire the per-expert fallback loop and the MXFP4 decision.
 4. At the end, build the container, run `EXPECT_FORWARD=1 test_stage1.sh`, and record all results here.
