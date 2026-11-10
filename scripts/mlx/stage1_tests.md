@@ -36,8 +36,26 @@ CONTAINER=1 BUILD=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 ```
 
-Adds a `tensorfold-dsv41` boot with `TF_DSV41_LAYERS=0-0` and `TF_DSV41_DRAFTS=0`,
-captures the log, and compares its `dispatch:` line with `plan_dispatch.py`.
+Adds a `tensorfold-dsv41` boot with `TF_DSV41_DRAFTS=0`, captures the log, and compares
+its `dispatch:` line with `plan_dispatch.py`. The guard returns before any weight upload,
+so it plans all layers and must report the full counts (309/120/22/9). The `SMOKE=1` run
+then loads only layer 0 (`TF_DSV41_LAYERS=0-0`).
+
+The engine needs `quantization_config` in `config.json`. If the checkpoint only has the
+OMLX map, point `MODEL_DIR` at a translated overlay rather than editing the source:
+
+```sh
+OVERLAY=/models/mlx-translated
+mkdir -p "$OVERLAY"
+for f in /models/mlx/model-*.safetensors; do
+  ln "$f" "$OVERLAY/$(basename "$f")" 2>/dev/null || cp "$f" "$OVERLAY/"
+done
+cp /models/mlx/model.safetensors.index.json "$OVERLAY/"
+python3 scripts/mlx/translate_config.py /models/mlx --write-config "$OVERLAY/config.json"
+```
+
+Use hardlinks (or copies), not symlinks: a symlink to the host path is broken inside the
+container, where only the overlay is mounted at `/model`.
 
 **Before stage 1m** the engine is expected to end with `AffineForwardNotPorted`; the
 harness treats that as PASS. **After stage 1m** run with `EXPECT_FORWARD=1`, which

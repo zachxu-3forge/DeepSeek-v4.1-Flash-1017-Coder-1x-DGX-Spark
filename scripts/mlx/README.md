@@ -33,6 +33,24 @@ The translator emits canonical per-module keys under `quantization`, marks non-a
 (`.scales`/`.biases` for affine, `.scales` for MXFP8/MXFP4). It passes on the published
 config/index.
 
+## Translated-config overlay
+
+The engine reads `quantization_config`; the published checkpoint only has the OMLX map.
+Build a separate directory and leave the source untouched:
+
+```sh
+OVERLAY=/models/mlx-translated
+mkdir -p "$OVERLAY"
+for f in /models/mlx/model-*.safetensors; do
+  ln "$f" "$OVERLAY/$(basename "$f")" 2>/dev/null || cp "$f" "$OVERLAY/"
+done
+cp /models/mlx/model.safetensors.index.json "$OVERLAY/"
+python3 scripts/mlx/translate_config.py /models/mlx --write-config "$OVERLAY/config.json"
+```
+
+Hardlinks cost no extra disk. Do not use symlinks to the source: inside the container only
+the overlay is mounted at `/model`, so an absolute host-path symlink dangles.
+
 ## Container
 
 ```sh

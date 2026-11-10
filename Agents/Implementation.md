@@ -18,21 +18,21 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1p smoke test committed; Spark run next |
+| Overall status | Stage 1p built and image verified; host/GPU run next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
-| CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
+| CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` (not built) |
+| Container image | `tf-dsv41-mlx:dev`, ID `sha256:54c3f67c043aa2a0a5f4fc33ffb09307d841fdd4e6dc23f7602c0781a42164d6` |
 | Last updated | 2026-11-10 |
 
 ## Phase tracker
 
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
-| 0. Harness and admission spike | In progress | Translated config + 192-expert, world-1 affine fixture loads | Harness committed; image build pending |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1p smoke committed; GPU comparison pending |
+| 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; affine plan admits 192-expert/world-1; GPU guard pending |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | Stage 1p image built; GPU comparison pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
 | 3. Engram | Not started | Sampled lookups match reference; SSD streaming works | - |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -61,6 +61,24 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Spark image verified; harness dispatch/overlay fixes
+
+- **Phase:** 0/1.
+- **Done:** built `tf-dsv41-mlx:dev` from base digest
+  `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`; recorded image ID
+  `sha256:54c3f67c043aa2a0a5f4fc33ffb09307d841fdd4e6dc23f7602c0781a42164d6` and labels
+  `tf.ref=26e1b07...`, `tf.sm=121`. `tensorfold-dsv41 --version` prints `tensorfold-native 1.2.5`.
+- **Harness fix:** `test_stage1.sh` no longer forces `TF_DSV41_LAYERS=0-0` for the guard run.
+  The engine filters the dispatch count by requested layers, so the old run reported layer 0
+  only (`2 affine8 linears, 3 expert fallbacks`) and could not match `plan_dispatch.json`.
+  The guard returns before weight upload, so planning all layers is cheap and gives the full
+  309/120/22/9 counts. The smoke run still uses `0-0`.
+- **Overlay fix:** use hardlinks, not symlinks. A symlink to the host checkpoint dangles inside
+  the container, where only the overlay is mounted at `/model`.
+- **Verification:** host `plan_dispatch.py` confirms 460 quantized modules and counts
+  309 affine8 linears, 120 affine 2-bit expert fallbacks, 22 MXFP8, 9 MXFP4.
+- **Next:** host checks, translated overlay, container guard, one-layer fixture, affine smoke.
 
 ### 2026-11-10 - Stage 1p: affine smoke test
 

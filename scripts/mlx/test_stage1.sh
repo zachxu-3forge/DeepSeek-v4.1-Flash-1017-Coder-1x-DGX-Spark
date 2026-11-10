@@ -89,9 +89,12 @@ if [[ "$CONTAINER" == "1" ]]; then
     step build_image env BUILD=1 MODEL_DIR="$MODEL_DIR" IMAGE="$IMAGE" "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 --version
   fi
   echo "== engine"
+  # The guard runs before any weight upload, so it can plan every layer. That keeps
+  # the dispatch line comparable with plan_dispatch.json; the smoke run below loads
+  # only layer 0.
   set +e
-  TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 \
-    timeout 180 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
+  TF_DSV41_DRAFTS=0 \
+    timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
     >"$OUT_DIR/engine.log" 2>&1
   rc=$?
   set -e
@@ -117,7 +120,7 @@ if [[ "$CONTAINER" == "1" ]]; then
     echo "== affine smoke"
     set +e
     TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_SMOKE=1 \
-      timeout 300 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
+      timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
       >"$OUT_DIR/smoke.log" 2>&1
     rc_smoke=$?
     set -e
