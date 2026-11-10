@@ -89,6 +89,9 @@ present (`U32 [rows,32]`, `BF16 [rows,8]` scales/biases), so the converter and g
 infer affine 4-bit/group-32 from the shapes. On 2026-11-10 the dry-run reported
 188.83 GiB; a 64-row conversion verified with max 0.125 and RMS 0.0232/0.0256.
 
+Chosen path: a native 4-bit reader streamed from SSD (160 B/row, ~114 GiB), not the FP8
+conversion. The converter stays as a fallback/tool.
+
 ### B6. Mixed affine/MXFP8/MXFP4/unquantized modules
 
 The target is not uniformly affine. Its omlx map has:

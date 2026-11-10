@@ -18,7 +18,7 @@ import os
 import sys
 
 GIB = 1 << 30
-DEFAULT_CONTEXTS = (4096, 16384, 32768, 65536, 131072, 262144, 1048576)
+DEFAULT_CONTEXTS = (4096, 16384, 32768, 65536, 131072, 262144, 600000, 1048576)
 
 
 def main(argv: list[str] | None = None) -> int:

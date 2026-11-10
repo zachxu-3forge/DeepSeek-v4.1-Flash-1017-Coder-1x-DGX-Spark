@@ -105,9 +105,13 @@ python3 scripts/mlx/memory_estimate.py "$MODEL_DIR"
 
 `make_one_layer.py` copies layer 0 plus the embedding, final norm, and head into a translated
 fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` reports weights + conservative KV +
-reserve against 128 GiB at each context.
+reserve against 128 GiB at each context. With 600K in the defaults it reports 125.05 GiB
+(2.95 GiB headroom); 1M does not fit.
 
 ## Engram conversion
+
+The chosen path is the engine's native 4-bit reader, streamed from SSD: 160 B/row, ~114 GiB,
+no requantization. The converter below remains a fallback/tool.
 
 ```sh
 python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --dry-run

@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1q sweep, budget, resident linear set, and device linear added offline; GPU runs deferred |
+| Overall status | Decisions recorded: emitter integration, MXFP4→affine-4, host-loop fallback, native 4-bit Engram, 600K YaRN |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -33,8 +33,8 @@ needed. This file is the history.
 |---|---|---|---|
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
 | 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference (0.12% / 0.08%); full layer next |
-| 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable | - |
-| 3. Engram | In progress | Sampled lookups match reference; SSD streaming works | Golden rows and 64-row FP8 conversion pass; `engram.json` assets and full conversion remain |
+| 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
+| 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; 64-row FP8 conversion is a fallback; native reader pending |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
 | 5. Qualification and docs | Not started | Metrics, regression suite, reproducible run record | - |
 
@@ -56,6 +56,11 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D9 | 2026-11-09 | Build and run with `--platform linux/arm64` by default | Let Docker pick the host platform | Prevents an accidental x86 image on a non-Spark build host; the Spark is arm64 |
 | D10 | 2026-11-09 | Commit stages separately: stage 0 harness, stage 1a config admission, then stage 1b-1d layout/reader/plan | One large commit | Keeps each patch reviewable and reversible; multiple commits per stage are allowed |
 | D11 | 2026-11-10 | Write the Stage 1 verification harness before 1m/1n/1o | Verify ad hoc later | Captures golden rows, Engram checks, and dispatch counts before the launch code changes |
+| D12 | 2026-11-10 | Integrate affine projections into the existing dsv41 call emitter | A separate affine forward | The emitter already carries the window, attention, MoE, mHC, and exchange graph; a parallel forward duplicates that logic. Add an affine call site instead |
+| D13 | 2026-11-10 | Requantize the 9 DSpark MXFP4 expert tensors to MLX affine-4 group 64 and use `Affine4Experts` | New MXFP4 CUDA kernel or E8M0→BF16 affine-4 | TensorFold's native MLX support is affine 2/3/4/5/6/8-bit; MXFP4 is a different format. Requantization keeps 4-bit size and is confined to draft tensors |
+| D14 | 2026-11-10 | Use a host-loop expert fallback for Stage 1; add a device kernel for throughput later | Device kernel first | The host loop reuses the tested `packExpert`/`AffineN` path and gets the one-layer gate correct sooner; the sync cost is acceptable for a correctness milestone |
+| D15 | 2026-11-10 | Read the target's native 4-bit Engram tables, streamed from SSD | FP8 conversion | 160 B/row (~114 GiB) is smaller than 264 B/row (~188.83 GiB) and avoids E4M3 requantization loss. The converter remains a fallback/tool |
+| D16 | 2026-11-10 | Target 600K context with YaRN; 1M is out | 32K/64K only, or 1M | YaRN already scales 65,536 to 1,048,576. 600K estimates at 125.05 GiB including reserve (~2.95 GiB headroom); measure live before fixing it |
 
 ## Work log
 
@@ -77,9 +82,23 @@ next step.
   shards with max 0.125 and RMS 0.0232/0.0256. Ran CPU-only in the image with
   `--cpus=2 --memory=2g`, no GPU.
 - **Memory:** weights 98.0 GiB; 32K total 112.71 GiB (15.29 GiB headroom); 128K
-  114.85 GiB; 1M 134.81 GiB (does not fit).
+  114.85 GiB; **600K 125.05 GiB (2.95 GiB headroom)**; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-10 - Forward and format decisions
+
+- **Decisions:** D12 affine projections go through the existing dsv41 call emitter, not a
+  parallel forward; D13 the 9 DSpark MXFP4 experts are requantized to affine-4/group-64 for
+  `Affine4Experts`; D14 the Stage 1 expert fallback is a host loop, with a device kernel
+  later; D15 Engram uses the native 4-bit reader streamed from SSD; D16 target context is
+  600K with YaRN.
+- **Context math:** 600K conservative KV is 13.05 GiB; total with 98 GiB weights, 4 GiB
+  overhead, and 10 GiB reserve is 125.05 GiB, leaving 2.95 GiB headroom. 1M is 134.81 GiB.
+- **Format note:** TensorFold's MLX support is affine 2/3/4/5/6/8-bit. The 9 DSpark modules
+  are MXFP4 (E2M1/E8M0, group 32), a different format; requantization is the bridge.
+- **Artifacts:** `AGENTS.md`, `Agents/Blockers.md`, `Agents/Implementation.md`,
+  `scripts/mlx/memory_estimate.py` (600K row).
 
 ### 2026-11-10 - Device-to-device affine linear
 
@@ -675,19 +694,20 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Open issues and deviations
 
-- Stage 1a-1p plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, convert Engram to FP8, pack and launch `AffineN`, and verify one projection on the Spark. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The per-expert loop and full forward remain.
-- Engram conversion is ready but expands to ~203 GB and requantizes to E4M3; a native 4-bit reader would avoid both, at the cost of engine work. The `engram.json` token map is still required.
-- Phase 0 harness and image build are done; the guard and one-projection smoke pass on the Spark.
+- Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
+- Engram: the native 4-bit reader is chosen (160 B/row, ~114 GiB, streamed from SSD, no E4M3 requantization). The FP8 converter remains a fallback; `engram.json` and RoPE assets are still required.
+- Phase 0 harness and image build are done; the projection guard and one-projection smoke pass on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture. It builds and admits.
-- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan.
-- Runtime assets: `TF_DSV41_ASSETS` expects RoPE tables and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load.
+- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan. MXFP4 will be requantized to affine-4/group-64 for the native `Affine4Experts`.
+- Runtime assets: `TF_DSV41_ASSETS` expects RoPE tables and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load. The RoPE table must cover 600K positions.
 - Docker is not installed on the local Windows host; the build runs on the Spark.
 - The base-image digest is `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`.
 - The `dsv41-serve` build and the upstream dsv41 family are verified by the Spark guard and smoke.
 
 ## Next actions
 
-1. Wire the per-expert fallback loop for the 120 two-bit expert stacks.
-2. Build the full one-layer forward on GPU and compare it with a dequantized layer reference.
-3. Decide the MXFP4 path: no native CUDA kernel; options are a kernel, group-64 requant, or E8M0→BF16 affine-4.
-4. Then full model, Engram assets, server/vision, and qualification.
+1. Integrate affine projections into the dsv41 emitter; use the host-loop expert fallback for the one-layer gate.
+2. Wire the per-expert fallback loop for the 120 two-bit expert stacks; add the layer-0 attention/MoE forward and a full-layer reference.
+3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`.
+4. Add the native 4-bit Engram reader and 600K RoPE assets; measure 600K memory.
+5. Then full model, server/vision, and qualification.
