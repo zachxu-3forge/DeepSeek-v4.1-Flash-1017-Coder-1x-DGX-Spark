@@ -43,8 +43,14 @@ def main(argv: list[str] | None = None) -> int:
         name = f"language_model.layers.{layer}.engram.embed"
         spec = qmods.get(name)
         if spec is None:
-            print(f"skip {name}: not in the quantization map", file=sys.stderr)
-            continue
+            if name + ".weight" not in weight_map:
+                print(f"missing {name}: no weight tensor", file=sys.stderr)
+                return 2
+            spec = {"bits": 4, "group_size": 32, "mode": "affine"}
+            print(f"{name}: inferred 4-bit/group-32 table", file=sys.stderr)
+        if spec.get("mode", "affine") != "affine" or spec.get("bits") != 4 or spec.get("group_size", 32) != 32:
+            print(f"{name}: expected affine 4-bit/group-32, got {spec}", file=sys.stderr)
+            return 2
         weight_name = name + ".weight"
         shard = weight_map[weight_name]
         if shard not in headers:
@@ -73,6 +79,10 @@ def main(argv: list[str] | None = None) -> int:
             "dot_alt": rl.dot(values, x2),
             "first": values[:8],
         })
+
+    if not results:
+        print("no Engram tables found", file=sys.stderr)
+        return 2
 
     text_out = json.dumps(results, indent=2, sort_keys=True)
     if args.out:

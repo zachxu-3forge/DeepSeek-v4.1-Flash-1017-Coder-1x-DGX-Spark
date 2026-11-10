@@ -158,10 +158,13 @@ def main(argv: list[str] | None = None) -> int:
         base = f"language_model.layers.{layer}.engram.embed"
         spec = qmods.get(base)
         if spec is None:
-            print(f"skip layer {layer}: no quantization spec", file=sys.stderr)
-            continue
-        if spec.get("bits") != 4 or spec.get("group_size") != 32:
-            print(f"layer {layer}: expected 4-bit/group-32, got {spec}", file=sys.stderr)
+            if base + ".weight" not in weight_map:
+                print(f"skip layer {layer}: no Engram table", file=sys.stderr)
+                continue
+            spec = {"bits": 4, "group_size": 32, "mode": "affine"}
+            print(f"layer {layer}: inferred 4-bit/group-32 table", file=sys.stderr)
+        if spec.get("mode", "affine") != "affine" or spec.get("bits") != 4 or spec.get("group_size", 32) != 32:
+            print(f"layer {layer}: expected affine 4-bit/group-32, got {spec}", file=sys.stderr)
             return 2
         wname = base + ".weight"
         shard = weight_map[wname]
@@ -175,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
         rows = want_rows if args.limit_rows <= 0 else min(want_rows, args.limit_rows)
         jobs.append((layer, base, shard, base_off, rows))
         total += HEADER_BYTES + rows * ROW_BYTES
+
+    if not jobs:
+        print("no Engram tables found", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         for layer, _base, _shard, _off, rows in jobs:
