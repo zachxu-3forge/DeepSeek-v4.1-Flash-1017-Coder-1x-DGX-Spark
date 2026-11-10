@@ -34,7 +34,7 @@ def read_header(path: str) -> tuple[dict, int]:
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         blob = f.read(n)
-    return json.loads(blob), n
+    return json.loads(blob), 8 + n
 
 
 def select_names(weight_map: dict, layer: int) -> list[str]:
