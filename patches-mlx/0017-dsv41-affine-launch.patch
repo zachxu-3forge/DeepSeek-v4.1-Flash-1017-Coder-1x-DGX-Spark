@@ -1,0 +1,106 @@
+diff --git a/zig/src/families/deepseek_v41/affine_launch.zig b/zig/src/families/deepseek_v41/affine_launch.zig
+new file mode 100644
+index 0000000..e940617
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_launch.zig
+@@ -0,0 +1,90 @@
++//! Launch an `AffineN` projection: x rows in, packed weights, y rows out.
++//!
++//! This is the first actual kernel call in the affine path. It allocates x, group sums,
++//! and y, calls `AffineNKernels.decode` or `.prompt`, and returns the output buffer.
++//! The caller downloads or feeds it to the next stage.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const pack = @import("affine_pack.zig");
++const bind = @import("affine_bind.zig");
++const affine_cuda = @import("affine_cuda.zig");
++
++pub const Output = struct {
++    buffer: cuda.DeviceBuffer,
++
++    pub fn deinit(o: *Output) void {
++        o.buffer.free();
++        o.* = undefined;
++    }
++
++    pub fn download(o: *const Output, driver: *const cuda.Driver, a: std.mem.Allocator) ![]u8 {
++        const out = try a.alloc(u8, o.buffer.len);
++        errdefer a.free(out);
++        try cuda.DeviceBuffer.download(.{ .d = driver, .ptr = o.buffer.ptr, .len = o.buffer.len }, 0, out);
++        return out;
++    }
++};
++
++fn check(p: *const pack.Packed, x: []const u8, rows: usize) !usize {
++    if (rows == 0 or p.an.k == 0 or p.an.n == 0 or p.an.k % 64 != 0) return error.BadShape;
++    const want = std.math.mul(usize, rows, std.math.mul(usize, p.an.k, 2) catch return error.BadShape) catch return error.BadShape;
++    if (x.len != want) return error.BadShape;
++    return want;
++}
++
++/// Decode rows: `x` is bf16 `[rows, k]`; the result is bf16 `[rows, n]`.
++pub fn linear(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    p: *const pack.Packed,
++    x: []const u8,
++    rows: usize,
++) !Output {
++    _ = try check(p, x, rows);
++    var xb = try cuda.DeviceBuffer.fromHost(driver, x);
++    defer xb.free();
++    const sums_bytes = try std.math.mul(usize, rows, (p.an.k / 64) * 4);
++    var sums = try cuda.DeviceBuffer.alloc(driver, sums_bytes);
++    defer sums.free();
++    var out = try cuda.DeviceBuffer.alloc(driver, rows * p.an.n * 2);
++    errdefer out.free();
++    try kernels.decode(stream, xb.ptr, sums.ptr, p.an, out.ptr, rows);
++    try stream.synchronize();
++    return .{ .buffer = out };
++}
++
++/// Prompt rows: `x` is bf16 `[rows, k]`; the result is bf16 `[rows, n]`.
++pub fn prompt(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    p: *const pack.Packed,
++    x: []const u8,
++    rows: usize,
++) !Output {
++    _ = try check(p, x, rows);
++    var xb = try cuda.DeviceBuffer.fromHost(driver, x);
++    defer xb.free();
++    var out = try cuda.DeviceBuffer.alloc(driver, rows * p.an.n * 2);
++    errdefer out.free();
++    try kernels.prompt(stream, xb.ptr, p.an, out.ptr, rows);
++    try stream.synchronize();
++    return .{ .buffer = out };
++}
++
++/// Pack one expert from a stacked projection, then decode it.
++pub fn expert(
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    d: *const bind.Device,
++    view: affine_cuda.ExpertView,
++    x: []const u8,
++    rows: usize,
++) !Output {
++    var p = try pack.packExpert(driver, stream, kernels, d, view);
++    defer p.deinit();
++    return linear(driver, stream, kernels, &p, x, rows);
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index a2f7b21..b4aa547 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -623,4 +623,5 @@ test "Draft state: failed model drain retains its context and allocation owner"
+ 
+ test {
+     _ = @import("affine_pack.zig");
++    _ = @import("affine_launch.zig");
+ }
