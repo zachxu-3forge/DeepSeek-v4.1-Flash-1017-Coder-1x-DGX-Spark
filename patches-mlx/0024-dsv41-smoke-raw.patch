@@ -1,0 +1,25 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index bc7ac16..3fe57ef 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -64,6 +64,20 @@ pub fn run(
+     }
+     const cpu1 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x1f);
+     const cpu2 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x2f);
++    std.log.info("affine smoke raw {s}: kinds {s}/{s}/{s} lens {d}/{d}/{d} w0={x} s0={x} b0={x} s1={x} b1={x}", .{
++        module_name,
++        @tagName(images.weight.kind),
++        @tagName(images.scales.kind),
++        @tagName(images.biases.kind),
++        images.weight.bytes.len,
++        images.scales.bytes.len,
++        images.biases.bytes.len,
++        w0[0],
++        s0[0],
++        b0[0],
++        s0[1],
++        b0[1],
++    });
+     std.log.info("affine smoke cpu {s}: row0 ones={d:.6} alt={d:.6}", .{ module_name, cpu1, cpu2 });
+ 
+     var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };

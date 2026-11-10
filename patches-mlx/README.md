@@ -28,10 +28,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0021-dsv41-indexer-weights-proj.patch` | Plan the checkpoint's quantized `attn.indexer.weights_proj` as an affine linear |
 | `0022-dsv41-affine-group-sums.patch` | Fill the affine decode's per-row 64-value group sums before launch |
 | `0023-dsv41-smoke-oracle.patch` | Log the CPU oracle for the smoke row and zero the output buffer |
-| `0024-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0025-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0024-dsv41-smoke-raw.patch` | Log the loaded row's raw words/scales/biases and tensor kinds |
+| `0025-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0026-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0023`. Planned: `0024`-`0025`.
+Implemented: `0001`-`0024`. Planned: `0025`-`0026`.
 
 Rules:
 
