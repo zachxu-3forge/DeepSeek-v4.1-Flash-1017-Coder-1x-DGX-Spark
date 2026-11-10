@@ -88,7 +88,9 @@ next step.
   `layers.0.ffn.experts.w1` through `affine_cuda.expertView` + `affine_launch.expert`,
   with a CPU `affine_ref.dotRow` oracle. `0026-dsv41-smoke-6bit.patch` refactors the
   smoke to run the 8-bit `wq_a`, the 6-bit `ffn.shared_experts.w1`, and the 2-bit expert.
-  The harness now compares all three GPU lines with `reference_layer.json`.
+  `0027-dsv41-layer0-sweep.patch` extends that to every layer-0 linear and all three
+  2-bit expert stacks. The harness compares every GPU line with its CPU oracle and checks
+  `wq_a`, `shared_experts.w1`, and expert 0 against `reference_layer.json`.
 - **Golden rows:** `wq_a` `-0.153510/2.451196`, `shared_experts.w1` `0.084923/3.316952`,
   `experts.w1` expert 0 `0.134277/0.107697`.
 - **Verification:** patches `0001`-`0026` apply cleanly; `zig ast-check` passes. Host-only

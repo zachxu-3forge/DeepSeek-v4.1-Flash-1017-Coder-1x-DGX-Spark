@@ -155,6 +155,27 @@ for canonical, pattern in checks:
             print(f"{canonical} {label}: gpu {got} ref {want} delta {got - want} tol {tol}", file=sys.stderr)
             raise SystemExit(1)
     print(f"{canonical}: gpu {ones}/{alt} ref {entry['dot_ones']}/{entry['dot_alt']}")
+
+def pairs(pattern):
+    return {
+        m.group(1): (float(m.group(2)), float(m.group(3)))
+        for m in re.finditer(pattern, text)
+    }
+
+cpu = pairs(r"affine smoke cpu (\S+): row0 ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)")
+cpu.update(pairs(r"affine smoke expert cpu (\S+): expert0 row0 ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"))
+gpu = pairs(r"affine smoke (\S+): y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)")
+gpu.update(pairs(r"affine smoke expert (\S+): y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)"))
+if not cpu or set(cpu) != set(gpu):
+    print(f"smoke pairs differ: cpu={sorted(cpu)} gpu={sorted(gpu)}", file=sys.stderr)
+    raise SystemExit(1)
+for name in sorted(cpu):
+    for label, got, want in (("ones", gpu[name][0], cpu[name][0]), ("alt", gpu[name][1], cpu[name][1])):
+        tol = 0.01 + 0.01 * abs(want)
+        if abs(got - want) > tol:
+            print(f"{name} {label}: gpu {got} cpu {want} delta {got - want} tol {tol}", file=sys.stderr)
+            raise SystemExit(1)
+print(f"all {len(cpu)} CPU/GPU smoke pairs match")
 print("smoke values match")
 PY
         then

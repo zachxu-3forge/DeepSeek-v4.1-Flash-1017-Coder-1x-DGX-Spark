@@ -84,9 +84,11 @@ the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`. The har
 `abs(gpu - ref) <= 0.01 + 0.01 * abs(ref)`, which accepts BF16 output rounding.
 
 On the published checkpoint the CPU row is `ones=-0.153510`, `alt=2.451196`; the first
-Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%). The same smoke also
-runs the 6-bit `layers.0.ffn.shared_experts.w1` (CPU `0.084923/3.316952`) and expert 0 of
-the 2-bit `layers.0.ffn.experts.w1` (CPU `0.134277/0.107697`).
+Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%). The smoke also
+sweeps every layer-0 linear (8/6-bit) and all three 2-bit expert stacks; the harness
+compares each GPU line with its CPU oracle and checks `wq_a`, `shared_experts.w1` and
+expert 0 against `reference_layer.json`. CPU rows: `wq_a -0.153510/2.451196`,
+`shared_experts.w1 0.084923/3.316952`, `experts.w1` expert 0 `0.134277/0.107697`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
 For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report

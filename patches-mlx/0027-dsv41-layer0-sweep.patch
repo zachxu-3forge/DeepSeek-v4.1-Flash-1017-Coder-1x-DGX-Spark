@@ -1,0 +1,69 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index d4155f0..0aceebc 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -19,8 +19,22 @@ const affine_exec = @import("affine_exec.zig");
+ const affine_cuda = @import("affine_cuda.zig");
+ 
+ pub const module_name = "layers.0.attn.wq_a";
+-const shared_name = "layers.0.ffn.shared_experts.w1";
+-const expert_name = "layers.0.ffn.experts.w1";
++
++const layer0_linears = [_][]const u8{
++    module_name,
++    "layers.0.attn.wkv",
++    "layers.0.attn.wq_b",
++    "layers.0.attn.wo_b",
++    "layers.0.ffn.shared_experts.w1",
++    "layers.0.ffn.shared_experts.w2",
++    "layers.0.ffn.shared_experts.w3",
++};
++
++const layer0_experts = [_][]const u8{
++    "layers.0.ffn.experts.w1",
++    "layers.0.ffn.experts.w2",
++    "layers.0.ffn.experts.w3",
++};
+ 
+ fn find(bindings: *const affine_exec.Bindings, name: []const u8) ?*const affine_exec.Binding {
+     for (bindings.items) |*b| {
+@@ -59,9 +73,8 @@ pub fn run(
+     var wide = try cuda.qlinear.AffineNKernels.resolve(driver, m8, mp, m4, sms, major == 12 and minor == 1);
+     defer wide.deinit();
+ 
+-    try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, module_name);
+-    try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, shared_name);
+-    try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide);
++    for (layer0_linears) |name| try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, name);
++    for (layer0_experts) |name| try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide, name);
+ }
+ 
+ fn runLinear(
+@@ -144,9 +157,10 @@ fn runExpert(
+     bindings: *const affine_exec.Bindings,
+     weights: *load.Weights,
+     wide: *const cuda.qlinear.AffineNKernels,
++    name: []const u8,
+ ) !void {
+     const experts = 192;
+-    const e = find(bindings, expert_name) orelse return error.SmokeExpertMissing;
++    const e = find(bindings, name) orelse return error.SmokeExpertMissing;
+     if (e.mode != .affine_n_expert or e.affine_layout == null or e.kind != .expert) return error.SmokeNotExpert;
+     const layout = e.affine_layout.?;
+     const k: usize = e.k;
+@@ -169,7 +183,7 @@ fn runExpert(
+     }
+     const cpu1 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x1f);
+     const cpu2 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x2f);
+-    std.log.info("affine smoke expert cpu {s}: expert0 row0 ones={d:.6} alt={d:.6}", .{ expert_name, cpu1, cpu2 });
++    std.log.info("affine smoke expert cpu {s}: expert0 row0 ones={d:.6} alt={d:.6}", .{ name, cpu1, cpu2 });
+ 
+     var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+     defer builder.deinit();
+@@ -200,5 +214,5 @@ fn runExpert(
+     defer gpa.free(b2);
+     const v1 = named.bf16Widen(std.mem.readInt(u16, b1[0..2], .little));
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+-    std.log.info("affine smoke expert {s}: y[0] ones={d:.6} alt={d:.6}", .{ expert_name, v1, v2 });
++    std.log.info("affine smoke expert {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
+ }
