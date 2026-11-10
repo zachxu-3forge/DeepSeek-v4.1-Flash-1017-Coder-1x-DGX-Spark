@@ -1,0 +1,77 @@
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index 02c974c..7533819 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -62,10 +62,12 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+     var skipped: std.ArrayList(Skipped) = .empty;
+     var mixed: std.ArrayList(Mixed) = .empty;
+     var name_buf: [160]u8 = undefined;
++    var spell_buf: [160]u8 = undefined;
+     var prefix_buf: [32]u8 = undefined;
+     for (layers, 0..) |*layer, i| {
+         const prefix = try a.dupe(u8, try names.blockPrefix(cfg, @intCast(i), &prefix_buf));
+-        const has_shared = pack.has(try std.fmt.bufPrint(&name_buf, "{s}.ffn.shared_experts.w1.weight", .{prefix}));
++        const shared = try std.fmt.bufPrint(&name_buf, "{s}.ffn.shared_experts.w1", .{prefix});
++        const has_shared = pack.spellModule(shared, &spell_buf) != null;
+         var modules: std.ArrayList(Module) = .empty;
+         const releases = try names.releaseBlocks(cfg, @intCast(i), has_shared);
+         for (releases.items()) |r| {
+@@ -73,7 +75,8 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 try skipped.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, r.suffix }), .reason = .engram });
+                 continue;
+             }
+-            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, r.suffix });
++            const canonical = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, r.suffix });
++            const name = try a.dupe(u8, pack.spellModule(canonical, &spell_buf) orelse canonical);
+             const spec = try formats.resolve(name);
+             if (spec == null) {
+                 try skipped.append(a, .{ .name = name, .reason = .dense });
+@@ -95,7 +98,8 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+             });
+         }
+         for ([_]names.ExpertProj{ .w1, .w2, .w3 }) |p| {
+-            const name = try std.fmt.allocPrint(a, "{s}.ffn.experts.{t}", .{ prefix, p });
++            const canonical = try std.fmt.allocPrint(a, "{s}.ffn.experts.{t}", .{ prefix, p });
++            const name = try a.dupe(u8, pack.spellModule(canonical, &spell_buf) orelse canonical);
+             const spec = try formats.resolve(name);
+             if (spec == null) {
+                 try skipped.append(a, .{ .name = name, .reason = .dense });
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index e2a6b05..f479746 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -20,7 +20,7 @@ pub const module_name = "layers.0.attn.wq_a";
+ 
+ fn find(bindings: *const affine_exec.Bindings) ?*const affine_exec.Binding {
+     for (bindings.items) |*b| {
+-        if (std.mem.eql(u8, b.name, module_name)) return b;
++        if (std.mem.endsWith(u8, b.name, module_name)) return b;
+     }
+     return null;
+ }
+diff --git a/zig/src/families/deepseek_v41/pack.zig b/zig/src/families/deepseek_v41/pack.zig
+index 5be4376..6538268 100644
+--- a/zig/src/families/deepseek_v41/pack.zig
++++ b/zig/src/families/deepseek_v41/pack.zig
+@@ -169,6 +169,21 @@ pub const Pack = struct {
+         return p.names.contains(name);
+     }
+ 
++    /// Prefixes a checkpoint may put before a canonical module name (`layers.0...`).
++    const module_prefixes = [_][]const u8{ "language_model.", "model.language_model.", "text_model.", "model.", "" };
++
++    /// The pack's spelling of a canonical module name, when its `.weight` tensor exists.
++    /// The returned slice is in `buf`; callers that keep it must copy it.
++    pub fn spellModule(p: *const Pack, canonical: []const u8, buf: []u8) ?[]const u8 {
++        for (module_prefixes) |prefix| {
++            const name = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, canonical }) catch return null;
++            var wbuf: [256]u8 = undefined;
++            const weight = std.fmt.bufPrint(&wbuf, "{s}.weight", .{name}) catch return null;
++            if (p.names.contains(weight)) return name;
++        }
++        return null;
++    }
++
+     /// A required tensor; a missing name is logged and refused.
+     pub fn need(p: *const Pack, name: []const u8) !Info {
+         return p.get(name) orelse {

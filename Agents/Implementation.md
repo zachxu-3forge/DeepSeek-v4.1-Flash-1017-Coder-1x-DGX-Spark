@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1p built and image verified; host/GPU run next |
+| Overall status | Stage 1p boot fixes committed; image rebuild with 0019/0020 pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -61,6 +61,30 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Stage 1p Spark boot fixes
+
+- **Phase:** 1.
+- **Done:** first Spark boot attempts exposed four gaps before the affine guard could run:
+  1. The translated overlay lacked `tokenizer.json`; the engine stopped with
+     `tensorfold: cannot read /model/tokenizer.json`.
+  2. The engine is gated: it needs `TF_EXPERIMENTAL=deepseek` and defaults to world 2, so
+     `TF_TP_WORLD=1` was added to the harness.
+  3. `translate_config.py` copied `"group_size": null` from the OMLX map for the 31
+     MXFP8/MXFP4 modules. The engine's strict spec parser reads a present null as a bad
+     integer and returned `BadAffine`; the translator now omits null fields.
+  4. Patch `0018` added `TF_DSV41_AFFINE_SMOKE` without registering it in the strict
+     environment table, so boot panicked with `unregistered strict environment parser`.
+     `0019-dsv41-affine-smoke-env.patch` registers it in `platform/environment.zig` and
+     `core/profile.zig`.
+- **Also fixed:** the affine plan names modules canonically (`layers.0...`) while the pack
+  spells them `language_model.layers.0...`; the plan's shared-expert probe and the loader's
+  `pack.need` would miss. `0020-dsv41-pack-spelling.patch` adds `Pack.spellModule` and makes
+  the plan carry the pack's spelling.
+- **Verification:** `0001`-`0020` apply cleanly; ast-check passes. The overlay translator now
+  emits no null `group_size`; a host plan simulation reports 496 enumerated modules, 30
+  mixed, 0 errors.
+- **Next:** rebuild `tf-dsv41-mlx:dev` with 0019/0020, rerun the guard, then the smoke.
 
 ### 2026-11-10 - Spark image verified; harness dispatch/overlay fixes
 

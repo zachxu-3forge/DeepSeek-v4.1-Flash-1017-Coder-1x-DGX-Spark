@@ -23,10 +23,12 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0016-dsv41-affine-pack.patch` | Pack affine projections into `AffineN` device tiles; no kernel launch yet |
 | `0017-dsv41-affine-launch.patch` | Launch `AffineNKernels.decode`/`prompt` with x, group sums, and output buffers |
 | `0018-dsv41-affine-smoke.patch` | One-projection smoke test: load `wq_a`, pack, decode two rows, log `y[0]` |
-| `0019-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0020-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0019-dsv41-affine-smoke-env.patch` | Register `TF_DSV41_AFFINE_SMOKE` in the strict environment and profile tables |
+| `0020-dsv41-pack-spelling.patch` | Resolve canonical plan names to the pack's `language_model.` spelling |
+| `0021-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0022-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0018`. Planned: `0019`-`0020`.
+Implemented: `0001`-`0020`. Planned: `0021`-`0022`.
 
 Rules:
 

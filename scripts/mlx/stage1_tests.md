@@ -52,11 +52,15 @@ for f in /models/mlx/model-*.safetensors; do
   ln "$f" "$OVERLAY/$(basename "$f")" 2>/dev/null || cp "$f" "$OVERLAY/"
 done
 cp /models/mlx/model.safetensors.index.json "$OVERLAY/"
+for f in tokenizer.json tokenizer_config.json chat_template.jinja special_tokens_map.json generation_config.json; do
+  [ -f "/models/mlx/$f" ] && cp -p "/models/mlx/$f" "$OVERLAY/"
+done
 python3 scripts/mlx/translate_config.py /models/mlx --write-config "$OVERLAY/config.json"
 ```
 
 Use hardlinks (or copies), not symlinks: a symlink to the host path is broken inside the
-container, where only the overlay is mounted at `/model`.
+container, where only the overlay is mounted at `/model`. The engine reads the tokenizer at
+startup, so the overlay must include it.
 
 **Before stage 1m** the engine is expected to end with `AffineForwardNotPorted`; the
 harness treats that as PASS. **After stage 1m** run with `EXPECT_FORWARD=1`, which

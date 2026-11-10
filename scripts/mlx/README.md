@@ -45,11 +45,15 @@ for f in /models/mlx/model-*.safetensors; do
   ln "$f" "$OVERLAY/$(basename "$f")" 2>/dev/null || cp "$f" "$OVERLAY/"
 done
 cp /models/mlx/model.safetensors.index.json "$OVERLAY/"
+for f in tokenizer.json tokenizer_config.json chat_template.jinja special_tokens_map.json generation_config.json; do
+  [ -f "/models/mlx/$f" ] && cp -p "/models/mlx/$f" "$OVERLAY/"
+done
 python3 scripts/mlx/translate_config.py /models/mlx --write-config "$OVERLAY/config.json"
 ```
 
 Hardlinks cost no extra disk. Do not use symlinks to the source: inside the container only
-the overlay is mounted at `/model`, so an absolute host-path symlink dangles.
+the overlay is mounted at `/model`, so an absolute host-path symlink dangles. The engine also
+reads the tokenizer at startup, so the overlay needs those files.
 
 ## Container
 
