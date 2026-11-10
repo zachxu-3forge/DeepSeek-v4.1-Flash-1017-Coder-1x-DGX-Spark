@@ -126,6 +126,36 @@ if [[ "$CONTAINER" == "1" ]]; then
     set -e
     if grep -q "affine smoke" "$OUT_DIR/smoke.log"; then
       lines+=("| affine smoke | PASS | \`smoke.log\` |")
+      if [[ -f "$OUT_DIR/reference_layer.json" ]]; then
+        if "$PY" - "$OUT_DIR/reference_layer.json" "$OUT_DIR/smoke.log" <<'PY'
+import json, re, sys
+ref = json.load(open(sys.argv[1], encoding="utf-8"))
+entry = next((x for x in ref if x.get("canonical") == "layers.0.attn.wq_a"), None)
+if entry is None:
+    print("reference has no layers.0.attn.wq_a", file=sys.stderr)
+    raise SystemExit(1)
+text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+m = re.search(r"affine smoke layers\.0\.attn\.wq_a: y\[0\] ones=([0-9.eE+-]+) alt=([0-9.eE+-]+)", text)
+if not m:
+    print("no GPU smoke line", file=sys.stderr)
+    raise SystemExit(1)
+ones, alt = float(m.group(1)), float(m.group(2))
+for label, got, want in (("ones", ones, entry["dot_ones"]), ("alt", alt, entry["dot_alt"])):
+    tol = 0.01 + 0.01 * abs(want)
+    if abs(got - want) > tol:
+        print(f"{label}: gpu {got} ref {want} delta {got - want} tol {tol}", file=sys.stderr)
+        raise SystemExit(1)
+print("smoke values match")
+PY
+        then
+          lines+=("| smoke match | PASS | 1% + 0.01 vs \`reference_layer.json\` |")
+        else
+          lines+=("| smoke match | FAIL | \`smoke.log\` |")
+          fail=1
+        fi
+      else
+        lines+=("| smoke match | SKIP | no reference_layer.json |")
+      fi
     else
       lines+=("| affine smoke | FAIL ($rc_smoke) | \`smoke.log\` |")
       fail=1

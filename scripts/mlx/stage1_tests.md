@@ -77,7 +77,11 @@ The GPU harness must reproduce `reference_layer.json`:
 
 `SMOKE=1` adds a one-projection run: `smoke.log` must contain
 `affine smoke layers.0.attn.wq_a: y[0] ones=... alt=...`; compare those two values with
-the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`.
+the `language_model.layers.0.attn.wq_a` entry in `reference_layer.json`. The harness checks
+`abs(gpu - ref) <= 0.01 + 0.01 * abs(ref)`, which accepts BF16 output rounding.
+
+On the published checkpoint the CPU row is `ones=-0.153510`, `alt=2.451196`; the first
+Spark run produced `ones=-0.153320`, `alt=2.453125` (0.12% and 0.08%).
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
 For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report
