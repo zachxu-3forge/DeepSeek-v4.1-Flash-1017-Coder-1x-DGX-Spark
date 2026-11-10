@@ -76,10 +76,13 @@ ported and tested, not just a config edit.
 
 ### B5. Engram storage format differs
 
-The repo expects the base model's BF16 Engram shards 47/48 (~203 GB) plus `engram.json` and the
-token map. The target stores 4-bit/group-32 affine Engram tables in its own shards 18/19
-(~114 GiB), with omlx SSD offload. Dimensions and vocabulary match, but the storage does not.
-Either convert the target tables to the engine's format or add an affine Engram reader.
+The engine's packed Engram rows are FP8, not affine: `F8_E4M3 [rows,256]` plus
+`F8_E8M0 [rows,8]`, 264 bytes a row, in `engram-l<layer>-r0of1.bin` shards with a
+`DSV41EN1` header. The target stores U32 4-bit/group-32 words plus BF16 scales and
+biases, 160 bytes a row, in shards 18/19 (~114 GiB). `scripts/mlx/convert_engram.py`
+converts to the engine format (output ~203 GB, with E4M3 requantization loss); a native
+4-bit reader would preserve the smaller tables but needs engine work. The `engram.json`
+token map is still required either way.
 
 ### B6. Mixed affine/MXFP8/MXFP4/unquantized modules
 

@@ -51,6 +51,8 @@ The GPU harness must reproduce `reference_layer.json`:
 - the same dispatch counts as `plan_dispatch.json`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
+For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report
+bounded max/RMS error, and a full `--dry-run` must confirm the ~203 GB output budget.
 
 ## Results
 

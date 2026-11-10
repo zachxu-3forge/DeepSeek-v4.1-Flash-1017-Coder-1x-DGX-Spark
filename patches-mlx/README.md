@@ -21,7 +21,7 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0014-dsv41-device-bindings.patch` | Bind the dispatch layouts to loaded device tensors with byte-size checks |
 | `0015-dsv41-one-layer-selection.patch` | Make the affine boot guard check only `TF_DSV41_LAYERS`, enabling one-layer fixtures |
 | `0016-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0017-dsv41-engram-affine.patch` | Read or convert the target's 4-bit/group-32 Engram tables |
+| `0017-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
 Implemented: `0001`-`0015`. Planned: `0016`-`0017`.
 

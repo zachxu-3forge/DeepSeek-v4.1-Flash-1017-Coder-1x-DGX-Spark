@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1prep committed (one-layer fixture + memory estimate); 1o launch next |
+| Overall status | Stage 1prep + Engram converter committed; 1o launch next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3` (tag; digest pending) |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -61,6 +61,23 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-10 - Engram converter
+
+- **Phase:** 3 preparation.
+- **Done:** added `scripts/mlx/convert_engram.py` and `test_convert_engram.py`. The
+  converter reads the target's `U32 [rows,32]` 4-bit words plus BF16 scales/biases,
+  dequantizes each 32-value group, requantizes to E4M3 with an E8M0 scale, and writes
+  `engram-l<layer>-r0of1.bin` with the engine's 4096-byte `DSV41EN1` header.
+- **Approach used:** FP8/E8M0 row shards, matching `engram_rows.zig` (256 E4M3 values +
+  8 E8M0 scales = 264 bytes). `--limit-rows` and `--verify` allow a small run first.
+- **Verification:** synthetic 4-row fixture round-trips with max/RMS 0; a random-value
+  unit check reports ~0.079 RMS at scale ~3; output header/size checked.
+- **Artifacts:** `scripts/mlx/convert_engram.py`, `scripts/mlx/test_convert_engram.py`.
+- **Tradeoff:** full output is ~203 GB and E4M3 requantization is slightly lossy; a native
+  4-bit Engram reader would keep ~114 GB but needs engine work. The `engram.json` token
+  map is still required.
+- **Next:** run `--limit-rows 64 --verify`, then the one-layer launch.
 
 ### 2026-11-10 - Stage 1prep: one-layer fixture and memory estimate
 
@@ -378,6 +395,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | Binding layouts | Freeze shapes for device binding | `affine_exec.zig` carries n/k/bits/group per entry | Device allocation and launch remain separate | `0013` committed; 25 tests |
 | Device bindings | Resolve loaded tensors to addresses | `affine_bind.zig` checks bytes and freezes ptr/len | Verifies the loader and binding contract before launch | `0014` committed; 26 tests |
 | One-layer fixture | Test one layer without 211 GiB load | `make_one_layer.py` + layer-selection patch | Shortens the 1o/1p loop and memory footprint | `0015` committed; 48 tensors |
+| Engram | Convert 4-bit affine tables to engine rows | FP8 E4M3/E8M0 row shards (`264 B/row`) | Matches `engram_rows.zig` without engine changes | Converter + unit checks pass; ~203 GB output |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
 | Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
@@ -413,6 +431,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-10 | `0015` patch apply | `git apply` on `0001`-`0014` | Pass | One-layer selection |
 | 2026-11-10 | One-layer fixture list | `make_one_layer.py --list` | Pass | 48 tensors for layer 0 |
 | 2026-11-10 | Memory estimate | `memory_estimate.py` | Pass | 32K ≈112.7 GiB, 1M ≈134.8 GiB |
+| 2026-11-10 | Engram converter math | `test_convert_engram.py` | Pass | E4M3/E8M0 roundtrip rms 0.0793 |
+| 2026-11-10 | Engram converter fixture | `convert_engram.py --limit-rows 4 --verify` | Pass | 5152-byte shard; max/RMS 0 |
 | 2026-11-09 | Mixed reader | `zig test` on `mixed`/`mixed_load` | Pass | 35-test host suite |
 | 2026-11-09 | Expert fallback views | `zig test` on `affine_cuda.zig` | Pass | 19-test host suite |
 | 2026-11-09 | CUDA width audit | `zig test` on `affine_cuda.zig` | Pass | 18-test host suite |
@@ -431,6 +451,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 ## Open issues and deviations
 
 - Stage 1a-1n plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, and build a one-layer fixture. The remaining work is the actual kernel launch; the affine path deliberately returns `AffineForwardNotPorted`.
+- Engram conversion is ready but expands to ~203 GB and requantizes to E4M3; a native 4-bit reader would avoid both, at the cost of engine work. The `engram.json` token map is still required.
 - Phase 0 harness is committed; the image build is still pending on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; mixed-format loading is an additional Phase 1 task.
@@ -441,7 +462,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Run `scripts/mlx/make_one_layer.py "$MODEL_DIR" /models/mlx-one-layer --layer 0` and `scripts/mlx/test_stage1.sh --host-only`.
+1. Run `convert_engram.py --dry-run` and `--limit-rows 64 --verify`, and `make_one_layer.py "$MODEL_DIR" /models/mlx-one-layer --layer 0`.
 2. Implement stage 1o: launch the affine8 linears and the per-expert fallback on the one-layer fixture.
-3. Implement stage 1p: the Engram affine reader/converter.
+3. Decide the final Engram path: FP8 conversion (~203 GB) or a native 4-bit reader (~114 GB); wire the token map/kit.
 4. At the end, build the container, run `EXPECT_FORWARD=1 test_stage1.sh`, and record all results here.

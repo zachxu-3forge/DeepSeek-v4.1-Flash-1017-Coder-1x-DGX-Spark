@@ -116,11 +116,12 @@ stays under the safety floor; 32K context is stable; no host libraries are loade
 
 Choose one:
 
-- **Convert (recommended first):** offline converter from the target's 4-bit/group-32 affine
-  Engram tables to the engine's `TF_DS_ENGRAM` format, plus the token map. Verify hashes and
-  row counts; keep the source checkpoint unchanged.
-- **Read (later):** add an affine Engram reader in the engine and stream from the target
-  shards. More faithful, but more engine work.
+- **Convert (implemented):** `scripts/mlx/convert_engram.py` reads the target's 4-bit/group-32
+  affine tables and writes the engine's FP8 row shards (`F8_E4M3 [rows,256]` +
+  `F8_E8M0 [rows,8]`, 264 bytes/row). Output is ~203 GB and the E4M3 requantization is
+  slightly lossy; `--limit-rows` and `--verify` validate it.
+- **Native reader (alternative):** add a 4-bit affine Engram reader to keep the ~114 GiB
+  tables and avoid requantization; this needs engine work.
 
 Gate: Engram lookups match the reference for sampled tokens; memory stays within budget;
 SSD streaming works under `--rm` with a read-only mount.

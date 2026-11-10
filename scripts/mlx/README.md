@@ -77,6 +77,18 @@ python3 scripts/mlx/memory_estimate.py "$MODEL_DIR"
 fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` reports weights + conservative KV +
 reserve against 128 GiB at each context.
 
+## Engram conversion
+
+```sh
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --dry-run
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --limit-rows 64 --verify
+```
+
+Writes `engram-l<layer>-r0of1.bin` in the engine's FP8/E8M0 row format. The full output
+is ~203 GB; the conversion dequantizes the target's 4-bit groups and requantizes to E4M3,
+so it is slightly lossy. The `engram.json` token map/kit is still required. Use
+`--limit-rows` first and `--verify` to see max/RMS error.
+
 ## Phase 0 gate
 
 The harness is ready when the image builds, `tensorfold-dsv41 --version` runs, and the engine
