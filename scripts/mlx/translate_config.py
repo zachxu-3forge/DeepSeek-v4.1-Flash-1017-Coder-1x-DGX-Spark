@@ -75,11 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         seen[key] = name
         mode = spec.get("mode", "affine")
         if mode != "affine":
-            non_affine[key] = {
-                "mode": mode,
-                "bits": spec.get("bits"),
-                "group_size": spec.get("group_size"),
-            }
+            entry = {"mode": mode}
+            if spec.get("bits") is not None:
+                entry["bits"] = spec["bits"]
+            if spec.get("group_size") is not None:
+                entry["group_size"] = spec["group_size"]
+            non_affine[key] = entry
             overrides[key] = False
             continue
         out = {
