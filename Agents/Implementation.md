@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Decisions recorded: emitter integration, MXFP4→affine-4, host-loop fallback, native 4-bit Engram, 600K YaRN |
+| Overall status | Decisions recorded; layer-0 attention projection chain added offline; GPU runs deferred |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -85,6 +85,19 @@ next step.
   114.85 GiB; **600K 125.05 GiB (2.95 GiB headroom)**; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-10 - Layer-0 attention projection chain
+
+- **Phase:** 1 (forward migration, unrun).
+- **Done:** `0031-dsv41-attn-chain.patch` adds `runAttentionChain` to the smoke:
+  `attn_norm` RMS → `wq_a` (8-bit) → `q_norm` RMS → `wq_b` (6-bit), and
+  `wkv` (8-bit) → `kv_norm` RMS, all on device through `linearDev` and `cuda.norms`.
+  It loads the three projections through a filtered resident `affine_linears.Set`, uses
+  the real layer-0 norm tensors, and logs `qa0/q0/kv0/kvn0`.
+- **Why:** this exercises the affine projection chain with the same norm/linear sequence
+  the attention block will use, without yet touching the attention kernel or `wo_a`/`wo_b`.
+- **Verification:** `0001`-`0031` apply; `zig ast-check` passes. GPU run pending.
+- **Next:** add the attention kernel/output projections, then the MoE block and full layer.
 
 ### 2026-11-10 - Forward and format decisions
 

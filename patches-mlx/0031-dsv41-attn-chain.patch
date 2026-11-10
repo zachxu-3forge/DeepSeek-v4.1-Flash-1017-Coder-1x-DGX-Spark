@@ -1,0 +1,159 @@
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 4399f86..a0494f8 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -17,6 +17,8 @@ const affine_launch = @import("affine_launch.zig");
+ const affine_plan = @import("affine_plan.zig");
+ const affine_exec = @import("affine_exec.zig");
+ const affine_cuda = @import("affine_cuda.zig");
++const affine_linears = @import("affine_linears.zig");
++const Config = @import("config.zig").Config;
+ 
+ pub const module_name = "layers.0.attn.wq_a";
+ 
+@@ -57,6 +59,7 @@ pub fn run(
+     plan: *const affine_plan.Plan,
+     bindings: *const affine_exec.Bindings,
+     weights: *load.Weights,
++    cfg: *const Config,
+ ) !void {
+     _ = plan;
+     const kk = cuda.kernels;
+@@ -77,6 +80,7 @@ pub fn run(
+ 
+     for (layer0_linears) |name| try runLinear(gpa, io, driver, stream, pack, bindings, weights, &wide, &act, name);
+     for (layer0_experts) |name| try runExpert(gpa, io, driver, stream, pack, bindings, weights, &wide, name);
++    try runAttentionChain(gpa, io, driver, stream, pack, bindings, &wide, &act, cfg);
+ }
+ 
+ fn runLinear(
+@@ -232,3 +236,116 @@ fn runExpert(
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+     std.log.info("affine smoke expert {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
+ }
++
++fn normF32(gpa: std.mem.Allocator, io: std.Io, pack: *const Pack, name: []const u8, n: usize) ![]f32 {
++    const info = try pack.need(name);
++    if (info.dims().len != 1 or info.dims()[0] != n) return error.UnexpectedTensor;
++    const len = std.math.cast(usize, info.nbytes) orelse return error.UnexpectedTensor;
++    const bytes = try gpa.alloc(u8, len);
++    defer gpa.free(bytes);
++    try pack.read(io, info, .{ .offset = 0, .len = info.nbytes }, bytes);
++    const out = try gpa.alloc(f32, n);
++    switch (info.dtype) {
++        .f32 => @memcpy(std.mem.sliceAsBytes(out), bytes),
++        .bf16 => for (out, 0..) |*v, i| {
++            v.* = named.bf16Widen(std.mem.readInt(u16, bytes[2 * i ..][0..2], .little));
++        },
++        .f16 => for (out, 0..) |*v, i| {
++            v.* = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[2 * i ..][0..2], .little))));
++        },
++        else => return error.UnexpectedTensor,
++    }
++    return out;
++}
++
++fn setItem(set: *const affine_linears.Set, suffix: []const u8) ?*const affine_linears.Item {
++    for (set.items) |*item| {
++        if (std.mem.endsWith(u8, item.name, suffix)) return item;
++    }
++    return null;
++}
++
++fn runAttentionChain(
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    pack: *const Pack,
++    bindings: *const affine_exec.Bindings,
++    wide: *const cuda.qlinear.AffineNKernels,
++    act: *const cuda.act_rows.ActRows,
++    cfg: *const Config,
++) !void {
++    const selected_names = [_][]const u8{ "layers.0.attn.wq_a", "layers.0.attn.wq_b", "layers.0.attn.wkv" };
++    var selected: [selected_names.len]affine_exec.Binding = undefined;
++    for (selected_names, &selected) |name, *dst| {
++        const b = find(bindings, name) orelse return error.SmokeModuleMissing;
++        if (b.mode != .affine8_linear or b.affine_layout == null) return error.SmokeNotAffine;
++        dst.* = b.*;
++    }
++    var set = try affine_linears.loadAll(gpa, io, driver, stream, wide, pack, &selected);
++    defer set.deinit();
++    const wq_a = setItem(&set, "layers.0.attn.wq_a") orelse return error.SmokeModuleMissing;
++    const wq_b = setItem(&set, "layers.0.attn.wq_b") orelse return error.SmokeModuleMissing;
++    const wkv = setItem(&set, "layers.0.attn.wkv") orelse return error.SmokeModuleMissing;
++
++    const hidden: usize = cfg.hidden;
++    const q_lora: usize = cfg.q_lora;
++    const head_dim: usize = cfg.head_dim;
++    const q_width: usize = @as(usize, cfg.heads) * head_dim;
++    const attn_w = try normF32(gpa, io, pack, "language_model.layers.0.attn_norm.weight", hidden);
++    defer gpa.free(attn_w);
++    const q_w = try normF32(gpa, io, pack, "language_model.layers.0.attn.q_norm.weight", q_lora);
++    defer gpa.free(q_w);
++    const kv_w = try normF32(gpa, io, pack, "language_model.layers.0.attn.kv_norm.weight", head_dim);
++    defer gpa.free(kv_w);
++
++    const x1 = try gpa.alloc(u8, hidden * 2);
++    defer gpa.free(x1);
++    for (0..hidden) |i| std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
++    const xd = try cuda.DeviceBuffer.fromHost(driver, x1);
++    defer xd.free();
++    const attn_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(attn_w));
++    defer attn_d.free();
++    const qw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(q_w));
++    defer qw_d.free();
++    const kvw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(kv_w));
++    defer kvw_d.free();
++    var xn = try cuda.DeviceBuffer.alloc(driver, hidden * 2);
++    defer xn.free();
++    var qa = try cuda.DeviceBuffer.alloc(driver, q_lora * 2);
++    defer qa.free();
++    var qn = try cuda.DeviceBuffer.alloc(driver, q_lora * 2);
++    defer qn.free();
++    var q = try cuda.DeviceBuffer.alloc(driver, q_width * 2);
++    defer q.free();
++    var kv = try cuda.DeviceBuffer.alloc(driver, head_dim * 2);
++    defer kv.free();
++    var kvn = try cuda.DeviceBuffer.alloc(driver, head_dim * 2);
++    defer kvn.free();
++
++    var norms = try cuda.norms.Norms.load(driver);
++    defer norms.unload();
++    try norms.rms(stream, xd.ptr, .bf16, attn_d.ptr, xn.ptr, .bf16, 1, hidden, cfg.eps);
++    try affine_launch.linearDev(driver, stream, wide, act, &wq_a.tiles, xn.ptr, 1, qa.ptr);
++    try norms.rms(stream, qa.ptr, .bf16, qw_d.ptr, qn.ptr, .bf16, 1, q_lora, cfg.eps);
++    try affine_launch.linearDev(driver, stream, wide, act, &wq_b.tiles, qn.ptr, 1, q.ptr);
++    try affine_launch.linearDev(driver, stream, wide, act, &wkv.tiles, xn.ptr, 1, kv.ptr);
++    try norms.rms(stream, kv.ptr, .bf16, kvw_d.ptr, kvn.ptr, .bf16, 1, head_dim, cfg.eps);
++    try stream.synchronize();
++
++    const qa_b = try qa.download(driver, gpa);
++    defer gpa.free(qa_b);
++    const q_b = try q.download(driver, gpa);
++    defer gpa.free(q_b);
++    const kv_b = try kv.download(driver, gpa);
++    defer gpa.free(kv_b);
++    const kvn_b = try kvn.download(driver, gpa);
++    defer gpa.free(kvn_b);
++    std.log.info("affine smoke attn layers.0: qa0={d:.6} q0={d:.6} kv0={d:.6} kvn0={d:.6}", .{
++        named.bf16Widen(std.mem.readInt(u16, qa_b[0..2], .little)),
++        named.bf16Widen(std.mem.readInt(u16, q_b[0..2], .little)),
++        named.bf16Widen(std.mem.readInt(u16, kv_b[0..2], .little)),
++        named.bf16Widen(std.mem.readInt(u16, kvn_b[0..2], .little)),
++    });
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 88034d5..909cbc5 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -273,7 +273,7 @@ pub const Model = struct {
+                 defer {
+                     m.weights.close() catch {};
+                 }
+-                try @import("affine_smoke.zig").run(gpa, io, &m.driver, &m.ctx, m.stream, &m.pack, &ap, &bindings, &m.weights);
++                try @import("affine_smoke.zig").run(gpa, io, &m.driver, &m.ctx, m.stream, &m.pack, &ap, &bindings, &m.weights, &m.cfg);
+             }
+             var modules: usize = 0;
+             var native_experts: usize = 0;

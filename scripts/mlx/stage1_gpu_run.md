@@ -75,6 +75,7 @@ Expected in `smoke.log`:
 - one `affine smoke cpu <module>: row0 ...` and one `affine smoke <module>: y[0] ...`
   line for every layer-0 linear and all three expert stacks;
 - `affine smoke dev layers.0.attn.wq_a: y[0] ones=...` matching the host `wq_a` line;
+- `affine smoke attn layers.0: qa0=... q0=... kv0=... kvn0=...` for the attention chain;
 - `smoke values match`;
 - `dispatch counts match`;
 - `AffineForwardNotPorted` after the smoke.
