@@ -1,0 +1,29 @@
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index 7533819..13561bc 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -97,6 +97,24 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 .layout = try spec.?.layout(r.n, r.k),
+             });
+         }
++        // The release keeps the indexer's weights_proj native; this checkpoint quantizes it.
++        if (cfg.isBackbone(@intCast(i)) and cfg.isIndexSource(@intCast(i))) {
++            const canonical = try std.fmt.allocPrint(a, "{s}.attn.indexer.weights_proj", .{prefix});
++            const name = try a.dupe(u8, pack.spellModule(canonical, &spell_buf) orelse canonical);
++            const spec = try formats.resolve(name);
++            if (spec) |s| {
++                if (s.mode != .affine) {
++                    try mixed.append(a, .{ .kind = .linear, .name = name, .spec = s, .n = cfg.index_heads, .k = cfg.hidden });
++                } else {
++                    try modules.append(a, .{
++                        .kind = .linear,
++                        .name = name,
++                        .spec = s,
++                        .layout = try s.layout(cfg.index_heads, cfg.hidden),
++                    });
++                }
++            }
++        }
+         for ([_]names.ExpertProj{ .w1, .w2, .w3 }) |p| {
+             const canonical = try std.fmt.allocPrint(a, "{s}.ffn.experts.{t}", .{ prefix, p });
+             const name = try a.dupe(u8, pack.spellModule(canonical, &spell_buf) orelse canonical);

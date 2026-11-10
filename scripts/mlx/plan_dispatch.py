@@ -54,7 +54,10 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "mxfp8":
             if expert:
                 errors.append(f"{key}: MXFP8 on an expert")
-            counts["mxfp8"] += 1
+            elif key.endswith(".main_proj"):
+                counts["dspark_main_proj"] += 1
+            else:
+                counts["mxfp8"] += 1
         elif mode == "mxfp4":
             if not expert:
                 errors.append(f"{key}: MXFP4 on a linear")
@@ -69,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
                     counts["affine_n_expert"] += 1
                 else:
                     errors.append(f"{key}: unsupported expert bits {bits}")
+            elif ".engram." in key:
+                counts["affine_engram"] += 1
             else:
                 if bits in (2, 3, 5, 6, 8):
                     counts["affine8_linear"] += 1
@@ -84,8 +89,10 @@ def main(argv: list[str] | None = None) -> int:
             "affine8_linear": counts["affine8_linear"],
             "affine_n_expert": counts["affine_n_expert"],
             "affine_native_expert": counts["affine_native_expert"],
+            "affine_engram": counts["affine_engram"],
             "mxfp8": counts["mxfp8"],
             "mxfp4": counts["mxfp4"],
+            "dspark_main_proj": counts["dspark_main_proj"],
         },
         "errors": errors,
     }

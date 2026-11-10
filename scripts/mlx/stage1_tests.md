@@ -23,8 +23,9 @@ Runs:
 
 - `inspect_checkpoint.py`: shard/tensor/expert/Engram structure.
 - `translate_config.py --check`: every quantized module has its tensors.
-- `plan_dispatch.py`: expected dispatch counts (309 affine8 linears, 120 expert
-  fallbacks, 22 MXFP8, 9 MXFP4).
+- `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
+  fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`
+  MXFP8 are reported separately because they are not affine-plan modules.
 - `reference_layer.py`: golden dots for one 8-bit, 6-bit, and 2-bit module, plus one
   MXFP8 and one MXFP4 module.
 - `test_engram.py`: golden dots and row counts for the two Engram tables.
@@ -39,7 +40,7 @@ CONTAINER=1 SMOKE=1 MODEL_DIR=/models/mlx scripts/mlx/test_stage1.sh
 Adds a `tensorfold-dsv41` boot with `TF_EXPERIMENTAL=deepseek`, `TF_TP_WORLD=1`, and
 `TF_DSV41_DRAFTS=0`, captures the log, and compares its `dispatch:` line with
 `plan_dispatch.py`. The guard returns before any weight upload, so it plans all layers and
-must report the full counts (309/120/22/9). The `SMOKE=1` run then loads only layer 0
+must report the affine-plan counts (307/120/21/9). The `SMOKE=1` run then loads only layer 0
 (`TF_DSV41_LAYERS=0-0`).
 
 The engine needs `quantization_config` in `config.json`. If the checkpoint only has the

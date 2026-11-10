@@ -12,7 +12,9 @@ python3 scripts/mlx/inspect_checkpoint.py "$MODEL_DIR" --headers --json out/insp
 Expected on the published checkpoint:
 
 - 21 shards, 2,286 tensors, 211.4 GiB.
-- 460 quantized modules: 429 affine (2/6/8-bit), 22 MXFP8, 9 MXFP4.
+- 460 quantized modules: 429 affine (2/6/8-bit), 22 MXFP8, 9 MXFP4. The affine plan
+  owns 307 linears, 120 2-bit expert stacks, 21 MXFP8 and 9 MXFP4; two affine Engram
+  tables and the DSpark `main_proj` MXFP8 are handled separately.
 - 378 stacked expert tensors (one tensor per projection, not per expert).
 - 16 Engram tensors.
 

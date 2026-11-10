@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1p boot fixes committed; image rebuild with 0019/0020 pending |
+| Overall status | Stage 1p guard reaches AffineForwardNotPorted; image rebuild with 0021 pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -81,10 +81,18 @@ next step.
   spells them `language_model.layers.0...`; the plan's shared-expert probe and the loader's
   `pack.need` would miss. `0020-dsv41-pack-spelling.patch` adds `Pack.spellModule` and makes
   the plan carry the pack's spelling.
-- **Verification:** `0001`-`0020` apply cleanly; ast-check passes. The overlay translator now
+- **After 0020:** the guard reached `AffineForwardNotPorted` and logged 419 modules,
+  30 mixed, `dispatch: 299 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4`.
+  The 10-linear gap was 8 quantized `attn.indexer.weights_proj` modules the plan did not
+  enumerate, plus 2 affine `engram.wkv` tables it intentionally leaves to the Engram path.
+  The 1-MXFP8 gap is DSpark's `main_proj`, which is handled by the DSpark plan, not the
+  affine dispatch. `0021-dsv41-indexer-weights-proj.patch` plans `weights_proj`;
+  `plan_dispatch.py` now reports `affine_engram` and `dspark_main_proj` separately, so the
+  affine-plan expectation is **307/120/21/9**.
+- **Verification:** `0001`-`0021` apply cleanly; ast-check passes. The overlay translator now
   emits no null `group_size`; a host plan simulation reports 496 enumerated modules, 30
   mixed, 0 errors.
-- **Next:** rebuild `tf-dsv41-mlx:dev` with 0019/0020, rerun the guard, then the smoke.
+- **Next:** rebuild `tf-dsv41-mlx:dev` with 0021, rerun the guard, then the smoke.
 
 ### 2026-11-10 - Spark image verified; harness dispatch/overlay fixes
 
