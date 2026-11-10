@@ -14,8 +14,8 @@ Implementation progress, decisions, and the approaches actually used are recorde
 - **Latest CUDA/TensorFold in the image.** The image pins a CUDA base by digest and a
   TensorFold ref by commit. "Latest" is allowed for experiments, but every milestone records
   the exact digest/SHA; `main` is not a reproducible pin.
-- **One GB10, 128 GB.** Target short context first (32K-64K). 1M context is out of scope for
-  the first working milestone.
+- **One GB10, 128 GB.** Start at 32K, then target 600K context with YaRN. 1M context is
+  out of scope for the first working milestone.
 - **Exact checkpoint.** The MLX weights are the source of truth; no conversion to EXL3 unless
   the port is abandoned.
 
@@ -99,32 +99,33 @@ Gate: one full layer runs a forward pass on GPU and matches a dequantized refere
 documented tolerance. Compare against a PyTorch/MLX dequant of the same layer, not against the
 EXL3 model.
 
-### Phase 2 - Full model, short context (1-2 weeks)
+### Phase 2 - Full model, 32K to 600K context (1-2 weeks)
 
 Tasks:
 
 - Load all 40 layers plus DSpark and the vision tower on one rank.
 - Implement or adapt 2-bit affine expert gather kernels; verify decode and prefill rows.
-- Add memory admission for ~98 GB weights plus KV; enforce a conservative default context.
+- Add memory admission for ~83.4 GB affine plus dense/native weights and KV; enforce a
+  conservative default context and validate 600K with YaRN.
 - Validate greedy generation against omlx on a fixed prompt for 64-256 tokens (accept small
   divergence only where documented).
 
 Gate: `tensorfold-dsv41 serve` answers a text prompt on one Spark; peak device/host memory
-stays under the safety floor; 32K context is stable; no host libraries are loaded.
+stays under the safety floor; 32K context is stable; 600K is measured; no host libraries are
+loaded.
 
 ### Phase 3 - Engram (1-2 weeks)
 
-Choose one:
+Chosen: the native 4-bit reader, streamed from SSD.
 
-- **Convert (implemented):** `scripts/mlx/convert_engram.py` reads the target's 4-bit/group-32
-  affine tables and writes the engine's FP8 row shards (`F8_E4M3 [rows,256]` +
-  `F8_E8M0 [rows,8]`, 264 bytes/row). Output is ~203 GB and the E4M3 requantization is
-  slightly lossy; `--limit-rows` and `--verify` validate it.
-- **Native reader (alternative):** add a 4-bit affine Engram reader to keep the ~114 GiB
-  tables and avoid requantization; this needs engine work.
+- **Native reader:** read the target's U32 4-bit/group-32 rows plus BF16 scales/biases
+  (160 bytes/row, ~114 GiB) and dequantize on demand. This avoids the E4M3 requantization
+  and is smaller than the FP8 form.
+- **Fallback/tool:** `scripts/mlx/convert_engram.py` still writes the engine's FP8 rows
+  (`264 B/row`, ~188.83 GiB) for comparison or if the native reader is delayed.
 
-Gate: Engram lookups match the reference for sampled tokens; memory stays within budget;
-SSD streaming works under `--rm` with a read-only mount.
+Gate: Engram lookups match the reference for sampled tokens; the native tables stream within
+budget; SSD streaming works under `--rm` with a read-only mount.
 
 ### Phase 4 - Server, tools, vision (1 week)
 
@@ -167,9 +168,9 @@ Agents/Implementation.md       # progress and actual approaches
 1. **Base:** upstream `main` vs pinned fork. Decide after the Phase 0 build/admission spike.
 2. **Expert layout:** load-time conversion to per-expert vs native stacked gather. Decide by
    measuring load time and decode speed on one layer.
-3. **Engram:** convert vs reader. Start with convert; add reader only if quality or disk
-   layout demands it.
-4. **Context target:** 32K for milestone 1; revisit 128K/1M only after memory measurements.
+3. **Engram:** native 4-bit reader chosen (smaller, no requantization); the FP8 converter
+   remains a fallback.
+4. **Context target:** 32K first, then 600K with YaRN; 1M is out.
 
 ## Fallback
 
