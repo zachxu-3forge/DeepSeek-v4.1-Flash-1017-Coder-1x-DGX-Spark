@@ -1,0 +1,77 @@
+diff --git a/zig/src/families/deepseek_v41/affine_launch.zig b/zig/src/families/deepseek_v41/affine_launch.zig
+index e940617..128486d 100644
+--- a/zig/src/families/deepseek_v41/affine_launch.zig
++++ b/zig/src/families/deepseek_v41/affine_launch.zig
+@@ -9,6 +9,7 @@ const cuda = @import("cuda");
+ const pack = @import("affine_pack.zig");
+ const bind = @import("affine_bind.zig");
+ const affine_cuda = @import("affine_cuda.zig");
++const named = @import("named.zig");
+ 
+ pub const Output = struct {
+     buffer: cuda.DeviceBuffer,
+@@ -35,6 +36,7 @@ fn check(p: *const pack.Packed, x: []const u8, rows: usize) !usize {
+ 
+ /// Decode rows: `x` is bf16 `[rows, k]`; the result is bf16 `[rows, n]`.
+ pub fn linear(
++    gpa: std.mem.Allocator,
+     driver: *const cuda.Driver,
+     stream: cuda.Stream,
+     kernels: *const cuda.qlinear.AffineNKernels,
+@@ -45,9 +47,24 @@ pub fn linear(
+     _ = try check(p, x, rows);
+     var xb = try cuda.DeviceBuffer.fromHost(driver, x);
+     defer xb.free();
+-    const sums_bytes = try std.math.mul(usize, rows, (p.an.k / 64) * 4);
++    const k: usize = p.an.k;
++    const groups: usize = k / 64;
++    const sums_bytes = try std.math.mul(usize, rows, groups * 4);
+     var sums = try cuda.DeviceBuffer.alloc(driver, sums_bytes);
+     defer sums.free();
++    const host_sums = try gpa.alloc(f32, rows * groups);
++    defer gpa.free(host_sums);
++    for (0..rows) |r| {
++        for (0..groups) |g| {
++            var sum: f32 = 0;
++            for (0..64) |j| {
++                const at = (r * k + g * 64 + j) * 2;
++                sum += named.bf16Widen(std.mem.readInt(u16, x[at..][0..2], .little));
++            }
++            host_sums[r * groups + g] = sum;
++        }
++    }
++    try cuda.DeviceBuffer.upload(.{ .d = driver, .ptr = sums.ptr, .len = sums_bytes }, 0, std.mem.sliceAsBytes(host_sums));
+     var out = try cuda.DeviceBuffer.alloc(driver, rows * p.an.n * 2);
+     errdefer out.free();
+     try kernels.decode(stream, xb.ptr, sums.ptr, p.an, out.ptr, rows);
+@@ -76,6 +93,7 @@ pub fn prompt(
+ 
+ /// Pack one expert from a stacked projection, then decode it.
+ pub fn expert(
++    gpa: std.mem.Allocator,
+     driver: *const cuda.Driver,
+     stream: cuda.Stream,
+     kernels: *const cuda.qlinear.AffineNKernels,
+@@ -86,5 +104,5 @@ pub fn expert(
+ ) !Output {
+     var p = try pack.packExpert(driver, stream, kernels, d, view);
+     defer p.deinit();
+-    return linear(driver, stream, kernels, &p, x, rows);
++    return linear(gpa, driver, stream, kernels, &p, x, rows);
+ }
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index f479746..9101d14 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -82,9 +82,9 @@ pub fn run(
+         std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
+     }
+ 
+-    var y1 = try affine_launch.linear(driver, stream, &wide, &tiles, x1, 1);
++    var y1 = try affine_launch.linear(gpa, driver, stream, &wide, &tiles, x1, 1);
+     defer y1.deinit();
+-    var y2 = try affine_launch.linear(driver, stream, &wide, &tiles, x2, 1);
++    var y2 = try affine_launch.linear(gpa, driver, stream, &wide, &tiles, x2, 1);
+     defer y2.deinit();
+     const b1 = try y1.download(driver, gpa);
+     defer gpa.free(b1);

@@ -26,10 +26,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0019-dsv41-affine-smoke-env.patch` | Register `TF_DSV41_AFFINE_SMOKE` in the strict environment and profile tables |
 | `0020-dsv41-pack-spelling.patch` | Resolve canonical plan names to the pack's `language_model.` spelling |
 | `0021-dsv41-indexer-weights-proj.patch` | Plan the checkpoint's quantized `attn.indexer.weights_proj` as an affine linear |
-| `0022-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0023-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0022-dsv41-affine-group-sums.patch` | Fill the affine decode's per-row 64-value group sums before launch |
+| `0023-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0024-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
 
-Implemented: `0001`-`0021`. Planned: `0022`-`0023`.
+Implemented: `0001`-`0022`. Planned: `0023`-`0024`.
 
 Rules:
 

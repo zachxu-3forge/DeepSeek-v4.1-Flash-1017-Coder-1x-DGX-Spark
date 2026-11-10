@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Stage 1p guard reaches AffineForwardNotPorted; image rebuild with 0021 pending |
+| Overall status | Guard passes 307/120/21/9; rebuilding with affine group sums for smoke |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -92,7 +92,14 @@ next step.
 - **Verification:** `0001`-`0021` apply cleanly; ast-check passes. The overlay translator now
   emits no null `group_size`; a host plan simulation reports 496 enumerated modules, 30
   mixed, 0 errors.
-- **Next:** rebuild `tf-dsv41-mlx:dev` with 0021, rerun the guard, then the smoke.
+- **Guard:** after rebuilding with `0021`, the guard passed with
+  `dispatch: 307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and
+  `AffineForwardNotPorted`, matching `plan_dispatch.py`.
+- **Smoke:** the one-layer fixture (48 tensors, 4.61 GiB) ran and logged the smoke line, but
+  both `y[0]` values were `nan`. `affine_launch.linear` allocated the kernel's `xs` buffer
+  (per-row 64-value group sums) and never filled it. `0022-dsv41-affine-group-sums.patch`
+  computes those sums from the BF16 input rows and uploads them before `decode`.
+- **Next:** rebuild with `0022`, rerun the smoke, compare `y[0]` with `reference_layer.py`.
 
 ### 2026-11-10 - Spark image verified; harness dispatch/overlay fixes
 
