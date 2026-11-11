@@ -10,10 +10,10 @@ index 909cbc5..46ad970 100644
  }
 diff --git a/zig/src/families/deepseek_v41/mxfp4_requant.zig b/zig/src/families/deepseek_v41/mxfp4_requant.zig
 new file mode 100644
-index 0000000..33565cc
+index 0000000..1fe5a6c
 --- /dev/null
 +++ b/zig/src/families/deepseek_v41/mxfp4_requant.zig
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,107 @@
 +//! MXFP4 -> MLX affine-4 (group 64) requantization.
 +//!
 +//! The target's 9 DSpark expert tensors are MXFP4: 4-bit codes with one E8M0 scale every
@@ -49,7 +49,7 @@ index 0000000..33565cc
 +        var hi: f32 = -std.math.inf(f32);
 +        for (0..64) |j| {
 +            const code: u32 = @intCast(try ref.codeAt(words, (g * 64 + j) * 4) & 0xF);
-+            const v = @as(f32, @floatFromInt(code)) * mixed.e8m0(scales[(g * 64 + j) / 32]);
++            const v = mixed.e2m1(code) * mixed.e8m0(scales[(g * 64 + j) / 32]);
 +            if (!std.math.isFinite(v)) return error.BadAffine;
 +            vals[j] = v;
 +            lo = @min(lo, v);
@@ -74,7 +74,7 @@ index 0000000..33565cc
 +    words[bit / 32] |= code << @intCast(bit % 32);
 +}
 +
-+test "MXFP4 codes 0..15 with one scale requantize exactly" {
++test "MXFP4 E2M1 values requantize onto the affine-4 grid" {
 +    var words: [8]u32 = @splat(0);
 +    const scales = [_]u8{ 127, 127 }; // 2^0
 +    for (0..64) |i| setCode(&words, i, @intCast(i % 16));
@@ -82,11 +82,13 @@ index 0000000..33565cc
 +    var out_scales: [1]u16 = undefined;
 +    var out_biases: [1]u16 = undefined;
 +    try requantRow(&words, &scales, &out_words, &out_scales, &out_biases, 64);
-+    try std.testing.expectEqual(@as(u16, 0x3f80), out_scales[0]); // 1.0
-+    try std.testing.expectEqual(@as(u16, 0), out_biases[0]);
 +    var values: [64]f32 = undefined;
 +    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
-+    for (values, 0..) |v, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i % 16)), v);
++    for (values, 0..) |v, i| {
++        const want = mixed.e2m1(@intCast(i % 16));
++        try std.testing.expectApproxEqAbs(want, v, 0.5);
++    }
++    try std.testing.expect(values[9] < 0); // nibble 1001 is -0.5, not 9
 +}
 +
 +test "a constant MXFP4 row becomes affine-4 with zero scale" {
@@ -98,10 +100,10 @@ index 0000000..33565cc
 +    var out_biases: [1]u16 = undefined;
 +    try requantRow(&words, &scales, &out_words, &out_scales, &out_biases, 64);
 +    try std.testing.expectEqual(@as(u16, 0), out_scales[0]);
-+    try std.testing.expectEqual(@as(u16, 0x40a0), out_biases[0]); // 5.0
++    try std.testing.expectEqual(@as(u16, 0x4040), out_biases[0]); // 3.0
 +    var values: [64]f32 = undefined;
 +    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
-+    for (values) |v| try std.testing.expectEqual(@as(f32, 5.0), v);
++    for (values) |v| try std.testing.expectEqual(@as(f32, 3.0), v);
 +}
 +
 +test "the E8M0 scale is applied before requantizing" {
@@ -115,7 +117,7 @@ index 0000000..33565cc
 +    var values: [64]f32 = undefined;
 +    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
 +    for (values, 0..) |v, i| {
-+        const want = @as(f32, @floatFromInt(i % 16)) * 0.5;
-+        try std.testing.expectApproxEqAbs(want, v, 0.5 / 15.0 + 0.001);
++        const want = mixed.e2m1(@intCast(i % 16)) * 0.5;
++        try std.testing.expectApproxEqAbs(want, v, 0.25);
 +    }
 +}

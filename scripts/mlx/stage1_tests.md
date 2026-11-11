@@ -25,6 +25,7 @@ Runs:
 - `test_make_one_layer.py`: the one-layer fixture's tensor bytes match the source shard.
 - `test_translate_config.py`: non-affine `group_size: null` is omitted.
 - `test_plan_dispatch.py`: Engram and `main_proj` are counted in their own buckets.
+- `test_reference_mixed.py`: MXFP8 E4M3 / MXFP4 E2M1 code points and the mixed decode path.
 - `make_rope_tables.py --self-test`: the 600K YaRN frequencies/scale match `core/rope_yarn.zig`.
 - `make_rope_tables.py --check`: when `$ASSETS_HOST/rope.bin` exists, its header, size,
   sampled window/YaRN values, and `mscale` are checked.

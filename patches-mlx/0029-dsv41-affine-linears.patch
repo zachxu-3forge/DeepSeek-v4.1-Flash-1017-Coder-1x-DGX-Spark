@@ -20,10 +20,10 @@ index 1d19657..55190e1 100644
      .{ .id = .TF_DSV41_BIAS_VL, .families = &.{"deepseek_v41"}, .class = .experimental, .syntax = .present, .effect = "Vision-bias calls in the AOT plan", .evidence = "#2370" },
 diff --git a/zig/src/families/deepseek_v41/affine_linears.zig b/zig/src/families/deepseek_v41/affine_linears.zig
 new file mode 100644
-index 0000000..960e0da
+index 0000000..ab1a402
 --- /dev/null
 +++ b/zig/src/families/deepseek_v41/affine_linears.zig
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +//! Every affine linear packed once into `AffineN` tiles, addressable by module name.
 +//!
 +//! The budget says all linears are ~4.3 GiB packed, so keeping them resident is cheap.
@@ -113,7 +113,8 @@ index 0000000..960e0da
 +        defer weights.close() catch {};
 +        try weights.upload(driver, &builder);
 +        const dev = try affine_bind.bind(&weights, &b, 1);
-+        const tiles = try affine_pack.packLinear(driver, stream, kernels, &dev, b.n, b.k, b.spec.bits);
++        var tiles = try affine_pack.packLinear(driver, stream, kernels, &dev, b.n, b.k, b.spec.bits);
++        errdefer tiles.deinit();
 +        const name = try a.dupe(u8, b.name);
 +        try map.put(gpa, name, made);
 +        items[made] = .{ .name = name, .tiles = tiles, .n = b.n, .k = b.k, .bits = b.spec.bits };

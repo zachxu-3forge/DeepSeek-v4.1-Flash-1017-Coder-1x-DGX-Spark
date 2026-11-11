@@ -91,6 +91,25 @@ def e8m0(byte: int) -> float:
     return 2.0 ** (byte - 127)
 
 
+def e2m1(code: int) -> float:
+    """MXFP4 E2M1: sign bit 3; magnitude {0, .5, 1, 1.5, 2, 3, 4, 6}."""
+    mag = code & 0x7
+    value = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)[mag]
+    return -value if code & 0x8 else value
+
+
+def e4m3(bits: int) -> float:
+    """MXFP8 E4M3FN: E4M3 with 448 max; 0x7F / 0xFF are NaN."""
+    sign = -1.0 if bits & 0x80 else 1.0
+    exp = (bits >> 3) & 0xF
+    mant = bits & 0x7
+    if exp == 0xF and mant == 0x7:
+        return float("nan")
+    if exp == 0:
+        return sign * (mant / 8.0) * 2.0 ** -6
+    return sign * (1.0 + mant / 8.0) * 2.0 ** (exp - 7)
+
+
 def decode(words: bytes, scales: bytes, biases: bytes | None, bits: int, k: int, group: int) -> list[float]:
     groups = k // group
     out = []
@@ -98,12 +117,18 @@ def decode(words: bytes, scales: bytes, biases: bytes | None, bits: int, k: int,
         q = code_at(words, i * bits, bits)
         g = i // group
         if biases is None:
-            s = e8m0(scales[g])
-            b = 0.0
+            # MXFP8/MXFP4 codes are small floats, not unsigned integers.
+            if bits == 4:
+                value = e2m1(q)
+            elif bits == 8:
+                value = e4m3(q)
+            else:
+                raise ValueError(f"mixed decode: unsupported {bits}-bit code")
+            out.append(value * e8m0(scales[g]))
         else:
             s = bf16(scales, g)
             b = bf16(biases, g)
-        out.append(q * s + b)
+            out.append(q * s + b)
     return out
 
 

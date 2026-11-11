@@ -297,7 +297,7 @@ index d165c41..da42e3e 100644
              if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
                  m.weights = .{ .gpa = gpa, .digest = false };
 diff --git a/zig/src/families/deepseek_v41/forward_glue.zig b/zig/src/families/deepseek_v41/forward_glue.zig
-index 5cfda55..14f2ab9 100644
+index 5cfda55..05bc9cd 100644
 --- a/zig/src/families/deepseek_v41/forward_glue.zig
 +++ b/zig/src/families/deepseek_v41/forward_glue.zig
 @@ -8,6 +8,7 @@ const run = @import("run.zig");
@@ -308,7 +308,7 @@ index 5cfda55..14f2ab9 100644
  const Error = fwd.Error;
  const Forward = fwd.Forward;
  
-@@ -174,5 +175,124 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
+@@ -174,5 +175,136 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
          std.crypto.hash.sha2.Sha256.hash(host, &sha, .{});
          return map.put(f.gpa, @intCast(c.args[1].arg.i), std.fmt.bytesToHex(sha, .lower));
      }
@@ -330,6 +330,7 @@ index 5cfda55..14f2ab9 100644
 +    const limit: f32 = @floatCast(c.args[7].arg.f);
 +    const n: usize = @intCast(x.shape[0]);
 +    const D: usize = @intCast(x.shape[1]);
++    if (x.dt != .bf16 or (out.dt != .f32 and out.dt != .bf16)) return error.BadGlue;
 +    if (pick.shape[0] != n or pick.shape[1] != slots or wts.shape[0] != n or wts.shape[1] != slots or out.shape[0] != n or out.shape[1] != D) return error.BadGlue;
 +
 +    try r.stream.synchronize();
@@ -361,6 +362,14 @@ index 5cfda55..14f2ab9 100644
 +    const w2n = try std.fmt.bufPrint(&e3, "layers.{d}.ffn.experts.w2", .{L});
 +    const has_shared = af.linears.get(sh1) != null;
 +    const I: usize = if (has_shared) af.linears.get(sh1).?.n else if (af.expert(w1n)) |m| m.layout.n else 0;
++    if (has_shared) {
++        const w2 = af.linears.get(sh2) orelse return error.UnknownAffine;
++        if (af.linears.get(sh3) == null or w2.k != I or w2.n != D) return error.BadGlue;
++    }
++    const x1 = af.expert(w1n) orelse return error.UnknownAffine;
++    const x3 = af.expert(w3n) orelse return error.UnknownAffine;
++    const x2 = af.expert(w2n) orelse return error.UnknownAffine;
++    if (x1.layout.n != I or x1.layout.k != D or x3.layout.n != I or x3.layout.k != D or x2.layout.n != D or x2.layout.k != I) return error.BadGlue;
 +
 +    for (0..n) |i| {
 +        const row = xb[i * D * 2 ..][0 .. D * 2];
@@ -411,25 +420,28 @@ index 5cfda55..14f2ab9 100644
 +    for (0..gate.len / 2) |i| {
 +        const g = named.bf16Widen(std.mem.readInt(u16, gate[2 * i ..][0..2], .little));
 +        const u = named.bf16Widen(std.mem.readInt(u16, up[2 * i ..][0..2], .little));
-+        const c = std.math.clamp(g, -limit, limit);
-+        const v = (c / (1 + @exp(-c))) * u;
++        // pointwise.cu: silu(min(g, limit)) * clamp(u, -limit, limit)
++        const a = @min(g, limit);
++        const v = (a / (1 + @exp(-a))) * std.math.clamp(u, -limit, limit);
 +        std.mem.writeInt(u16, out[2 * i ..][0..2], named.bf16Round(v), .little);
 +    }
 +}
 +
-+test "the affine MoE host activation clamps before silu and rounds once" {
-+    var gate: [4]u8 = undefined;
-+    var up: [4]u8 = undefined;
-+    var out: [4]u8 = undefined;
-+    std.mem.writeInt(u16, gate[0..2], named.bf16Round(20.0), .little);
-+    std.mem.writeInt(u16, gate[2..4], named.bf16Round(1.0), .little);
-+    std.mem.writeInt(u16, up[0..2], named.bf16Round(2.0), .little);
-+    std.mem.writeInt(u16, up[2..4], named.bf16Round(3.0), .little);
++test "the affine MoE host activation matches pointwise.cu's clamp" {
++    var gate: [8]u8 = undefined;
++    var up: [8]u8 = undefined;
++    var out: [8]u8 = undefined;
++    const gs = [_]f32{ 20.0, 1.0, -20.0, 0.0 };
++    const us = [_]f32{ 2.0, 20.0, 2.0, -20.0 };
++    for (gs, us, 0..) |g, u, i| {
++        std.mem.writeInt(u16, gate[2 * i ..][0..2], named.bf16Round(g), .little);
++        std.mem.writeInt(u16, up[2 * i ..][0..2], named.bf16Round(u), .little);
++    }
 +    try swigluRow(&gate, &up, &out, 10.0);
-+    const a = named.bf16Widen(std.mem.readInt(u16, out[0..2], .little));
-+    const b = named.bf16Widen(std.mem.readInt(u16, out[2..4], .little));
-+    const want_a = (10.0 / (1 + @exp(-10.0))) * 2.0;
-+    const want_b = (1.0 / (1 + @exp(-1.0))) * 3.0;
-+    try std.testing.expectApproxEqAbs(want_a, a, 0.02);
-+    try std.testing.expectApproxEqAbs(want_b, b, 0.02);
++    for (gs, us, 0..) |g, u, i| {
++        const a = @min(g, 10.0);
++        const want = (a / (1 + @exp(-a))) * std.math.clamp(u, -10.0, 10.0);
++        const got = named.bf16Widen(std.mem.readInt(u16, out[2 * i ..][0..2], .little));
++        try std.testing.expectApproxEqAbs(want, got, 0.02);
++    }
 +}

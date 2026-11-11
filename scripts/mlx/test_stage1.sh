@@ -73,6 +73,7 @@ step inspect_checkpoint "$PY" "$ROOT/scripts/mlx/inspect_checkpoint.py" "$MODEL_
 step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
 step test_translate_config "$PY" "$ROOT/scripts/mlx/test_translate_config.py"
 step test_plan_dispatch "$PY" "$ROOT/scripts/mlx/test_plan_dispatch.py"
+step test_reference_mixed "$PY" "$ROOT/scripts/mlx/test_reference_mixed.py"
 step test_rope_tables "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --self-test
 if [[ -n "${ASSETS_HOST:-}" && -f "$ASSETS_HOST/rope.bin" ]]; then
   step check_rope_bin "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --check "$ASSETS_HOST/rope.bin"

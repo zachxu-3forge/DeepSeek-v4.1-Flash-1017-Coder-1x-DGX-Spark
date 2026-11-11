@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Affine dense/expert loaders and host-loop MoE wired; affine boot path next |
+| Overall status | Review fixes applied; affine boot path next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -70,6 +70,29 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-11 - Review fixes: MXFP decode, SwiGLU clamp, affine leak
+
+- **Phase:** 1/2 (patch review follow-up; no GPU).
+- **Fixed:** MXFP8 and MXFP4 codes are small floats, not unsigned integers. `mixed.zig`
+  now has `e2m1` (`1001 -> -0.5`) and `e4m3` (E4M3FN, 448 max); `dequantizeRow`/`dotRow`
+  use them. `mxfp4_requant.zig` uses `mixed.e2m1` before requantizing.
+  `reference_layer.py.decode` uses the same E2M1/E4M3 values when `biases is None`.
+- **Tests:** `mixed.zig` tests now expect E4M3 `0xC8 -> -4.0` and E2M1 `9 -> -0.5`;
+  `mxfp4_requant` checks bounded affine-4 error and negative values. Added
+  `scripts/mlx/test_reference_mixed.py`, wired into `test_stage1.sh`; the earlier
+  "MXFP4 tests pass" note was based on the integer decode and is superseded.
+- **Fixed:** the 0034 host SwiGLU matches `pointwise.cu`: `silu(min(g, limit)) *
+  clamp(u, -limit, limit)`. The previous code clamped `g` both sides and never `u`.
+  The test now covers `u > limit`, `u < -limit`, and `g < -limit`.
+- **Fixed:** `affine_linears.loadAll` holds an `errdefer tiles.deinit()` from
+  `packLinear` through `dupe`/`put`, closing the GPU leak on those failures.
+- **Fixed:** `moeHost` requires bf16 `x`, a f32/bf16 output, and checks the shared and
+  routed expert layouts (`n`/`k`) against the hidden and intermediate sizes before
+  launching.
+- **Verification:** all `0001`-`0035` patches apply cleanly; standalone `mixed` 6/6,
+  `mxfp4_requant` 9/9; Linux `test-dsv41-forward` 200 pass, 1 skip, 1 pre-existing
+  mtime-precision failure; `compile-dsv41-device-host` and `compile-dsv41-server` pass.
 
 ### 2026-11-11 - Host-loop experts, affine emitter coverage, 600K RoPE
 
