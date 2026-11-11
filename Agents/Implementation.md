@@ -840,20 +840,20 @@ Record the approach that was actually implemented, even if it differs from `Agen
   SSD, no E4M3 requantization); the FP8 264 B format remains readable as a fallback. Native
   packer and synthetic shard reads pass; real-checkpoint `--verify`/`--shard-dir` checks are
   pending. `engram.json` and RoPE assets are still required.
-- 600K: bf16 KV is 13.05 GiB; total 125.05 GiB with a 10 GiB reserve, leaving 2.95 GiB. Generate `rope.bin` for 600K plus a prefill segment and measure with a 4-8 GiB reserve before fixing the default. dsv41 CUDA has no `kv8`; FP8 KV is deferred until measurement.
+- 600K: bf16 KV is 13.05 GiB; total 125.05 GiB with a 10 GiB reserve, leaving 2.95 GiB. The 600K `rope.bin` is generated and checked locally (602,048 rows, 308,248,592 bytes); measure 600K with a 4-8 GiB reserve before fixing the default. dsv41 CUDA has no `kv8`; FP8 KV is deferred until measurement.
 - Check `TF_DSV41_POOL_TOKENS`/`kv_pool`: if attention caches are not already pinned, adopt the pinned-pool admission policy (not MiaAI's PyTorch code) so KV is not taken by other workloads.
 - Phase 0 harness and image build are done; the projection guard and one-projection smoke pass on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture. It builds and admits.
-- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan. MXFP4 will be requantized to affine-4/group-64 for the native `Affine4Experts`.
-- Runtime assets: `TF_DSV41_ASSETS` expects the 600K `rope.bin` and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load. The RoPE table must cover 600K positions.
+- The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan. MXFP4 will be requantized to affine-4/group-64 for the native `Affine4Experts`. Affine mode refuses DSpark and non-own prefill until those emitters are wired.
+- Runtime assets: `TF_DSV41_ASSETS` expects the 600K `rope.bin` and `engram.json`; the target repo does not ship them. The local `rope.bin` is ready; `engram.json` and real native shard checks remain.
 - Docker is not installed on the local Windows host; the build runs on the Spark.
 - The base-image digest is `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`.
 - The `dsv41-serve` build and the upstream dsv41 family are verified by the Spark guard and smoke.
 
 ## Next actions
 
-1. Generate and verify the 600K `rope.bin` (600K + prefill segment); measure 600K with bf16 KV and a 4-8 GiB reserve. Check whether `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention.
-2. Integrate affine projections into the dsv41 emitter; use the host-loop expert fallback for the one-layer gate; add the layer-0 attention/MoE forward and a full-layer reference.
-3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`.
-4. Add the native 4-bit Engram reader and stream it from SSD.
+1. Wire the affine one-layer boot path (dense plan + affine runtime + buffers/KV) and run the layer-0 attention/MoE forward against a dequantized reference.
+2. Measure 600K with bf16 KV and a 4-8 GiB reserve; check whether `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention.
+3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter.
+4. Run the real `engram.json`/native shard checks on the Spark.
 5. Then full model, server/vision, and qualification.

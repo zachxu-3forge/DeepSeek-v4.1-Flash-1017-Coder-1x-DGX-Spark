@@ -142,14 +142,15 @@ but this must be verified before a full-model load. The CUDA dsv41 path reads
 
 At 600K, the conservative bf16 KV is 13.05 GiB. With 98 GiB weights, 4 GiB overhead, and a
 10 GiB reserve, the total is 125.05 GiB, leaving 2.95 GiB. This fits on paper but is tight.
-A `rope.bin` covering 600K plus a prefill segment must be generated and verified; the model's
-YaRN factor is 16 from 65,536, so no runtime factor change is needed. Measure with a 4-8 GiB
-reserve before fixing the default. 1M is 134.81 GiB and does not fit.
+The 600K `rope.bin` has been generated and checked locally: 602,048 rows, 308,248,592 bytes,
+window + YaRN tables, `mscale 1.2772589`. The model's YaRN factor is 16 from 65,536, so no
+runtime factor change is needed. Measure with a 4-8 GiB reserve before fixing the default.
+1M is 134.81 GiB and does not fit.
 
-`scripts/mlx/make_rope_tables.py` writes the two-table asset (default 602,048 rows) and
-`--self-test` matches `core/rope_yarn.zig`'s known YaRN vector. It applies
-`mscale = 0.1 ln(factor) + 1` to the compressed table; confirm that against the target's MLX
-reference before serving.
+`scripts/mlx/make_rope_tables.py` writes the two-table asset (default 602,048 rows),
+`--self-test` matches `core/rope_yarn.zig`'s known YaRN vector, and `--check FILE` validates
+an existing asset's header, size, sampled values, and scale. The compressed table applies
+`mscale = 0.1 ln(factor) + 1`; confirm that against the target's MLX reference before serving.
 
 A pinned KV pool would keep this memory from being taken by another workload. Check whether
 `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention caches; if not, adopt the admission
