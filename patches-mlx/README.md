@@ -36,10 +36,13 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0029-dsv41-affine-linears.patch` | Pack every affine linear into a resident name-addressed device set (`TF_DSV41_AFFINE_LOAD=1`) |
 | `0030-dsv41-affine-linear-dev.patch` | Device-to-device `AffineN` linear with `act_rows.groupSums`; smoke checks the dev path |
 | `0031-dsv41-attn-chain.patch` | Layer-0 attention projection chain: `attn_norm` → `wq_a` → `q_norm` → `wq_b`, `wkv` → `kv_norm` |
-| `0032-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
-| `0033-dsv41-engram-affine.patch` | Optional native 4-bit Engram reader; the FP8 converter is the current path |
+| `0032-dsv41-mxfp4-requant.patch` | Requantize MXFP4 rows to affine-4/group-64 for the native expert kernels |
+| `0033-dsv41-affine-emitter.patch` | Add the affine projection call site to the dsv41 emitter |
+| `0034-dsv41-expert-host-loop.patch` | Host-loop per-expert fallback for the 2-bit routed experts |
+| `0035-dsv41-engram-native.patch` | Native 4-bit Engram reader streamed from SSD |
+| `0036-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0031`. Planned: `0032`-`0033`.
+Implemented: `0001`-`0032`. Planned: `0033`-`0036`.
 
 Rules:
 

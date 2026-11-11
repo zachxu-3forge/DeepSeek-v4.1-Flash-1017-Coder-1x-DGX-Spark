@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | External recipe reviewed; 600K rope.bin and GPU verification next |
+| Overall status | Alignment: 600K rope generator and MXFP4 requant added; emitter call site next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0031` rebuild pending) |
+| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` rebuild pending) |
 | Last updated | 2026-11-11 |
 
 ## Phase tracker
@@ -89,6 +89,24 @@ next step.
   114.85 GiB; **600K 125.05 GiB (2.95 GiB headroom)**; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-11 - Alignment: rope tables and MXFP4 requant
+
+- **Phase:** 1/2 (offline).
+- **Done:** added `scripts/mlx/make_rope_tables.py` for the dsv41 CUDA `rope.bin`
+  (16-byte header, window + YaRN-compressed f32 `[rows,64]`, default 602,048 rows). The
+  compressed table applies `mscale = 0.1 ln(factor) + 1`; `--self-test` reproduces the known
+  Qwen3.6 YaRN vector from `core/rope_yarn.zig`.
+- **Done:** `0032-dsv41-mxfp4-requant.patch` adds `mxfp4_requant.zig`: MXFP4 E8M0 rows →
+  MLX affine-4/group-64 with BF16 scale/bias, host-only. Tests cover exact 0..15 codes,
+  constant rows, and a 2^-1 E8M0 scale; the standalone suite passes 9/9.
+- **Alignment:** the emitter call site is now the planned forward path (`0033`); the
+  per-expert host loop (`0034`), native Engram reader (`0035`), and single-rank path
+  (`0036`) follow. The existing smoke/attention-chain files remain test-only primitives,
+  not a parallel forward.
+- **Verification:** `0001`-`0032` apply cleanly; `zig ast-check` passes; rope self-test and
+  MXFP4 tests pass.
+- **Next:** add the affine call site to the emitter, then the layer-0 attention/MoE forward.
 
 ### 2026-11-11 - External recipe review: MiaAI Qwen3.8
 

@@ -46,7 +46,17 @@ MODEL_DIR="$MODEL_DIR" OUT_DIR="$WORK/stage1-host-q" \
 ```
 
 Expected: all host checks PASS, including `make_one_layer_fixture`,
-`test_translate_config`, `test_plan_dispatch`, and real Engram rows.
+`test_translate_config`, `test_plan_dispatch`, `test_rope_tables`, and real Engram rows.
+
+For a 600K run, generate the asset once:
+
+```sh
+mkdir -p "$WORK/assets"
+python3 scripts/mlx/make_rope_tables.py "$WORK/assets/rope.bin"
+```
+
+Then pass `ASSETS_HOST="$WORK/assets"`, set `TF_DSV41_CONTEXT=600000`, and start with
+`TENSORFOLD_MEMORY_RESERVE_GIB=4..8`. Do not set the reserve to 0 on a shared box.
 
 ## 3. Guard and layer-0 sweep
 

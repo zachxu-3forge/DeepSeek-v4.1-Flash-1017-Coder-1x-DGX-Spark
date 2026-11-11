@@ -108,6 +108,18 @@ fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` reports weights + conser
 reserve against 128 GiB at each context. With 600K in the defaults it reports 125.05 GiB
 (2.95 GiB headroom); 1M does not fit.
 
+## RoPE tables
+
+```sh
+python3 scripts/mlx/make_rope_tables.py /assets/rope.bin
+```
+
+Writes the dsv41 CUDA `rope.bin`: 16-byte header, then the plain window table and the
+YaRN compressed table, each f32 `[rows, 64]`. The default `--rows 602048` covers 600K plus a
+2,048-row prefill segment. The compressed table carries `mscale = 0.1 ln(factor) + 1`; verify
+the frequencies against `core/rope_yarn.zig` and the target's MLX reference before serving.
+`--self-test` checks the known Qwen3.6 YaRN vector.
+
 ## Engram conversion
 
 The chosen path is the engine's native 4-bit reader, streamed from SSD: 160 B/row, ~114 GiB,

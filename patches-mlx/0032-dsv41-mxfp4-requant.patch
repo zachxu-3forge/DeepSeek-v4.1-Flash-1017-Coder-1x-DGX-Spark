@@ -1,0 +1,121 @@
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 909cbc5..46ad970 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -661,4 +661,5 @@ test {
+     _ = @import("affine_smoke.zig");
+     _ = @import("affine_budget.zig");
+     _ = @import("affine_linears.zig");
++    _ = @import("mxfp4_requant.zig");
+ }
+diff --git a/zig/src/families/deepseek_v41/mxfp4_requant.zig b/zig/src/families/deepseek_v41/mxfp4_requant.zig
+new file mode 100644
+index 0000000..33565cc
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/mxfp4_requant.zig
+@@ -0,0 +1,105 @@
++//! MXFP4 -> MLX affine-4 (group 64) requantization.
++//!
++//! The target's 9 DSpark expert tensors are MXFP4: 4-bit codes with one E8M0 scale every
++//! 32 inputs. TensorFold's native MLX expert kernels serve affine-4, group 64. This module
++//! converts one row at a time, keeping 4-bit codes and adding one BF16 scale and bias per
++//! 64-value group. It is host-only and does no device work.
++
++const std = @import("std");
++const mixed = @import("mixed.zig");
++const ref = @import("affine_ref.zig");
++
++fn bf16Round(x: f32) u16 {
++    const bits: u32 = @bitCast(x);
++    const lsb = (bits >> 16) & 1;
++    return @intCast((bits + 0x7FFF + lsb) >> 16);
++}
++
++pub fn requantRow(
++    words: []const u32,
++    scales: []const u8,
++    out_words: []u32,
++    out_scales: []u16,
++    out_biases: []u16,
++    k: usize,
++) !void {
++    if (k == 0 or k % 64 != 0) return error.BadAffine;
++    if (words.len != k / 8 or scales.len != k / 32) return error.BadAffine;
++    if (out_words.len != k / 8 or out_scales.len != k / 64 or out_biases.len != k / 64) return error.BadAffine;
++    @memset(out_words, 0);
++    for (0..k / 64) |g| {
++        var vals: [64]f32 = undefined;
++        var lo: f32 = std.math.inf(f32);
++        var hi: f32 = -std.math.inf(f32);
++        for (0..64) |j| {
++            const code: u32 = @intCast(try ref.codeAt(words, (g * 64 + j) * 4) & 0xF);
++            const v = @as(f32, @floatFromInt(code)) * mixed.e8m0(scales[(g * 64 + j) / 32]);
++            if (!std.math.isFinite(v)) return error.BadAffine;
++            vals[j] = v;
++            lo = @min(lo, v);
++            hi = @max(hi, v);
++        }
++        const scale: f32 = if (hi == lo) 0 else (hi - lo) / 15.0;
++        const bias: f32 = lo;
++        out_scales[g] = bf16Round(scale);
++        out_biases[g] = bf16Round(bias);
++        if (scale == 0) continue;
++        for (0..64) |j| {
++            const qf = @round((vals[j] - bias) / scale);
++            const q: u32 = @intFromFloat(std.math.clamp(qf, 0, 15));
++            const bit = (g * 64 + j) * 4;
++            out_words[bit / 32] |= q << @intCast(bit % 32);
++        }
++    }
++}
++
++fn setCode(words: []u32, i: usize, code: u32) void {
++    const bit = i * 4;
++    words[bit / 32] |= code << @intCast(bit % 32);
++}
++
++test "MXFP4 codes 0..15 with one scale requantize exactly" {
++    var words: [8]u32 = @splat(0);
++    const scales = [_]u8{ 127, 127 }; // 2^0
++    for (0..64) |i| setCode(&words, i, @intCast(i % 16));
++    var out_words: [8]u32 = undefined;
++    var out_scales: [1]u16 = undefined;
++    var out_biases: [1]u16 = undefined;
++    try requantRow(&words, &scales, &out_words, &out_scales, &out_biases, 64);
++    try std.testing.expectEqual(@as(u16, 0x3f80), out_scales[0]); // 1.0
++    try std.testing.expectEqual(@as(u16, 0), out_biases[0]);
++    var values: [64]f32 = undefined;
++    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
++    for (values, 0..) |v, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i % 16)), v);
++}
++
++test "a constant MXFP4 row becomes affine-4 with zero scale" {
++    var words: [8]u32 = @splat(0);
++    const scales = [_]u8{ 127, 127 };
++    for (0..64) |i| setCode(&words, i, 5);
++    var out_words: [8]u32 = undefined;
++    var out_scales: [1]u16 = undefined;
++    var out_biases: [1]u16 = undefined;
++    try requantRow(&words, &scales, &out_words, &out_scales, &out_biases, 64);
++    try std.testing.expectEqual(@as(u16, 0), out_scales[0]);
++    try std.testing.expectEqual(@as(u16, 0x40a0), out_biases[0]); // 5.0
++    var values: [64]f32 = undefined;
++    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
++    for (values) |v| try std.testing.expectEqual(@as(f32, 5.0), v);
++}
++
++test "the E8M0 scale is applied before requantizing" {
++    var words: [8]u32 = @splat(0);
++    const scales = [_]u8{ 126, 126 }; // 2^-1
++    for (0..64) |i| setCode(&words, i, @intCast(i % 16));
++    var out_words: [8]u32 = undefined;
++    var out_scales: [1]u16 = undefined;
++    var out_biases: [1]u16 = undefined;
++    try requantRow(&words, &scales, &out_words, &out_scales, &out_biases, 64);
++    var values: [64]f32 = undefined;
++    try ref.dequantizeRow(&out_words, &out_scales, &out_biases, 4, 64, &values);
++    for (values, 0..) |v, i| {
++        const want = @as(f32, @floatFromInt(i % 16)) * 0.5;
++        try std.testing.expectApproxEqAbs(want, v, 0.5 / 15.0 + 0.001);
++    }
++}

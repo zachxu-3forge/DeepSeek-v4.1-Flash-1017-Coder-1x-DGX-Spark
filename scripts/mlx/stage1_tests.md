@@ -25,6 +25,7 @@ Runs:
 - `test_make_one_layer.py`: the one-layer fixture's tensor bytes match the source shard.
 - `test_translate_config.py`: non-affine `group_size: null` is omitted.
 - `test_plan_dispatch.py`: Engram and `main_proj` are counted in their own buckets.
+- `make_rope_tables.py --self-test`: the 600K YaRN frequencies/scale match `core/rope_yarn.zig`.
 - `translate_config.py --check`: every quantized module has its tensors.
 - `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
   fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`

@@ -72,6 +72,7 @@ step inspect_checkpoint "$PY" "$ROOT/scripts/mlx/inspect_checkpoint.py" "$MODEL_
 step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
 step test_translate_config "$PY" "$ROOT/scripts/mlx/test_translate_config.py"
 step test_plan_dispatch "$PY" "$ROOT/scripts/mlx/test_plan_dispatch.py"
+step test_rope_tables "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --self-test
 step translate_config "$PY" "$ROOT/scripts/mlx/translate_config.py" "$MODEL_DIR" --check \
   --out "$OUT_DIR/quantization.json" --write-config "$OUT_DIR/config.translated.json"
 step plan_dispatch "$PY" "$ROOT/scripts/mlx/plan_dispatch.py" "$MODEL_DIR" --json "$OUT_DIR/plan_dispatch.json"

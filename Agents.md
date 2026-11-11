@@ -122,7 +122,9 @@ EXL3 model.
 Tasks:
 
 - Load all 40 layers plus DSpark and the vision tower on one rank.
-- Implement or adapt 2-bit affine expert gather kernels; verify decode and prefill rows.
+- Wire the host-loop fallback for the 120 two-bit expert stacks for the one-layer gate; add
+  a device gather/GEMM kernel for decode throughput later.
+- Requantize the 9 DSpark MXFP4 expert tensors to affine-4/group-64 for `Affine4Experts`.
 - Generate `rope.bin` for 600K plus a prefill segment; verify the YaRN frequencies and
   `mscale` against `core/rope_yarn.zig` before loading.
 - Add memory admission for ~83.4 GB affine plus dense/native weights and KV; enforce a
