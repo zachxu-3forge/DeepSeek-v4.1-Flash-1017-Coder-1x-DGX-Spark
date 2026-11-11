@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Affine runtime and emitter wired; dense loader and expert host loop next |
+| Overall status | Affine dense/native loader wired; expert host loop next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference; affine runtime + emitter wired (`0033`); dense loader/MoE host loop next |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference; affine runtime, emitter, dense/native loader wired; MoE host loop next |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
 | 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; native 160 B reader and packer tested; real-shard check pending |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -89,14 +89,20 @@ next step.
   (`wo_a`'s columns, a compressor gate) land in a temporary block and a new
   `glue.copy_cols` 2D copy places them. A block-emitter test checks 4 affine calls and
   8 dense groups for layer 0, with no EXL3 linear left in the affine program.
+- **Done:** the affine dense/native plan (`plan.Options.dense`) loads the other half of the
+  checkpoint through the existing `named` rules: norms, mHC mixers, sinks, compressor /
+  indexer norms, router gate/bias, Engram q/k, the whole `wo_a`, this rank’s `embed` rows,
+  the final norm, and the dense head. `named.top` now maps `head.weight` to the `head` role,
+  and `block.denseLinear` emits the head’s `_plain` projection. `cuda_model` loads this set
+  and the resident linears under `TF_DSV41_AFFINE_LOAD=1` and logs both byte counts.
 - **Fixed:** `affine_smoke.zig` had three compile errors only visible in the cross-target
   build (`const DeviceBuffer.free`, and `DeviceBuffer.download`'s current signature).
-- **Verification:** `zig build test-dsv41-forward` on Linux: 197 pass, 1 skip, 1 fail; the
+- **Verification:** `zig build test-dsv41-forward` on Linux: 199 pass, 1 skip, 1 fail; the
   failure is the pre-existing `prepared.zig` mtime-precision test on the mounted
-  filesystem. `compile-dsv41-device-host` and `compile-dsv41-server` pass.
-- **Still open:** the affine branch still returns `AffineForwardNotPorted`; it needs the
-  dense/native weight loader (norms, router, `wo_a`, head) and the MoE host loop (`0034`)
-  before the guard can go. MXFP4-to-affine-4 requant is not yet wired into the plan.
+  filesystem. The new tests cover the dense plan’s roles (`wo_a`, router, head) and the
+  full native loader. `compile-dsv41-device-host` and `compile-dsv41-server` pass.
+- **Still open:** the affine branch still returns `AffineForwardNotPorted`; the MoE host
+  loop (`0034`) is next. MXFP4-to-affine-4 requant is not yet wired into the plan.
 - **Next:** `0034` host-loop experts, then the layer-0 attention/MoE forward.
 
 ### 2026-11-11 - Native 4-bit Engram reader and packer

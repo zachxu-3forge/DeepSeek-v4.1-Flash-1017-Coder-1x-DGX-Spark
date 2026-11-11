@@ -105,9 +105,10 @@ Expected in `smoke.log`:
 The harness compares every CPU/GPU pair with `abs(gpu - cpu) <= 0.01 + 0.01 * abs(cpu)`
 and checks `wq_a`, `shared_experts.w1`, and expert 0 against `reference_layer.json`.
 
-## 4. Resident affine linears
+## 4. Resident affine linears and dense weights
 
-When the GPU is idle and the sweep is clean, verify the full packed-linear set:
+When the GPU is idle and the sweep is clean, verify the full packed-linear set and the
+dense/native half of the affine checkpoint:
 
 ```sh
 TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_LOAD=1 \
@@ -120,11 +121,14 @@ Expected:
 
 ```text
 dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; ...
+dsv41 affine dense: N tensors, M GiB
 dsv41 affine load: 309 linears packed, 4.30 GiB
 AffineForwardNotPorted
 ```
 
-The set is freed before exit; the log proves all linears pack without OOM.
+The dense set is the norms, mHC mixers, router gate/bias, `wo_a`, this rank’s embed rows
+and head rows; the linears are the packed projections. Both are freed before exit; the log
+proves the affine load path fits without OOM.
 
 ## 5. If a smoke line fails
 
