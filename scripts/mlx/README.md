@@ -71,6 +71,7 @@ Environment:
 - `ASSETS_HOST` — optional runtime assets directory (RoPE tables, `engram.json`), mounted at
   `/assets`; `TF_DSV41_ASSETS` points there when set.
 - `OUT_DIR` - output directory, mounted at `/out`.
+- `ENGRAM_SHARDS` - packed Engram shards for `test_stage1.sh`'s `test_engram.py --shard-dir`.
 - `BUILD=1` - build the image first.
 - `DRY_RUN=1` - print the `docker run` command without running it.
 - `TF_EXPERIMENTAL=deepseek` - required by the engine's gated DeepSeek-V4.1 family;
@@ -123,19 +124,24 @@ the frequencies against `core/rope_yarn.zig` and the target's MLX reference befo
 ## Engram conversion
 
 The chosen path is the engine's native 4-bit reader, streamed from SSD: 160 B/row, ~114 GiB,
-no requantization. The converter below remains a fallback/tool.
+no requantization. The converter writes that format by default; `--format fp8` is the
+fallback/tool.
 
 ```sh
-python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --dry-run
-python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --limit-rows 64 --verify
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-native --dry-run
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-native --verify
+python3 scripts/mlx/test_engram.py "$MODEL_DIR" --shard-dir /engram-native
 ```
 
-Writes `engram-l<layer>-r0of1.bin` in the engine's FP8/E8M0 row format. The full output
-is ~203 GB; the conversion dequantizes the target's 4-bit groups and requantizes to E4M3,
-so it is slightly lossy. The OMLX map lists `engram.wkv` but omits `engram.embed`; the
-scripts infer affine 4-bit/group-32 when the table tensors are present. The `engram.json`
-token map/kit is still required. Use `--limit-rows` first and `--verify` to see max/RMS
-error.
+Native rows are the source's own bytes: 32 U32 affine-4 words, then 8 BF16 scales and 8 BF16
+biases (group 32). The header records `row_bytes=160`; the reader also accepts the older
+FP8/E8M0 format (264 B: 256 E4M3 values and 8 E8M0 scales). `--verify` decodes 64 sampled rows
+back from the written file and compares them with the release. The OMLX map lists
+`engram.wkv` but omits `engram.embed`; the scripts infer affine 4-bit/group-32 when the
+table tensors are present. The `engram.json` token map/kit is still required.
+
+`test_engram.py --shard-dir` checks row 0 of every packed shard against the release bytes
+(native) or the decoded values (FP8).
 
 ## Phase 0 gate
 

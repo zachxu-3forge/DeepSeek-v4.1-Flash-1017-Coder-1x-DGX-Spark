@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Alignment: 600K rope generator and MXFP4 requant added; emitter call site next |
+| Overall status | Native 4-bit Engram reader added; emitter call site next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` rebuild pending) |
+| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` and `0035` rebuild pending) |
 | Last updated | 2026-11-11 |
 
 ## Phase tracker
@@ -34,7 +34,7 @@ needed. This file is the history.
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
 | 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference (0.12% / 0.08%); full layer next |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
-| 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; 64-row FP8 conversion is a fallback; native reader pending |
+| 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; native 160 B reader and packer tested; real-shard check pending |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
 | 5. Qualification and docs | Not started | Metrics, regression suite, reproducible run record | - |
 
@@ -70,6 +70,29 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-11 - Native 4-bit Engram reader and packer
+
+- **Phase:** 3 (host-side, offline).
+- **Done:** `0035-dsv41-engram-native.patch` makes the Engram reader format-aware. A shard
+  header may declare `row_bytes=160` (32 U32 affine-4 words, then 8 BF16 scales and 8 BF16
+  biases, group 32) or the legacy `264` (256 E4M3 values and 8 E8M0 scales). `decodeRow`
+  serves both; `engram_io` and the Linux, Darwin, and portable readers take the size from
+  the header instead of a constant.
+- **Done:** `convert_engram.py` now writes native rows by default
+  (`--format native`), copying the release's U32/BF16 bytes with no requantization;
+  `--format fp8` keeps the fallback. `--verify` decodes 64 rows back from each written file.
+  `test_engram.py --shard-dir` checks row 0 of every shard against the release.
+- **Tests:** a synthetic 160-byte shard reads through `Rows` (including a cached second read
+  and a 64-value prefix); native decode matches code * scale + bias; FP8 decode matches the
+  LUT and direct paths; headers accept 160/264 and reject 161. The standalone suite passes
+  5/5 on the host; the Linux reader type-checks for `x86_64-linux-gnu`.
+  `test_convert_engram.py` also builds a tiny safetensors release and runs the native and
+  FP8 conversions plus `test_engram.py --shard-dir` end to end.
+- **Why now:** this is the one Stage 1 design item that needs no GPU, so it lands while
+  `dgx1` serves another workload.
+- **Next:** run `convert_engram.py ... --verify` and `test_engram.py --shard-dir` on the
+  Spark when the checkpoint shards are available; then the affine emitter (`0033`).
 
 ### 2026-11-10 - Engram spec inferred; 64-row conversion verified
 
@@ -746,7 +769,10 @@ Record the approach that was actually implemented, even if it differs from `Agen
 ## Open issues and deviations
 
 - Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
-- Engram: the native 4-bit reader is chosen (160 B/row, ~114 GiB, streamed from SSD, no E4M3 requantization). The FP8 converter remains a fallback; `engram.json` and RoPE assets are still required.
+- Engram: the native 4-bit reader is implemented (`0035`, 160 B/row, ~114 GiB, streamed from
+  SSD, no E4M3 requantization); the FP8 264 B format remains readable as a fallback. Native
+  packer and synthetic shard reads pass; real-checkpoint `--verify`/`--shard-dir` checks are
+  pending. `engram.json` and RoPE assets are still required.
 - 600K: bf16 KV is 13.05 GiB; total 125.05 GiB with a 10 GiB reserve, leaving 2.95 GiB. Generate `rope.bin` for 600K plus a prefill segment and measure with a 4-8 GiB reserve before fixing the default. dsv41 CUDA has no `kv8`; FP8 KV is deferred until measurement.
 - Check `TF_DSV41_POOL_TOKENS`/`kv_pool`: if attention caches are not already pinned, adopt the pinned-pool admission policy (not MiaAI's PyTorch code) so KV is not taken by other workloads.
 - Phase 0 harness and image build are done; the projection guard and one-projection smoke pass on the Spark.

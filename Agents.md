@@ -144,8 +144,9 @@ Chosen: the native 4-bit reader, streamed from SSD.
 - **Native reader:** read the target's U32 4-bit/group-32 rows plus BF16 scales/biases
   (160 bytes/row, ~114 GiB) and dequantize on demand. This avoids the E4M3 requantization
   and is smaller than the FP8 form.
-- **Fallback/tool:** `scripts/mlx/convert_engram.py` still writes the engine's FP8 rows
-  (`264 B/row`, ~188.83 GiB) for comparison or if the native reader is delayed.
+- **Fallback/tool:** `scripts/mlx/convert_engram.py --format fp8` still writes the engine's
+  FP8 rows (`264 B/row`, ~188.83 GiB) for comparison or if the native reader is delayed.
+  The default `--format native` packs the 160-byte rows the reader now serves.
 
 Gate: Engram lookups match the reference for sampled tokens; the native tables stream within
 budget; SSD streaming works under `--rm` with a read-only mount.

@@ -39,10 +39,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0032-dsv41-mxfp4-requant.patch` | Requantize MXFP4 rows to affine-4/group-64 for the native expert kernels |
 | `0033-dsv41-affine-emitter.patch` | Add the affine projection call site to the dsv41 emitter, including the native affine-4 expert mode for requantized MXFP4 |
 | `0034-dsv41-expert-host-loop.patch` | Host-loop per-expert fallback for the 2-bit routed experts |
-| `0035-dsv41-engram-native.patch` | Native 4-bit Engram reader streamed from SSD |
+| `0035-dsv41-engram-native.patch` | Native 4-bit Engram reader streamed from SSD (160 B rows; the FP8 264 B format remains readable) |
 | `0036-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0032`. Planned: `0033`-`0036`.
+Implemented: `0001`-`0032` and `0035`. Planned: `0033`, `0034`, `0036`.
 
 Rules:
 

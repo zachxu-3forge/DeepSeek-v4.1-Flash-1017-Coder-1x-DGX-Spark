@@ -58,6 +58,18 @@ python3 scripts/mlx/make_rope_tables.py "$WORK/assets/rope.bin"
 Then pass `ASSETS_HOST="$WORK/assets"`, set `TF_DSV41_CONTEXT=600000`, and start with
 `TENSORFOLD_MEMORY_RESERVE_GIB=4..8`. Do not set the reserve to 0 on a shared box.
 
+Pack the native Engram shards once (CPU and disk only; ~114 GiB):
+
+```sh
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" "$WORK/engram-native" --limit-rows 64 --verify
+python3 scripts/mlx/convert_engram.py "$MODEL_DIR" "$WORK/engram-native" --overwrite --verify
+python3 scripts/mlx/test_engram.py "$MODEL_DIR" --shard-dir "$WORK/engram-native"
+```
+
+Then set `ENGRAM_SHARDS="$WORK/engram-native"` for the host checks and
+`ENGRAM_DIR="$WORK/engram-native"` for the container. `--verify` decodes sampled rows back
+from the written files; native rows must report max 0.
+
 ## 3. Guard and layer-0 sweep
 
 ```sh

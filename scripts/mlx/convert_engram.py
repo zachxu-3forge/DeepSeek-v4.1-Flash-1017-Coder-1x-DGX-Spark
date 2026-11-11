@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Convert the target's 4-bit affine Engram tables to the engine's FP8 shards.
+"""Pack the target's 4-bit affine Engram tables into the engine's row shards.
 
 The engine reads `engram-l<layer>-r0of1.bin`:
-  4096-byte header: magic "DSV41EN1", layer, lo=0, hi=rows, total=rows, row_bytes=264
-  each row: 256 E4M3 codes + 8 UE8M0 scales (one per 32 values)
+  4096-byte header: magic "DSV41EN1", layer, lo=0, hi=rows, total=rows, row_bytes
+  each row: `row_bytes` bytes, one of two formats:
+    native (160): 32 U32 words of 4-bit codes, 8 BF16 scales, 8 BF16 biases (group 32)
+    fp8    (264): 256 E4M3 codes, 8 UE8M0 scales (one per 32 values)
 
 The target stores `U32 [rows,32]` 4-bit codes, BF16 `[rows,8]` scales, and BF16
-`[rows,8]` biases. This script dequantizes, re-quantizes to E4M3 with a per-32 E8M0
-scale, and streams the result. It needs NumPy; it does not need a GPU.
+`[rows,8]` biases. The default native mode copies those bytes row by row, with no
+dequantization or requantization. `--format fp8` is the fallback: it dequantizes,
+re-quantizes to E4M3 with a per-32 E8M0 scale, and streams the result. Both modes
+need NumPy; neither needs a GPU.
 
 Examples:
-  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --dry-run
-  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --verify
-  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-converted --limit-rows 64 --verify
+  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-native --dry-run
+  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-native --verify
+  python3 scripts/mlx/convert_engram.py "$MODEL_DIR" /engram-fp8 --format fp8 --verify
 """
 
 from __future__ import annotations
@@ -28,10 +32,12 @@ import numpy as np
 
 MAGIC = 0x31344E4531565344  # "DSV41EN1"
 HEADER_BYTES = 4096
-ROW_BYTES = 264
 VALUES = 256
 SCALES = 8
 GROUP = 32
+NATIVE_ROW_BYTES = 160
+FP8_ROW_BYTES = 264
+ROW_BYTES = NATIVE_ROW_BYTES
 ROW_OUT = ROW_BYTES
 
 
@@ -68,6 +74,27 @@ def dequantize(words: np.ndarray, scales: np.ndarray, biases: np.ndarray) -> np.
     s = np.repeat(bf16_to_f32(scales), GROUP, axis=1)
     b = np.repeat(bf16_to_f32(biases), GROUP, axis=1)
     return q.astype(np.float32) * s + b
+
+
+def native_chunk(wbytes: bytes, sbytes: bytes, bbytes: bytes) -> np.ndarray:
+    """[n,160] native rows: 128 bytes of codes, then 8 BF16 scales and 8 BF16 biases."""
+    n = len(wbytes) // (32 * 4)
+    if len(sbytes) != n * 8 * 2 or len(bbytes) != n * 8 * 2:
+        raise ValueError("native Engram chunk sizes differ")
+    out = np.empty((n, NATIVE_ROW_BYTES), dtype=np.uint8)
+    out[:, :128] = np.frombuffer(wbytes, dtype=np.uint8).reshape(n, 128)
+    out[:, 128:144] = np.frombuffer(sbytes, dtype=np.uint8).reshape(n, 16)
+    out[:, 144:160] = np.frombuffer(bbytes, dtype=np.uint8).reshape(n, 16)
+    return out
+
+
+def dequantize_native(rows: np.ndarray) -> np.ndarray:
+    """[n,160] native rows -> [n,256] float32 values (the same code * scale + bias)."""
+    n = rows.shape[0]
+    words = np.frombuffer(rows[:, :128].tobytes(), dtype="<u4").reshape(n, 32)
+    scales = np.frombuffer(rows[:, 128:144].tobytes(), dtype="<u2").reshape(n, 8)
+    biases = np.frombuffer(rows[:, 144:160].tobytes(), dtype="<u2").reshape(n, 8)
+    return dequantize(words, scales, biases)
 
 
 def e4m3_bits(x: np.ndarray) -> np.ndarray:
@@ -136,11 +163,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("out_dir")
     ap.add_argument("--limit-rows", type=int, default=0, help="convert only the first N rows")
     ap.add_argument("--chunk-rows", type=int, default=4096)
+    ap.add_argument("--format", choices=("native", "fp8"), default="native", help="row format (default native)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args(argv)
 
+    row_bytes = NATIVE_ROW_BYTES if args.format == "native" else FP8_ROW_BYTES
     model = os.path.abspath(args.model_dir)
     out = os.path.abspath(args.out_dir)
     config = load_json(os.path.join(model, "config.json"))
@@ -177,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         rows = want_rows if args.limit_rows <= 0 else min(want_rows, args.limit_rows)
         jobs.append((layer, base, shard, base_off, rows))
-        total += HEADER_BYTES + rows * ROW_BYTES
+        total += HEADER_BYTES + rows * row_bytes
 
     if not jobs:
         print("no Engram tables found", file=sys.stderr)
@@ -185,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         for layer, _base, _shard, _off, rows in jobs:
-            print(f"layer {layer}: {rows} rows -> {HEADER_BYTES + rows * ROW_BYTES} bytes")
+            print(f"layer {layer}: {rows} rows -> {HEADER_BYTES + rows * row_bytes} bytes ({row_bytes} B rows)")
         print(f"total: {total / (1 << 30):.2f} GiB")
         return 0
 
@@ -206,16 +235,13 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.exists(path) and not args.overwrite:
             print(f"exists: {path} (use --overwrite)", file=sys.stderr)
             return 2
-        header = struct.pack("<6Q", MAGIC, layer, 0, rows, rows, ROW_BYTES) + b"\0" * (HEADER_BYTES - 48)
+        header = struct.pack("<6Q", MAGIC, layer, 0, rows, rows, row_bytes) + b"\0" * (HEADER_BYTES - 48)
         wname = base + ".weight"
         sname = base + ".scales"
         bname = base + ".biases"
         src = os.path.join(model, shard)
         done = 0
         tmp = path + ".part"
-        max_err = 0.0
-        sum_sq = 0.0
-        count = 0
         with open(tmp, "wb") as dst:
             dst.write(header)
             while done < rows:
@@ -229,25 +255,72 @@ def main(argv: list[str] | None = None) -> int:
                 vals = dequantize(words, scales, biases)
                 if not np.isfinite(vals).all():
                     raise ValueError(f"layer {layer} rows {done}..{done+n}: non-finite values")
-                codes, scale_bits = quantize_row(vals)
-                if args.verify:
-                    back = dequantize_fp8(codes, scale_bits)
-                    err = np.abs(back - vals)
-                    max_err = max(max_err, float(err.max()))
-                    sum_sq += float(np.sum(err.astype(np.float64) ** 2))
-                    count += err.size
-                out_rows = np.empty((n, ROW_BYTES), dtype=np.uint8)
-                out_rows[:, :VALUES] = codes
-                out_rows[:, VALUES:] = scale_bits
+                if args.format == "native":
+                    out_rows = native_chunk(wbytes, sbytes, bbytes)
+                else:
+                    codes, scale_bits = quantize_row(vals)
+                    out_rows = np.empty((n, row_bytes), dtype=np.uint8)
+                    out_rows[:, :VALUES] = codes
+                    out_rows[:, VALUES:] = scale_bits
                 dst.write(out_rows.tobytes())
                 done += n
                 print(f"layer {layer}: {done}/{rows} rows", file=sys.stderr)
-        if args.verify and count:
-            print(f"layer {layer} verify: max {max_err:.6g} rms {(sum_sq / count) ** 0.5:.6g}", file=sys.stderr)
         os.replace(tmp, path)
+        if args.verify:
+            max_err, sum_sq, count = verify_file(
+                path, src, base_off, headers[shard][0], wname, sname, bname, rows, row_bytes, args.format
+            )
+            print(
+                f"layer {layer} verify ({args.format}, {count} values): "
+                f"max {max_err:.6g} rms {(sum_sq / count) ** 0.5:.6g}",
+                file=sys.stderr,
+            )
         print(f"wrote {path} ({rows} rows)")
 
     return 0
+
+
+def verify_file(
+    path: str,
+    src: str,
+    base_off: int,
+    header: dict,
+    wname: str,
+    sname: str,
+    bname: str,
+    rows: int,
+    row_bytes: int,
+    fmt: str,
+    sample: int = 64,
+) -> tuple[float, float, int]:
+    """Decode sampled rows from the written shard and compare with the source rows."""
+    picks = sorted(set([0, rows - 1] + [i * rows // max(sample, 1) for i in range(max(sample, 1))]))
+    max_err = 0.0
+    sum_sq = 0.0
+    count = 0
+    for r in picks:
+        if r < 0 or r >= rows:
+            continue
+        raw = read_rows(path, HEADER_BYTES, r, 1, row_bytes)
+        wbytes = read_rows(src, base_off + header_offset(wname, header), r, 1, 32 * 4)
+        sbytes = read_rows(src, base_off + header_offset(sname, header), r, 1, 8 * 2)
+        bbytes = read_rows(src, base_off + header_offset(bname, header), r, 1, 8 * 2)
+        words = np.frombuffer(wbytes, dtype="<u4").reshape(1, 32)
+        scales = np.frombuffer(sbytes, dtype="<u2").reshape(1, 8)
+        biases = np.frombuffer(bbytes, dtype="<u2").reshape(1, 8)
+        want = dequantize(words, scales, biases)
+        row = np.frombuffer(raw, dtype=np.uint8).reshape(1, row_bytes)
+        if fmt == "native":
+            got = dequantize_native(row)
+        else:
+            got = dequantize_fp8(row[:, :VALUES], row[:, VALUES:])
+        err = np.abs(got - want)
+        max_err = max(max_err, float(err.max()))
+        sum_sq += float(np.sum(err.astype(np.float64) ** 2))
+        count += err.size
+    if count == 0:
+        raise ValueError(f"{path}: no rows sampled")
+    return max_err, sum_sq, count
 
 
 def header_offset(name: str, header: dict) -> int:

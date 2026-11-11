@@ -1,0 +1,471 @@
+diff --git a/zig/src/families/deepseek_v41/engram_io.zig b/zig/src/families/deepseek_v41/engram_io.zig
+index 3ec97bd..56c7c11 100644
+--- a/zig/src/families/deepseek_v41/engram_io.zig
++++ b/zig/src/families/deepseek_v41/engram_io.zig
+@@ -8,7 +8,6 @@ const Rows = engram_rows.Rows;
+ const Header = engram_rows.Header;
+ const header_bytes = engram_rows.header_bytes;
+ const sector = engram_rows.sector;
+-const row_bytes = engram_rows.row_bytes;
+ const merge_gap = engram_rows.merge_gap;
+ const page = engram_rows.page;
+ 
+@@ -21,6 +20,8 @@ pub const Batch = struct {
+     rows: []u64,
+     ext: []Extent,
+     buf: []align(page) u8,
++    /// the table's record size (FP8 264 or native affine-4 160)
++    row_bytes: u64 = engram_rows.row_bytes,
+     left: u32,
+     failed: bool = false,
+     in_use: bool = true,
+@@ -38,8 +39,8 @@ pub const Batch = struct {
+             if (b.ext[m].first <= k) a = m else z = m;
+         }
+         const e = b.ext[a];
+-        const at = e.at + @as(usize, @intCast(header_bytes + (b.rows[k] - lo) * row_bytes - e.off));
+-        return b.buf[at..][0..row_bytes];
++        const at = e.at + @as(usize, @intCast(header_bytes + (b.rows[k] - lo) * b.row_bytes - e.off));
++        return b.buf[at..][0..b.row_bytes];
+     }
+ };
+ 
+@@ -274,7 +275,7 @@ pub fn openTable(gpa: std.mem.Allocator, path: [:0]const u8, cap: u32) !Table {
+     return tableStorage(gpa, fd, direct, h, st.size, cap);
+ }
+ pub fn tableStorage(gpa: std.mem.Allocator, fd: linux.fd_t, direct: bool, h: Header, size: u64, cap: u32) !Table {
+-    const recs = try gpa.alloc(u8, try std.math.mul(usize, cap, row_bytes));
++    const recs = try gpa.alloc(u8, try std.math.mul(usize, cap, h.row_bytes));
+     errdefer gpa.free(recs);
+     const ids = try gpa.alloc(u64, cap);
+     errdefer gpa.free(ids);
+@@ -308,13 +309,14 @@ pub fn start(r: anytype, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
+     try recover(r);
+     const t = &r.tables[ti];
+     const gpa = r.gpa;
++    const rb = t.h.row_bytes;
+     var ext: std.ArrayList(Extent) = .empty;
+     errdefer ext.deinit(gpa);
+     var total: usize = 0;
+     for (rows_in, 0..) |x, k| {
+-        const s = header_bytes + (x - t.h.lo) * row_bytes;
++        const s = header_bytes + (x - t.h.lo) * rb;
+         const s0 = s / sector * sector;
+-        const s1 = (s + row_bytes + sector - 1) / sector * sector;
++        const s1 = (s + rb + sector - 1) / sector * sector;
+         if (ext.items.len > 0) {
+             const e = &ext.items[ext.items.len - 1];
+             if (s0 <= e.off + e.len + merge_gap) {
+@@ -337,7 +339,7 @@ pub fn start(r: anytype, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
+     errdefer if (!published) gpa.free(owned);
+     const extents = try ext.toOwnedSlice(gpa);
+     errdefer if (!published) gpa.free(extents);
+-    const b: Batch = .{ .table = ti, .rows = owned, .ext = extents, .buf = buf, .left = 0 };
++    const b: Batch = .{ .table = ti, .rows = owned, .ext = extents, .buf = buf, .row_bytes = rb, .left = 0 };
+     try t.map.ensureUnusedCapacity(gpa, @intCast(owned.len));
+     if (r.pool) |p| {
+         // the batch's slot and its extents queued under the pool's lock (a worker settles batches.items[bi])
+diff --git a/zig/src/families/deepseek_v41/engram_native_test.zig b/zig/src/families/deepseek_v41/engram_native_test.zig
+new file mode 100644
+index 0000000..76deb6d
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/engram_native_test.zig
+@@ -0,0 +1,68 @@
++//! Native affine-4 Engram rows (160 B): decoding beside FP8 rows and a shard read through `Rows`.
++
++const std = @import("std");
++const testing = std.testing;
++const er = @import("engram_rows.zig");
++
++/// One deterministic native row: 32 U32 words, then 8 BF16 scales and 8 BF16 biases.
++fn putNativeRow(row: []u8, seed: u64) void {
++    @memset(row, 0);
++    for (0..32) |w| {
++        var word: u32 = 0;
++        for (0..8) |k| {
++            const q: u32 = @intCast((w * 8 + k + seed) % 16);
++            word |= q << @intCast(k * 4);
++        }
++        std.mem.writeInt(u32, row[4 * w ..][0..4], word, .little);
++    }
++    for (0..8) |g| {
++        std.mem.writeInt(u16, row[128 + 2 * g ..][0..2], er.bf16(1.0 + @as(f32, @floatFromInt(g)) * 0.5), .little);
++        std.mem.writeInt(u16, row[144 + 2 * g ..][0..2], er.bf16(-0.5 + @as(f32, @floatFromInt(g)) * 0.125), .little);
++    }
++}
++
++test "a native shard reads rows at the header's 160-byte size" {
++    const a = testing.allocator;
++    const io = testing.io;
++    const rows = 8;
++    const n: usize = @intCast(er.header_bytes + rows * er.native_row_bytes);
++    const b = try a.alloc(u8, n);
++    defer a.free(b);
++    @memset(b, 0);
++    for ([_]u64{ er.magic, 1, 0, rows, rows, er.native_row_bytes }, 0..) |v, i| {
++        std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);
++    }
++    for (0..rows) |k| putNativeRow(b[er.header_bytes + k * er.native_row_bytes ..][0..er.native_row_bytes], k);
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram-l1-r0of1.bin", .data = b });
++    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
++    defer a.free(root);
++
++    const r = try er.Rows.open(a, root, 0, 1, &.{1}, 4096);
++    defer r.close();
++    try testing.expectEqual(@as(u64, 160), r.tables[0].h.row_bytes);
++
++    const idx = [_]i64{ 7, 0, 3, 0 };
++    const got = try a.alloc(u16, idx.len * er.values);
++    defer a.free(got);
++    try r.rows(0, &idx, er.values, got);
++    for (idx, 0..) |id, i| {
++        var want: [er.values]u16 = undefined;
++        const at: usize = @intCast(er.header_bytes + @as(u64, @intCast(id)) * er.native_row_bytes);
++        try er.decodeRow(b[at..][0..er.native_row_bytes], er.values, null, &want);
++        try testing.expectEqualSlices(u16, &want, got[i * er.values ..][0..er.values]);
++    }
++
++    // a second call served from the cache gives the same bits, and dim is a prefix
++    const again = try a.alloc(u16, 64 * idx.len);
++    defer a.free(again);
++    try r.rows(0, &idx, 64, again);
++    for (idx, 0..) |id, i| {
++        var want: [er.values]u16 = undefined;
++        const at: usize = @intCast(er.header_bytes + @as(u64, @intCast(id)) * er.native_row_bytes);
++        try er.decodeRow(b[at..][0..er.native_row_bytes], er.values, null, &want);
++        try testing.expectEqualSlices(u16, want[0..64], again[i * 64 ..][0..64]);
++    }
++}
+diff --git a/zig/src/families/deepseek_v41/engram_probe.zig b/zig/src/families/deepseek_v41/engram_probe.zig
+index 5eadd3f..9f24a54 100644
+--- a/zig/src/families/deepseek_v41/engram_probe.zig
++++ b/zig/src/families/deepseek_v41/engram_probe.zig
+@@ -12,7 +12,7 @@ fn nowNs() u64 {
+     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+ }
+ 
+-const Shard = struct { fd: linux.fd_t, lo: u64, hi: u64, size: u64, direct: bool };
++const Shard = struct { fd: linux.fd_t, lo: u64, hi: u64, size: u64, row_bytes: u64, direct: bool };
+ 
+ fn openShard(dir: []const u8, layer: u32, rank: u32, world: u32) !Shard {
+     var nb: [4096]u8 = undefined;
+@@ -32,7 +32,7 @@ fn openShard(dir: []const u8, layer: u32, rank: u32, world: u32) !Shard {
+     var st: linux.Statx = undefined;
+     if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.EngramShard;
+     const h = try er.Header.parse(hb[0..48], st.size);
+-    return .{ .fd = fd, .lo = h.lo, .hi = h.hi, .size = st.size, .direct = direct };
++    return .{ .fd = fd, .lo = h.lo, .hi = h.hi, .size = st.size, .row_bytes = h.row_bytes, .direct = direct };
+ }
+ 
+ const RawArgs = struct { s: Shard, n: usize, seed: u64, lat: []u64 };
+@@ -43,9 +43,9 @@ fn rawWorker(a: RawArgs) void {
+     var buf: [2048]u8 align(4096) = undefined;
+     for (a.lat[0..a.n]) |*l| {
+         const row = rnd.intRangeLessThan(u64, a.s.lo, a.s.hi);
+-        const b0 = er.header_bytes + (row - a.s.lo) * er.row_bytes;
++        const b0 = er.header_bytes + (row - a.s.lo) * a.s.row_bytes;
+         const off = b0 / er.sector * er.sector;
+-        const len = std.mem.alignForward(u64, b0 + er.row_bytes - off, er.sector);
++        const len = std.mem.alignForward(u64, b0 + a.s.row_bytes - off, er.sector);
+         const t0 = nowNs();
+         _ = linux.pread(a.s.fd, &buf, len, @intCast(off));
+         l.* = nowNs() - t0;
+diff --git a/zig/src/families/deepseek_v41/engram_rows.zig b/zig/src/families/deepseek_v41/engram_rows.zig
+index 5f721c0..e596580 100644
+--- a/zig/src/families/deepseek_v41/engram_rows.zig
++++ b/zig/src/families/deepseek_v41/engram_rows.zig
+@@ -5,11 +5,61 @@ const std = @import("std");
+ pub const magic: u64 = 0x31344E4531565344; // "DSV41EN1"; file `<dir>/engram-l<layer>-r<rank>of<world>.bin`
+ pub const header_bytes: u64 = 4096; // 6 little-endian u64: magic, layer, lo, hi, total rows, row bytes
+ pub const sector: u64 = 512;
+-pub const row_bytes: u64 = 264; // 256 e4m3 values and 8 UE8M0 scales (one a 32)
++pub const fp8_row_bytes: u64 = 264; // 256 e4m3 values and 8 UE8M0 scales (one a 32)
++pub const native_row_bytes: u64 = 160; // 32 U32 affine-4 words, 8 BF16 scales, 8 BF16 biases
++pub const row_bytes: u64 = fp8_row_bytes; // legacy default; readers use Header.row_bytes
+ pub const values = 256;
+ pub const merge_gap: u64 = 4096; // holes up to this merged into one extent
+ pub const page = 4096;
+ 
++pub const RowFormat = enum { fp8, affine4 };
++
++pub fn formatOf(rb: u64) ?RowFormat {
++    return switch (rb) {
++        fp8_row_bytes => .fp8,
++        native_row_bytes => .affine4,
++        else => null,
++    };
++}
++
++/// A bfloat16 bit pattern as float32 (the exact value the row stores).
++pub fn fromBf16(bits: u16) f32 {
++    return @bitCast(@as(u32, bits) << 16);
++}
++
++/// One shard row's first `dim` values as bf16 bits.
++///
++/// FP8 rows (264 bytes) decode through `lut` when given, else compute `e4m3 x 2^(scale-127)`.
++/// Native rows (160 bytes) hold 32 U32 words of affine-4 codes (low nibble first), then 8 BF16
++/// scales and 8 BF16 biases, one each per 32 values: `code * scale + bias`.
++pub fn decodeRow(rec: []const u8, dim: usize, lut: ?*const [65536]u16, out: []u16) !void {
++    if (dim == 0 or dim > values or dim % 32 != 0 or out.len != dim) return error.BadEngramRow;
++    switch (formatOf(rec.len) orelse return error.BadEngramRow) {
++        .fp8 => {
++            if (rec.len < fp8_row_bytes) return error.BadEngramRow;
++            for (out, 0..) |*v, j| {
++                const scale_code = rec[values + j / 32];
++                v.* = if (lut) |t| t[@as(usize, scale_code) << 8 | rec[j]] else bf16(e4m3(rec[j]) * scale(scale_code));
++            }
++        },
++        .affine4 => {
++            if (rec.len < native_row_bytes) return error.BadEngramRow;
++            const scales_at: usize = 32 * 4; // 32 U32 words of 4-bit codes
++            const biases_at: usize = scales_at + 8 * 2;
++            for (0..dim / 32) |g| {
++                const s = fromBf16(std.mem.readInt(u16, rec[scales_at + 2 * g ..][0..2], .little));
++                const b = fromBf16(std.mem.readInt(u16, rec[biases_at + 2 * g ..][0..2], .little));
++                for (0..32) |u| {
++                    const j = g * 32 + u;
++                    const word = std.mem.readInt(u32, rec[4 * (j / 8) ..][0..4], .little);
++                    const q: u32 = (word >> @intCast((j % 8) * 4)) & 0xF;
++                    out[j] = bf16(@as(f32, @floatFromInt(q)) * s + b);
++                }
++            }
++        },
++    }
++}
++
+ pub const Header = struct {
+     layer: u64,
+     lo: u64,
+@@ -23,7 +73,7 @@ pub const Header = struct {
+         for (&w, 0..) |*x, i| x.* = std.mem.readInt(u64, b[8 * i ..][0..8], .little);
+         if (w[0] != magic) return error.NotEngramShard;
+         const h: Header = .{ .layer = w[1], .lo = w[2], .hi = w[3], .total = w[4], .row_bytes = w[5] };
+-        if (h.row_bytes != row_bytes or h.hi < h.lo or h.hi > h.total) return error.BadEngramShard;
++        if (formatOf(h.row_bytes) == null or h.hi < h.lo or h.hi > h.total) return error.BadEngramShard;
+         const payload = std.math.mul(u64, h.hi - h.lo, h.row_bytes) catch return error.BadEngramShard;
+         const expected = std.math.add(u64, header_bytes, payload) catch return error.BadEngramShard;
+         if (size != expected) return error.BadEngramShard;
+@@ -110,3 +160,74 @@ test "Linux row storage releases tables if LUT allocation fails" {
+     };
+     try std.testing.checkAllAllocationFailures(std.testing.allocator, check.run, .{});
+ }
++
++fn putNativeRow(row: []u8, seed: u64) void {
++    @memset(row, 0);
++    for (0..32) |w| {
++        var word: u32 = 0;
++        for (0..8) |k| {
++            const q: u32 = @intCast((w * 8 + k + seed) % 16);
++            word |= q << @intCast(k * 4);
++        }
++        std.mem.writeInt(u32, row[4 * w ..][0..4], word, .little);
++    }
++    for (0..8) |g| {
++        std.mem.writeInt(u16, row[128 + 2 * g ..][0..2], bf16(1.0 + @as(f32, @floatFromInt(g)) * 0.5), .little);
++        std.mem.writeInt(u16, row[144 + 2 * g ..][0..2], bf16(-0.5 + @as(f32, @floatFromInt(g)) * 0.125), .little);
++    }
++}
++
++test "a native affine-4 row decodes code * scale + bias" {
++    var rec: [native_row_bytes]u8 = undefined;
++    putNativeRow(&rec, 3);
++    var got: [values]u16 = undefined;
++    try decodeRow(&rec, values, null, &got);
++    for (got, 0..) |v, j| {
++        const g = j / 32;
++        const s = 1.0 + @as(f32, @floatFromInt(g)) * 0.5;
++        const b = -0.5 + @as(f32, @floatFromInt(g)) * 0.125;
++        const q: f32 = @floatFromInt((j + 3) % 16);
++        try std.testing.expectEqual(bf16(q * s + b), v);
++    }
++    // dim is a prefix: the first two groups only
++    var short: [64]u16 = undefined;
++    try decodeRow(&rec, 64, null, &short);
++    try std.testing.expectEqualSlices(u16, got[0..64], &short);
++}
++
++test "an FP8 row decodes through the LUT and directly" {
++    var rec: [fp8_row_bytes]u8 = undefined;
++    @memset(&rec, 0x80);
++    rec[0] = 0x00;
++    rec[1] = 0x38;
++    rec[2] = 0x40;
++    rec[3] = 0x7E;
++    @memset(rec[values..], 127);
++    var lut: [65536]u16 = undefined;
++    fillTable(&lut);
++    var a: [values]u16 = undefined;
++    var b: [values]u16 = undefined;
++    try decodeRow(&rec, values, &lut, &a);
++    try decodeRow(&rec, values, null, &b);
++    try std.testing.expectEqualSlices(u16, &a, &b);
++    try std.testing.expectEqual(@as(u16, 0x0000), a[0]); // 0
++    try std.testing.expectEqual(@as(u16, 0x3f80), a[1]); // 1
++    try std.testing.expectEqual(@as(u16, 0x4000), a[2]); // 2
++    try std.testing.expectEqual(@as(u16, 0x43e0), a[3]); // 448
++}
++
++test "the shard header admits both row formats and nothing else" {
++    var b: [48]u8 = @splat(0);
++    const write = struct {
++        fn h(buf: *[48]u8, rows: u64, rb: u64) void {
++            for ([_]u64{ magic, 1, 0, rows, rows, rb }, 0..) |v, i| std.mem.writeInt(u64, buf[8 * i ..][0..8], v, .little);
++        }
++    }.h;
++    write(&b, 4, native_row_bytes);
++    const h = try Header.parse(&b, header_bytes + 4 * native_row_bytes);
++    try std.testing.expectEqual(RowFormat.affine4, formatOf(h.row_bytes).?);
++    write(&b, 4, fp8_row_bytes);
++    _ = try Header.parse(&b, header_bytes + 4 * fp8_row_bytes);
++    write(&b, 4, 161);
++    try std.testing.expectError(error.BadEngramShard, Header.parse(&b, header_bytes + 4 * 161));
++}
+diff --git a/zig/src/families/deepseek_v41/engram_rows_darwin.zig b/zig/src/families/deepseek_v41/engram_rows_darwin.zig
+index cab8c02..946707d 100644
+--- a/zig/src/families/deepseek_v41/engram_rows_darwin.zig
++++ b/zig/src/families/deepseek_v41/engram_rows_darwin.zig
+@@ -13,7 +13,6 @@ const Pool = engram_io.Pool;
+ const Aio = engram_io.Aio;
+ const header_bytes = format.header_bytes;
+ const sector = format.sector;
+-const row_bytes = format.row_bytes;
+ const values = format.values;
+ const page = format.page;
+ const fillTable = format.fillTable;
+@@ -306,7 +305,8 @@ pub const Rows = struct {
+                     continue;
+                 }
+                 const s = t.take();
+-                @memcpy(t.recs[s * row_bytes ..][0..row_bytes], b.record(k, t.h.lo));
++                const rb: usize = @intCast(t.h.row_bytes);
++                @memcpy(t.recs[s * rb ..][0..rb], b.record(k, t.h.lo));
+                 t.ids[s] = x;
+                 t.front(s);
+                 // the entry is this batch's (a row is in one batch at most; evictions only remove ready entries)
+@@ -331,10 +331,11 @@ pub const Rows = struct {
+         // cached records now; in-flight ones after their batches; the rest read as one batch
+         var miss: std.ArrayList(u64) = .empty;
+         defer miss.deinit(r.gpa);
++        const rb: usize = @intCast(t.h.row_bytes);
+         for (u, 0..) |x, k| {
+             if (t.map.get(x)) |e| switch (e) {
+                 .ready => |s| {
+-                    r.recs.items[k] = t.recs[s * row_bytes ..].ptr;
++                    r.recs.items[k] = t.recs[s * rb ..].ptr;
+                     t.unlink(s);
+                     t.front(s);
+                     r.stats.hits += 1;
+@@ -367,11 +368,10 @@ pub const Rows = struct {
+                 r.recs.items[k] = b.record(std.sort.binarySearch(u64, b.rows, x, orderU64).?, t.h.lo).ptr;
+             },
+         };
+-        // every position: its record's values through the table (scale byte of each 32 values, then the e4m3 byte)
++        // every position: its record's values (FP8 through the LUT, native affine-4 as code * scale + bias)
+         for (idx, 0..) |i, p| {
+             const rec = r.recs.items[std.sort.binarySearch(u64, u, @as(u64, @intCast(i)), orderU64).?];
+-            const o = out[p * dim ..][0..dim];
+-            for (o, 0..) |*v, j| v.* = r.lut[@as(usize, rec[values + j / 32]) << 8 | rec[j]];
++            try format.decodeRow(rec[0..rb], dim, r.lut, out[p * dim ..][0..dim]);
+         }
+         r.settle(li);
+     }
+diff --git a/zig/src/families/deepseek_v41/engram_rows_linux.zig b/zig/src/families/deepseek_v41/engram_rows_linux.zig
+index 1796ab6..c44d8ad 100644
+--- a/zig/src/families/deepseek_v41/engram_rows_linux.zig
++++ b/zig/src/families/deepseek_v41/engram_rows_linux.zig
+@@ -7,7 +7,6 @@ const format = @import("engram_rows.zig");
+ pub const Header = format.Header;
+ const header_bytes = format.header_bytes;
+ const sector = format.sector;
+-const row_bytes = format.row_bytes;
+ const values = format.values;
+ const merge_gap = format.merge_gap;
+ const page = format.page;
+@@ -192,7 +191,8 @@ pub const Rows = struct {
+                     continue;
+                 }
+                 const s = t.take();
+-                @memcpy(t.recs[s * row_bytes ..][0..row_bytes], b.record(k, t.h.lo));
++                const rb: usize = @intCast(t.h.row_bytes);
++                @memcpy(t.recs[s * rb ..][0..rb], b.record(k, t.h.lo));
+                 t.ids[s] = x;
+                 t.front(s);
+                 // the entry is this batch's (a row is in one batch at most; evictions only remove ready entries)
+@@ -217,10 +217,11 @@ pub const Rows = struct {
+         // cached records now; in-flight ones after their batches; the rest read as one batch
+         var miss: std.ArrayList(u64) = .empty;
+         defer miss.deinit(r.gpa);
++        const rb: usize = @intCast(t.h.row_bytes);
+         for (u, 0..) |x, k| {
+             if (t.map.get(x)) |e| switch (e) {
+                 .ready => |s| {
+-                    r.recs.items[k] = t.recs[s * row_bytes ..].ptr;
++                    r.recs.items[k] = t.recs[s * rb ..].ptr;
+                     t.unlink(s);
+                     t.front(s);
+                     r.stats.hits += 1;
+@@ -253,11 +254,10 @@ pub const Rows = struct {
+                 r.recs.items[k] = b.record(std.sort.binarySearch(u64, b.rows, x, orderU64).?, t.h.lo).ptr;
+             },
+         };
+-        // every position: its record's values through the table (scale byte of each 32 values, then the e4m3 byte)
++        // every position: its record's values (FP8 through the LUT, native affine-4 as code * scale + bias)
+         for (idx, 0..) |i, p| {
+             const rec = r.recs.items[std.sort.binarySearch(u64, u, @as(u64, @intCast(i)), orderU64).?];
+-            const o = out[p * dim ..][0..dim];
+-            for (o, 0..) |*v, j| v.* = r.lut[@as(usize, rec[values + j / 32]) << 8 | rec[j]];
++            try format.decodeRow(rec[0..rb], dim, r.lut, out[p * dim ..][0..dim]);
+         }
+         r.settle(li);
+     }
+diff --git a/zig/src/families/deepseek_v41/engram_rows_portable.zig b/zig/src/families/deepseek_v41/engram_rows_portable.zig
+index 89afdd3..c54b646 100644
+--- a/zig/src/families/deepseek_v41/engram_rows_portable.zig
++++ b/zig/src/families/deepseek_v41/engram_rows_portable.zig
+@@ -70,12 +70,13 @@ pub const Rows = struct {
+         }
+         // Publish the cache identity only after the full positional read succeeds.
+         var bytes: [264]u8 = undefined;
+-        const offset = f.header_bytes + (id - table.h.lo) * f.row_bytes;
+-        if (try table.file.readPositionalAll(r.io, &bytes, offset) != bytes.len) return error.ShortRead;
++        const rb: usize = @intCast(table.h.row_bytes);
++        const offset = f.header_bytes + (id - table.h.lo) * table.h.row_bytes;
++        if (try table.file.readPositionalAll(r.io, bytes[0..rb], offset) != rb) return error.ShortRead;
+         slot.* = .{ .id = id, .age = r.clock, .bytes = bytes };
+         r.stats.misses += 1;
+         r.stats.reads += 1;
+-        r.stats.bytes += 264;
++        r.stats.bytes += rb;
+         return &slot.bytes;
+     }
+     /// Portable prefetch is synchronous. The Source contract permits completion before return.
+@@ -88,10 +89,11 @@ pub const Rows = struct {
+     }
+     pub fn rows(r: *Rows, li: usize, ids: []const i64, dim: usize, out: []u16) !void {
+         try r.validate(li, ids);
+-        if (dim != 256 or out.len != try std.math.mul(usize, ids.len, 256)) return error.BadEngramShard;
++        if (dim == 0 or dim > f.values or dim % 32 != 0 or out.len != try std.math.mul(usize, ids.len, dim)) return error.BadEngramShard;
++        const rb: usize = @intCast(r.tables[li].h.row_bytes);
+         for (ids, 0..) |id, i| {
+             const b = try r.record(li, @intCast(id));
+-            for (0..256) |j| out[i * 256 + j] = f.bf16(f.e4m3(b[j]) * f.scale(b[256 + j / 32]));
++            try f.decodeRow(b[0..rb], dim, null, out[i * dim ..][0..dim]);
+         }
+     }
+     pub fn source(r: *Rows) eh.Source {
+diff --git a/zig/src/families/deepseek_v41/shared_test.zig b/zig/src/families/deepseek_v41/shared_test.zig
+index eaec550..ed04d47 100644
+--- a/zig/src/families/deepseek_v41/shared_test.zig
++++ b/zig/src/families/deepseek_v41/shared_test.zig
+@@ -11,6 +11,7 @@ test {
+     std.testing.refAllDecls(@import("engram_rows.zig").Rows);
+     std.testing.refAllDecls(@import("phases.zig"));
+     _ = @import("engram_boundary_test.zig");
++    _ = @import("engram_native_test.zig");
+     _ = @import("engram_start_test.zig");
+     _ = @import("engram_recovery_test.zig");
+     _ = @import("ced.zig");

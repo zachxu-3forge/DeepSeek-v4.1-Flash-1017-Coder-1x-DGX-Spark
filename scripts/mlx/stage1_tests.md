@@ -32,7 +32,10 @@ Runs:
   MXFP8 are reported separately because they are not affine-plan modules.
 - `reference_layer.py`: golden dots for one 8-bit, 6-bit, and 2-bit module, plus one
   MXFP8 and one MXFP4 module.
-- `test_engram.py`: golden dots and row counts for the two Engram tables.
+- `test_engram.py`: golden dots and row counts for the two Engram tables; with
+  `ENGRAM_SHARDS`, row 0 of every packed shard against the release.
+- `test_convert_engram.py`: E4M3/E8M0 math, the 160-byte native interleave, and a tiny
+  native/FP8 shard through `convert_engram.py` and `test_engram.py --shard-dir`.
 
 ## Container
 
@@ -95,8 +98,11 @@ device-to-device group-sums path, and `affine smoke attn ...` checks the layer-0
 `0.134277/0.107697`.
 
 The Engram reader (1o) must reproduce `engram.json`, including the two row counts.
-For the FP8 conversion path, `convert_engram.py --limit-rows 64 --verify` must report
-bounded max/RMS error, and a full `--dry-run` must confirm the ~203 GB output budget.
+The native shard path is the default: `convert_engram.py --verify` decodes 64 rows back from
+each written shard and must report `max 0` (the source bytes are copied), and
+`test_engram.py --shard-dir` must pass for row 0 of every table. The FP8 fallback
+(`--format fp8 --limit-rows 64 --verify`) must report bounded max/RMS error, and a full
+`--dry-run` must confirm its ~203 GB output budget (the native tables are ~114 GiB).
 
 ## Results
 

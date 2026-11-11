@@ -90,7 +90,10 @@ infer affine 4-bit/group-32 from the shapes. On 2026-11-10 the dry-run reported
 188.83 GiB; a 64-row conversion verified with max 0.125 and RMS 0.0232/0.0256.
 
 Chosen path: a native 4-bit reader streamed from SSD (160 B/row, ~114 GiB), not the FP8
-conversion. The converter stays as a fallback/tool.
+conversion. Implemented in `0035`: the header may declare either row size, and readers
+decode both. The converter stays as a fallback/tool; `--format native` (default) copies the
+release bytes, `--format fp8` writes the 264 B form. Real-checkpoint shard verification
+remains before the Stage 3 gate.
 
 ### B6. Mixed affine/MXFP8/MXFP4/unquantized modules
 

@@ -16,6 +16,7 @@
 #   BUILD=1     build the image before the container run
 #   EXPECT_FORWARD=1  require the one-layer forward to pass (after stage 1m)
 #   SERVE_ARGS  engine arguments (default "serve /model")
+#   ENGRAM_SHARDS  packed Engram shards to check with test_engram.py --shard-dir
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -73,6 +74,11 @@ step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
 step test_translate_config "$PY" "$ROOT/scripts/mlx/test_translate_config.py"
 step test_plan_dispatch "$PY" "$ROOT/scripts/mlx/test_plan_dispatch.py"
 step test_rope_tables "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --self-test
+if "$PY" -c "import numpy" >/dev/null 2>&1; then
+  step test_convert_engram "$PY" "$ROOT/scripts/mlx/test_convert_engram.py"
+else
+  lines+=("| test_convert_engram | SKIP | numpy not installed |")
+fi
 step translate_config "$PY" "$ROOT/scripts/mlx/translate_config.py" "$MODEL_DIR" --check \
   --out "$OUT_DIR/quantization.json" --write-config "$OUT_DIR/config.translated.json"
 step plan_dispatch "$PY" "$ROOT/scripts/mlx/plan_dispatch.py" "$MODEL_DIR" --json "$OUT_DIR/plan_dispatch.json"
@@ -83,7 +89,11 @@ else
   lines+=("| reference_layer | SKIP | shard 20 not downloaded |")
 fi
 if [[ -f "$MODEL_DIR/model-00018-of-00021.safetensors" && -f "$MODEL_DIR/model-00019-of-00021.safetensors" ]]; then
-  step engram "$PY" "$ROOT/scripts/mlx/test_engram.py" "$MODEL_DIR" --out "$OUT_DIR/engram.json"
+  engram_args=("$MODEL_DIR" --out "$OUT_DIR/engram.json")
+  if [[ -n "${ENGRAM_SHARDS:-}" ]]; then
+    engram_args+=(--shard-dir "$ENGRAM_SHARDS")
+  fi
+  step engram "$PY" "$ROOT/scripts/mlx/test_engram.py" "${engram_args[@]}"
 else
   lines+=("| engram | SKIP | Engram shards not downloaded |")
 fi
