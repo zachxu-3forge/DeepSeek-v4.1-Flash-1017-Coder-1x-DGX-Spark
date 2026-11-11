@@ -1,0 +1,592 @@
+diff --git a/zig/src/families/deepseek_v41/affine_linears.zig b/zig/src/families/deepseek_v41/affine_linears.zig
+index 960e0da..4efb331 100644
+--- a/zig/src/families/deepseek_v41/affine_linears.zig
++++ b/zig/src/families/deepseek_v41/affine_linears.zig
+@@ -25,10 +25,13 @@ pub const Set = struct {
+     arena: std.heap.ArenaAllocator,
+     items: []Item,
+     map: std.StringHashMapUnmanaged(usize) = .empty,
++    /// the emitter passes this 63-bit hash (an integer call argument) instead of the name
++    hashed: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+ 
+     pub fn deinit(s: *Set) void {
+         for (s.items) |*item| item.tiles.deinit();
+         s.map.deinit(s.arena.child_allocator);
++        s.hashed.deinit(s.arena.child_allocator);
+         s.arena.deinit();
+         s.* = undefined;
+     }
+@@ -38,6 +41,12 @@ pub const Set = struct {
+         return &s.items[at];
+     }
+ 
++    /// The item a `tf_dsv41_affine_v1.linear` call names by hash.
++    pub fn getHashed(s: *const Set, h: u64) ?*const Item {
++        const at = s.hashed.get(h) orelse return null;
++        return &s.items[at];
++    }
++
+     pub fn bytes(s: *const Set) u64 {
+         var total: u64 = 0;
+         for (s.items) |item| {
+@@ -47,6 +56,11 @@ pub const Set = struct {
+     }
+ };
+ 
++/// A stable 63-bit module-name hash; collisions are refused when the set is built.
++pub fn nameHash(name: []const u8) u64 {
++    return std.hash.Wyhash.hash(0x44534e34_31616666, name) & 0x7fff_ffff_ffff_ffff;
++}
++
+ pub fn loadAll(
+     gpa: std.mem.Allocator,
+     io: std.Io,
+@@ -71,6 +85,8 @@ pub fn loadAll(
+     }
+     var map: std.StringHashMapUnmanaged(usize) = .empty;
+     errdefer map.deinit(gpa);
++    var hashed: std.AutoHashMapUnmanaged(u64, usize) = .empty;
++    errdefer hashed.deinit(gpa);
+ 
+     for (bindings) |b| {
+         if (b.mode != .affine8_linear or b.affine_layout == null) continue;
+@@ -94,5 +110,11 @@ pub fn loadAll(
+         made += 1;
+     }
+     if (made != items.len) return error.AffineSetMismatch;
+-    return .{ .arena = arena, .items = items, .map = map };
++    try hashed.ensureTotalCapacity(gpa, @intCast(items.len));
++    for (items, 0..) |item, i| {
++        const h = nameHash(item.name);
++        if (hashed.contains(h)) return error.AffineNameCollision;
++        hashed.putAssumeCapacity(h, i);
++    }
++    return .{ .arena = arena, .items = items, .map = map, .hashed = hashed };
+ }
+diff --git a/zig/src/families/deepseek_v41/affine_runtime.zig b/zig/src/families/deepseek_v41/affine_runtime.zig
+new file mode 100644
+index 0000000..13666dc
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -0,0 +1,87 @@
++//! The affine model's resident kernels: `affine8` / `affine_prefill` / `affine4_pack`,
++//! `act_rows`, and every dense affine linear packed once into `AffineN` tiles.
++//!
++//! The forward emits `tf_dsv41_affine_v1.linear` calls; `kernels_replay.zig` resolves
++//! their name hash here and launches decode (`rows <= 16`) or prompt rows.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const Pack = @import("pack.zig").Pack;
++const exec = @import("affine_exec.zig");
++const linears = @import("affine_linears.zig");
++
++pub const Affine = struct {
++    mods: [3]cuda.Module,
++    wide: cuda.qlinear.AffineNKernels,
++    act: cuda.act_rows.ActRows,
++    linears: linears.Set,
++
++    /// Loads the affine CUDA kernels and packs every affine linear in `bindings`.
++    pub fn load(
++        gpa: std.mem.Allocator,
++        io: std.Io,
++        d: *const cuda.Driver,
++        stream: cuda.Stream,
++        pack: *const Pack,
++        bindings: []const exec.Binding,
++        sms: usize,
++        gb10: bool,
++    ) !Affine {
++        var a: Affine = undefined;
++        a.mods[0] = try cuda.Module.load(d, cuda.kernels.affine8);
++        errdefer a.mods[0].unload();
++        a.mods[1] = try cuda.Module.load(d, cuda.kernels.affine_prefill);
++        errdefer a.mods[1].unload();
++        a.mods[2] = try cuda.Module.load(d, cuda.kernels.affine4_pack);
++        errdefer a.mods[2].unload();
++        a.wide = try cuda.qlinear.AffineNKernels.resolve(d, a.mods[0], a.mods[1], a.mods[2], sms, gb10);
++        errdefer a.wide.deinit();
++        a.act = try cuda.act_rows.ActRows.load(d);
++        errdefer a.act.unload();
++        a.linears = try linears.loadAll(gpa, io, d, stream, &a.wide, pack, bindings);
++        return a;
++    }
++
++    pub fn deinit(a: *Affine) void {
++        a.linears.deinit();
++        a.act.unload();
++        a.wide.deinit();
++        a.mods[2].unload();
++        a.mods[1].unload();
++        a.mods[0].unload();
++        a.* = undefined;
++    }
++
++    pub fn bytes(a: *const Affine) u64 {
++        return a.linears.bytes();
++    }
++
++    /// One affine projection: `x` device bf16 [rows, k], `y` device bf16 [rows, n].
++    /// Decode rows (<= 16) take the group sums kernel; wider windows use the prompt GEMM.
++    pub fn linear(
++        a: *const Affine,
++        stream: cuda.Stream,
++        sums: u64,
++        id: u64,
++        x: u64,
++        y: u64,
++        rows: usize,
++        k: usize,
++        n: usize,
++    ) !void {
++        const item = a.linears.getHashed(id) orelse return error.UnknownAffine;
++        if (item.k != k or item.n != n or rows == 0 or k % 64 != 0) return error.BadShape;
++        if (rows <= 16) {
++            if (sums == 0) return error.BadShape;
++            try a.act.groupSums(stream, x, k, sums, rows, k);
++            try a.wide.decode(stream, x, sums, item.tiles.an, y, rows);
++        } else try a.wide.prompt(stream, x, item.tiles.an, y, rows);
++    }
++};
++
++test "an affine name hash is stable and fits a call's integer argument" {
++    const h = linears.nameHash("layers.0.attn.wq_a");
++    try std.testing.expectEqual(h, linears.nameHash("layers.0.attn.wq_a"));
++    try std.testing.expect(h != linears.nameHash("layers.0.attn.wq_b"));
++    try std.testing.expect(h <= std.math.maxInt(i64));
++}
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index a0494f8..11114e8 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -155,14 +155,15 @@ fn runLinear(
+     std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
+ 
+     if (std.mem.eql(u8, name, module_name)) {
+-        const xd = try cuda.DeviceBuffer.fromHost(driver, x1);
++        var xd = try cuda.DeviceBuffer.fromHost(driver, x1);
+         defer xd.free();
+         var od = try cuda.DeviceBuffer.alloc(driver, chosen.n * 2);
+         defer od.free();
+         try affine_launch.linearDev(driver, stream, wide, act, &tiles, xd.ptr, 1, od.ptr);
+         try stream.synchronize();
+-        const bd = try od.download(driver, gpa);
++        const bd = try gpa.alloc(u8, od.len);
+         defer gpa.free(bd);
++        try od.download(0, bd);
+         const vd = named.bf16Widen(std.mem.readInt(u16, bd[0..2], .little));
+         std.log.info("affine smoke dev {s}: y[0] ones={d:.6}", .{ name, vd });
+     }
+@@ -303,13 +304,13 @@ fn runAttentionChain(
+     const x1 = try gpa.alloc(u8, hidden * 2);
+     defer gpa.free(x1);
+     for (0..hidden) |i| std.mem.writeInt(u16, x1[2 * i ..][0..2], bf16(1.0), .little);
+-    const xd = try cuda.DeviceBuffer.fromHost(driver, x1);
++    var xd = try cuda.DeviceBuffer.fromHost(driver, x1);
+     defer xd.free();
+-    const attn_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(attn_w));
++    var attn_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(attn_w));
+     defer attn_d.free();
+-    const qw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(q_w));
++    var qw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(q_w));
+     defer qw_d.free();
+-    const kvw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(kv_w));
++    var kvw_d = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(kv_w));
+     defer kvw_d.free();
+     var xn = try cuda.DeviceBuffer.alloc(driver, hidden * 2);
+     defer xn.free();
+@@ -334,14 +335,18 @@ fn runAttentionChain(
+     try norms.rms(stream, kv.ptr, .bf16, kvw_d.ptr, kvn.ptr, .bf16, 1, head_dim, cfg.eps);
+     try stream.synchronize();
+ 
+-    const qa_b = try qa.download(driver, gpa);
++    const qa_b = try gpa.alloc(u8, qa.len);
+     defer gpa.free(qa_b);
+-    const q_b = try q.download(driver, gpa);
++    try qa.download(0, qa_b);
++    const q_b = try gpa.alloc(u8, q.len);
+     defer gpa.free(q_b);
+-    const kv_b = try kv.download(driver, gpa);
++    try q.download(0, q_b);
++    const kv_b = try gpa.alloc(u8, kv.len);
+     defer gpa.free(kv_b);
+-    const kvn_b = try kvn.download(driver, gpa);
++    try kv.download(0, kv_b);
++    const kvn_b = try gpa.alloc(u8, kvn.len);
+     defer gpa.free(kvn_b);
++    try kvn.download(0, kvn_b);
+     std.log.info("affine smoke attn layers.0: qa0={d:.6} q0={d:.6} kv0={d:.6} kvn0={d:.6}", .{
+         named.bf16Widen(std.mem.readInt(u16, qa_b[0..2], .little)),
+         named.bf16Widen(std.mem.readInt(u16, q_b[0..2], .little)),
+diff --git a/zig/src/families/deepseek_v41/block.zig b/zig/src/families/deepseek_v41/block.zig
+index f247daf..b498f74 100644
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const dk = @import("dsv41_kernels");
+ const calls = @import("block_calls.zig");
++const affine_linears = @import("affine_linears.zig");
+ const config = @import("config.zig");
+ const knob_types = @import("knob_types.zig");
+ const moe = @import("block_moe.zig");
+@@ -363,6 +364,59 @@ pub const Emitter = struct {
+         }
+     }
+ 
++    /// One affine projection: a `tf_dsv41_affine_v1.linear` call naming the resident packed
++    /// linear by hash, with an output view when the group writes one column range.
++    pub fn affineProj(e: *Emitter, p: Proj) !void {
++        const xt = p.x.t;
++        if (xt.dt != .bf16 or xt.shape.len != 2 or xt.shape[0] != e.n or xt.shape[1] != @as(i64, @intCast(p.k)) or xt.stride[0] != @as(i64, @intCast(p.k)))
++            return error.AffineInput;
++        const yt = p.y.t;
++        if (yt.dt != .bf16 or yt.stride.len != 2 or yt.shape.len != 2) return error.AffineOutput;
++        const direct = p.col == 0 and yt.stride[0] == @as(i64, @intCast(p.n));
++        const out = if (direct) p.y else try e.buf("L.affine.{s}.out", .{p.w}, .bf16, &.{ e.n, @intCast(p.n) });
++        try e.ext("tf_dsv41_affine_v1.linear", &.{ p.x, out, .{ .i = @intCast(affine_linears.nameHash(p.w)) }, .{ .i = @intCast(p.k) }, .{ .i = @intCast(p.n) } });
++        if (!direct) try e.glue("copy_cols", &.{ out, p.y, .{ .i = @intCast(p.col) } });
++    }
++
++    /// The projections of a fused group: affine calls one by one, else the EXL3 fused launch.
++    pub fn proj(e: *Emitter, tag: []const u8, ps: []const Proj) !void {
++        if (e.cfg.format == .affine) {
++            for (ps) |p| try e.affineProj(p);
++            return;
++        }
++        try e.fused(tag, ps);
++    }
++
++    /// `proj` with `r1`'s RMS_FOLD: the affine path has no rot_in to fold the norm into.
++    pub fn projNorm(e: *Emitter, tag: []const u8, ps: []const Proj, norm: ?Norm) !void {
++        if (e.cfg.format == .affine) {
++            if (norm != null) return error.AffineNormFoldUnsupported;
++            return e.proj(tag, ps);
++        }
++        try e.fusedNorm(tag, ps, norm);
++    }
++
++    /// Upstream's rot_in + linear, or the affine module's call.
++    pub fn upstreamOrAffine(e: *Emitter, w: []const u8, x: Arg, k: i64, n: i64, y: Arg) !void {
++        if (e.cfg.format == .affine) return e.affineProj(.{ .w = w, .x = x, .k = @intCast(k), .n = @intCast(n), .y = y });
++        return e.upstream(w, x, k, n, y);
++    }
++
++    /// One BF16 block of a dense group (`wo_a` in the affine checkpoint): `_plain` over a row view
++    /// of the whole `[groups * n, k]` tensor. `x_rs` is the input's full row stride.
++    pub fn denseGroup(e: *Emitter, base: []const u8, group: usize, x: Arg, x_rs: i64, k: i64, n: i64, y: Arg, col: usize) !void {
++        const w = try e.view(.{ .weight = base }, .bf16, &.{ n, k }, &.{ k, 1 }, @as(i64, @intCast(group)) * n * k * 2);
++        const out = try e.buf("L.{s}.g{d}", .{ base, group }, .bf16, &.{ e.n, n });
++        try e.triton("_plain", .{ e.n, n, 1 }, &.{
++            .{ .name = "X", .arg = x },                 .{ .name = "x_rs", .arg = .{ .i = x_rs } },
++            .{ .name = "W", .arg = w },                 .{ .name = "w_rs", .arg = .{ .i = k } },
++            .{ .name = "OUT", .arg = out },             .{ .name = "K", .arg = .{ .i = k } },
++            .{ .name = "N", .arg = .{ .i = n } },       .{ .name = "BK", .arg = .{ .i = 256 } },
++            .{ .name = "PDL", .arg = .{ .b = false } }, .{ .name = "BF16", .arg = .{ .b = true } },
++        });
++        try e.glue("copy_cols", &.{ out, y, .{ .i = @intCast(col) } });
++    }
++
+     /// Upstream's rot_in + linear: one projection, its trellis as strips unless one 128-column block.
+     pub fn upstream(e: *Emitter, w: []const u8, x: Arg, k: i64, n: i64, y: Arg) !void {
+         const k2: i64 = try e.w.k2(w);
+diff --git a/zig/src/families/deepseek_v41/block_attn.zig b/zig/src/families/deepseek_v41/block_attn.zig
+index 308d3b3..76d7557 100644
+--- a/zig/src/families/deepseek_v41/block_attn.zig
++++ b/zig/src/families/deepseek_v41/block_attn.zig
+@@ -218,7 +218,7 @@ pub fn attention(e: *Emitter, L: u32) !void {
+         1 => kv,
+         else => comp,
+     }, .col = if (i == 3) @intCast(hd) else 0 };
+-    try e.fused("x", ps[0..xg.ws.len]);
++    try e.proj("x", ps[0..xg.ws.len]);
+     const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, e.cfg.q_lora });
+     const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ n, hd });
+     // `r1` (RMS_FOLD): no launch here; q_norm runs in its consumers' rot_in, kv_norm beside the SWA store
+@@ -255,7 +255,7 @@ pub fn attention(e: *Emitter, L: u32) !void {
+         });
+         try e.kvStore(lat, L, ratio);
+         const kp = try e.buf("L.ix_k", .{}, .bf16, &.{ n, ID });
+-        try e.upstream(try e.fmt("L{d}.attn.ix_wk", .{L}), lat, hd, ID, kp);
++        try e.upstreamOrAffine(try e.fmt("L{d}.attn.ix_wk", .{L}), lat, hd, ID, kp);
+         const kpg = try e.paging(ratio, false);
+         try e.triton("_index_k", .{ n, 1, 1 }, &.{
+             .{ .name = "KP", .arg = kp },                                                    .{ .name = "k_stride", .arg = .{ .i = ID } },
+@@ -276,7 +276,7 @@ pub fn attention(e: *Emitter, L: u32) !void {
+     e.onMain();
+     // q group: wq_b
+     const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
+-    try e.fusedNorm("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = if (e.o.r1) qa else qn, .y = q, .k = e.cfg.q_lora, .n = @intCast(H * hd) }}, qnorm);
++    try e.projNorm("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = if (e.o.r1) qa else qn, .y = q, .k = e.cfg.q_lora, .n = @intCast(H * hd) }}, qnorm);
+     try e.prefetchO(L);
+     if (!e.o.r1) try e.rope(q, H, hd, hd - 64); // `r1` (ATTN_ROPE): the attention kernel rotates q as it loads it
+     if (indexer) try e.swaStore(L, kv, kvn);
+@@ -339,6 +339,10 @@ pub fn attention(e: *Emitter, L: u32) !void {
+         .k = @intCast(gk),
+         .n = e.cfg.o_lora,
+     };
+-    try e.fused("o", po[0..g]);
+-    try e.fused("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = g * e.cfg.o_lora, .n = @intCast(D) }});
++    if (e.cfg.format == .affine) {
++        const base = try e.fmt("L{d}.attn.wo_a", .{L});
++        const ol: i64 = @intCast(e.cfg.o_lora);
++        for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, e.cfg.o_lora));
++    } else try e.fused("o", po[0..g]);
++    try e.proj("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = g * e.cfg.o_lora, .n = @intCast(D) }});
+ }
+diff --git a/zig/src/families/deepseek_v41/block_test.zig b/zig/src/families/deepseek_v41/block_test.zig
+index 93a3589..53629e9 100644
+--- a/zig/src/families/deepseek_v41/block_test.zig
++++ b/zig/src/families/deepseek_v41/block_test.zig
+@@ -107,3 +107,31 @@ test "branch row threshold falls back to the main stream above its limit" {
+     const program = try block.emit(a, &cfg, &w, .{ .branches = true, .branch_rows = 1 }, &.{0}, 8, 0, false);
+     for (program) |call| try std.testing.expect(!call.side and !call.fork and !call.join);
+ }
++
++test "affine format emits affine projections and a dense wo_a group" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const w = try widths(a);
++    var c: Config = .{};
++    c.format = .affine;
++    const cs = try block.emit(a, &c, &w, .{}, &.{0}, 1, 0, false);
++    var affine: usize = 0;
++    var dense: usize = 0;
++    for (cs) |call| {
++        if (std.mem.eql(u8, call.name, "tf_dsv41_affine_v1.linear")) {
++            affine += 1;
++            try t.expectEqual(@as(usize, 5), call.args.len);
++            const id = call.args[2].arg.i;
++            try t.expect(id > 0);
++            const k = call.args[3].arg.i;
++            const n = call.args[4].arg.i;
++            try t.expect(k > 0 and n > 0);
++            try t.expect(call.args[0].arg == .t and call.args[1].arg == .t);
++        } else if (std.mem.eql(u8, call.name, "tensorfold_exl3_linear_v4.linear")) {
++            return error.TestUnexpectedResult;
++        } else if (std.mem.eql(u8, call.name, "_plain")) dense += 1;
++    }
++    try t.expectEqual(@as(usize, 4), affine); // wq_a, wkv, wq_b, wo_b
++    try t.expectEqual(@as(usize, 8), dense); // wo_a's eight rank groups
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 46ad970..a9ded77 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -86,6 +86,8 @@ pub const Model = struct {
+     ctx: cuda.Context,
+     stream: cuda.Stream,
+     kernels: dk.Kernels,
++    /// affine checkpoints: `affine8`/`affine_prefill`/`affine4_pack`, `act_rows`, resident linears
++    affine: ?@import("affine_runtime.zig").Affine = null,
+     session: tp.Session,
+     benchmark_group: ?[]const u8,
+     cfg: Config,
+@@ -149,6 +151,7 @@ pub const Model = struct {
+         const stall_ns = try @import("round_progress.zig").timeoutNs(if (std.c.getenv("TF_DSV41_STALL_EXIT_S")) |v| std.mem.span(v) else null);
+         // gpa.create applies no field defaults: optional parts start null so close() never frees garbage
+         m.pass = null;
++        m.affine = null;
+         m.l2pf = null;
+         m.sessions = null;
+         m.slots = 1;
+@@ -203,6 +206,10 @@ pub const Model = struct {
+     pub fn bootAborted(m: *Model, err: anyerror) void {
+         _ = m.supervisor.?.check();
+         m.supervisor.?.stop();
++        if (m.affine) |*a| {
++            a.deinit();
++            m.affine = null;
++        }
+         if (m.ctx.synchronize()) |_| m.session.bootFailed(err) else |_| {}
+     }
+ 
+@@ -251,22 +258,11 @@ pub const Model = struct {
+                 @as(f64, @floatFromInt(budget.totalPacked())) / (1 << 30),
+             });
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", false)) {
+-                const kk = cuda.kernels;
+-                if (!kk.available) return error.BuiltWithoutKernels;
+-                var m8 = try cuda.Module.load(&m.driver, kk.affine8);
+-                defer m8.unload();
+-                var mp = try cuda.Module.load(&m.driver, kk.affine_prefill);
+-                defer mp.unload();
+-                var m4 = try cuda.Module.load(&m.driver, kk.affine4_pack);
+-                defer m4.unload();
+                 const sms: usize = @intCast(try m.ctx.attribute(.multiprocessor_count));
+                 const major = try m.ctx.attribute(.compute_capability_major);
+                 const minor = try m.ctx.attribute(.compute_capability_minor);
+-                var wide = try cuda.qlinear.AffineNKernels.resolve(&m.driver, m8, mp, m4, sms, major == 12 and minor == 1);
+-                defer wide.deinit();
+-                var set = try @import("affine_linears.zig").loadAll(gpa, io, &m.driver, m.stream, &wide, &m.pack, bindings.items);
+-                defer set.deinit();
+-                if (!quiet) std.log.info("dsv41 affine load: {d} linears packed, {d:.2} GiB", .{ set.items.len, @as(f64, @floatFromInt(set.bytes())) / (1 << 30) });
++                m.affine = try @import("affine_runtime.zig").Affine.load(gpa, io, &m.driver, m.stream, &m.pack, bindings.items, sms, major == 12 and minor == 1);
++                if (!quiet) std.log.info("dsv41 affine load: {d} linears packed, {d:.2} GiB", .{ m.affine.?.linears.items.len, @as(f64, @floatFromInt(m.affine.?.bytes())) / (1 << 30) });
+             }
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
+                 m.weights = .{ .gpa = gpa, .digest = false };
+@@ -296,7 +292,7 @@ pub const Model = struct {
+                     }
+                 }
+             }
+-            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; dispatch: {d} affine8 linears, {d} expert fallbacks, {d} mxfp8, {d} mxfp4; forward not ported yet", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears, dispatch.linear, dispatch.expert, dispatch.mxfp8, dispatch.mxfp4 });
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; dispatch: {d} affine8 linears, {d} expert fallbacks, {d} mxfp8, {d} mxfp4; affine emitter ready, dense/MoE forward pending", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears, dispatch.linear, dispatch.expert, dispatch.mxfp8, dispatch.mxfp4 });
+             return error.AffineForwardNotPorted;
+         }
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+@@ -375,6 +371,7 @@ pub const Model = struct {
+         try @import("aot_trace.zig").attach(gpa, io, &m.aot, @import("aot_trace.zig").pathFromEnv());
+         m.widths = try gate_forward.widths(a, &m.weights, &m.pl);
+         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
++        if (m.affine != null) m.runner.affine = &m.affine.?;
+         // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed, JSON written at close
+         m.runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &m.driver)) |p| p.timer() else null;
+         const topp = try @import("sys").environment.read(?f64, "TF_DSV41_EXPERT_TOPP", null);
+@@ -597,6 +594,10 @@ pub const Model = struct {
+         m.supervisor = null;
+         m.session.close();
+         m.kernels.deinit();
++        if (m.affine) |*a| {
++            a.deinit();
++            m.affine = null;
++        }
+         m.stream.deinit();
+         if (m.dev_arena) |x| x.deinit(gpa);
+         m.ctx.deinit();
+diff --git a/zig/src/families/deepseek_v41/forward_glue.zig b/zig/src/families/deepseek_v41/forward_glue.zig
+index 5634bf6..5cfda55 100644
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -140,6 +140,24 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
+     }
+     if (std.mem.eql(u8, step, "kit_weights"))
+         return k.kitWeights(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
++    if (std.mem.eql(u8, step, "copy_cols")) {
++        // a contiguous [rows, cols] block into `dst`'s columns at `col` (affine groups write contiguously)
++        const src = c.args[0].arg.t;
++        const dst = c.args[1].arg.t;
++        const col: usize = @intCast(c.args[2].arg.i);
++        const rows: usize = @intCast(src.shape[0]);
++        const cols: usize = @intCast(src.shape[1]);
++        if (col + cols > @as(usize, @intCast(dst.shape[1]))) return error.BadGlue;
++        const copy: cuda.abi.Memcpy2D = .{
++            .src = try r.tensorAddr(src),
++            .src_pitch = cols * 2,
++            .dst = try r.tensorAddr(dst) + col * 2,
++            .dst_pitch = @as(usize, @intCast(dst.shape[1])) * 2,
++            .width = cols * 2,
++            .height = rows,
++        };
++        return r.d.check(r.d.api.cuMemcpy2DAsync_v2(&copy, s), "cuMemcpy2DAsync");
++    }
+     if (std.mem.eql(u8, step, "kit_logits")) return k.kitLogits(try r.tensorAddr(c.args[0].arg.t), numel(c.args[0].arg.t));
+     if (std.mem.eql(u8, step, "engram_rows")) {
+         if (g) |gr| return f.engramGathered(gr, r, c);
+diff --git a/zig/src/families/deepseek_v41/run.zig b/zig/src/families/deepseek_v41/run.zig
+index 1ff0441..e8af968 100644
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -8,6 +8,7 @@ const buffers = @import("buffers.zig");
+ const load = @import("cuda_weights.zig");
+ const tc = @import("triton_call.zig");
+ const rp = dk.replay;
++const affine_runtime = @import("affine_runtime.zig");
+ 
+ /// A call timer behind the runner (profile.zig's Profile.timer); its methods forward to the timer's own.
+ pub const Timer = struct {
+@@ -54,6 +55,8 @@ pub const Runner = struct {
+     kernels: *const dk.Kernels,
+     triton: *const cuda.aot.Set,
+     weights: *const load.Weights,
++    /// affine checkpoints: the resident packed linears and their kernels, owned by the model
++    affine: ?*affine_runtime.Affine = null,
+     /// role -> device address
+     addrs: std.StringHashMapUnmanaged(u64) = .empty,
+     owned: std.ArrayList(cuda.DeviceBuffer) = .empty,
+@@ -320,11 +323,58 @@ pub const Runner = struct {
+         if (r.dfr) |d| d.open = false;
+     }
+ 
++    /// The parsed arguments of a `tf_dsv41_affine_v1.linear` call.
++    const AffineArgs = struct {
++        x: calls.Tensor,
++        y: calls.Tensor,
++        id: u64,
++        k: usize,
++        n: usize,
++    };
++
++    fn affineArgs(c: *const calls.Call) !AffineArgs {
++        if (c.args.len != 5) return error.BadAffineCall;
++        const xt = switch (c.args[0].arg) {
++            .t => |t| t,
++            else => return error.BadAffineCall,
++        };
++        const yt = switch (c.args[1].arg) {
++            .t => |t| t,
++            else => return error.BadAffineCall,
++        };
++        const id: u64 = @bitCast(switch (c.args[2].arg) {
++            .i => |v| v,
++            else => return error.BadAffineCall,
++        });
++        const k: usize = @intCast(switch (c.args[3].arg) {
++            .i => |v| v,
++            else => return error.BadAffineCall,
++        });
++        const n: usize = @intCast(switch (c.args[4].arg) {
++            .i => |v| v,
++            else => return error.BadAffineCall,
++        });
++        if (xt.dt != .bf16 or yt.dt != .bf16 or xt.shape.len != 2 or yt.shape.len != 2) return error.BadAffineCall;
++        return .{ .x = xt, .y = yt, .id = id, .k = k, .n = n };
++    }
++
++    /// `tf_dsv41_affine_v1.linear(x, y, id, k, n)`: the model's resident packed linear.
++    fn affineCall(r: *Runner, stream: cuda.Stream, c: *const calls.Call, scratch_buf: ?cuda.DeviceBuffer) !void {
++        const a = try affineArgs(c);
++        const rows: usize = @intCast(a.x.shape[0]);
++        const af = r.affine orelse return error.AffineNotLoaded;
++        const sb = scratch_buf orelse return error.ScratchTooSmall;
++        var scratch: rp.Scratch = .{ .ptr = sb.ptr, .len = sb.len };
++        const sums = if (rows <= 16) try scratch.take(try std.math.mul(usize, rows, (a.k / 64) * 4)) else 0;
++        try af.linear(stream, sums, a.id, try r.tensorAddr(a.x), try r.tensorAddr(a.y), rows, a.k, a.n);
++    }
++
+     fn issueOn(r: *Runner, stream: cuda.Stream, c: *const calls.Call, scratch_buf: ?cuda.DeviceBuffer) !void {
+         if (c.glue) {
+             const g = r.glue orelse return error.NoGlue;
+             return g.run(g.ctx, r, c);
+         }
++        if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.linear")) return r.affineCall(stream, c, scratch_buf);
+         var arena = std.heap.ArenaAllocator.init(r.gpa);
+         defer arena.deinit();
+         const a = arena.allocator();
+@@ -541,3 +591,24 @@ fn syncEach() !bool {
+     sync_each = v;
+     return v;
+ }
++
++test "an affine call carries x, y, the name hash, and its shape" {
++    const xs = [_]i64{ 1, 64 };
++    const ys = [_]i64{ 1, 128 };
++    const xstr = [_]i64{ 64, 1 };
++    const ystr = [_]i64{ 128, 1 };
++    const args = [_]calls.Named{
++        .{ .name = "x", .arg = .{ .t = .{ .role = .{ .buf = "L.qn" }, .dt = .bf16, .shape = &xs, .stride = &xstr } } },
++        .{ .name = "y", .arg = .{ .t = .{ .role = .{ .buf = "L.q" }, .dt = .bf16, .shape = &ys, .stride = &ystr } } },
++        .{ .name = "id", .arg = .{ .i = 12345 } },
++        .{ .name = "k", .arg = .{ .i = 64 } },
++        .{ .name = "n", .arg = .{ .i = 128 } },
++    };
++    const c: calls.Call = .{ .triton = false, .name = "tf_dsv41_affine_v1.linear", .args = &args };
++    const a = try Runner.affineArgs(&c);
++    try std.testing.expectEqual(@as(u64, 12345), a.id);
++    try std.testing.expectEqual(@as(usize, 64), a.k);
++    try std.testing.expectEqual(@as(usize, 128), a.n);
++    try std.testing.expectEqual(@as(i64, 1), a.x.shape[0]);
++    try std.testing.expectEqual(@as(i64, 128), a.y.shape[1]);
++}
