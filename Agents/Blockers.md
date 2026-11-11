@@ -107,7 +107,9 @@ The target is not uniformly affine. Its omlx map has:
 The DSpark head is the full model's release-format head, not an affine quant. The dsv41 loader
 must admit per-module affine, MXFP8, MXFP4, and dense formats. Upstream's `release_fp8` path
 handles the release's FP8/MXFP4 blocks, and the Qwen affine reader handles affine, but neither
-combines them in one dsv41 checkpoint.
+combines them in one dsv41 checkpoint. The affine path currently refuses
+`TF_DSV41_DRAFTS=1` (`AffineDSparkUnsupported`) and `TF_DSV41_OWN_PREFILL=0`
+(`AffinePrefillUnsupported`) until the mixed DSpark and prefill emitters are wired.
 
 ### B7. Vision, tokenizer, chat template
 

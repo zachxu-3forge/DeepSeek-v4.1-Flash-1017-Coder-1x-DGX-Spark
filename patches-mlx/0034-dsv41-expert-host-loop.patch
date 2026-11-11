@@ -169,6 +169,19 @@ index 13666dc..6a3cbc5 100644
      /// One affine projection: `x` device bf16 [rows, k], `y` device bf16 [rows, n].
      /// Decode rows (<= 16) take the group sums kernel; wider windows use the prompt GEMM.
      pub fn linear(
+diff --git a/zig/src/families/deepseek_v41/block_index.zig b/zig/src/families/deepseek_v41/block_index.zig
+index 3e5019c..0846323 100644
+--- a/zig/src/families/deepseek_v41/block_index.zig
++++ b/zig/src/families/deepseek_v41/block_index.zig
+@@ -45,7 +45,7 @@ pub fn index(e: *Emitter, L: u32, qn: Arg, iw: Arg, qnorm: ?Norm) !void {
+     const IH: i64 = e.cfg.index_heads;
+     const ID: i64 = e.cfg.index_dim;
+     const qi = try e.buf("L.qi", .{}, .bf16, &.{ n, IH * ID });
+-    try e.fusedNorm("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }}, qnorm);
++    try e.projNorm("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }}, qnorm);
+     try e.rope(qi, IH, ID, ID - 64);
+     const reindex = e.cfg.mode(L) == .reindex;
+     const src = if (reindex) e.cfg.kvSource(L).? else L;
 diff --git a/zig/src/families/deepseek_v41/block_moe.zig b/zig/src/families/deepseek_v41/block_moe.zig
 index 6f14d73..9438404 100644
 --- a/zig/src/families/deepseek_v41/block_moe.zig
@@ -260,10 +273,19 @@ index 3b15c49..fd7f0f8 100644
 +    try t.expectEqual(@as(usize, 8), dense); // wo_a's eight full-rank groups
 +}
 diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
-index d165c41..659e78a 100644
+index d165c41..da42e3e 100644
 --- a/zig/src/families/deepseek_v41/cuda_model.zig
 +++ b/zig/src/families/deepseek_v41/cuda_model.zig
-@@ -271,8 +271,8 @@ pub const Model = struct {
+@@ -237,6 +237,8 @@ pub const Model = struct {
+         if (o.own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
+         m.pack = try Pack.open(gpa, io, pack_dir);
+         if (m.cfg.format == .affine) {
++            if (o.drafts) return error.AffineDSparkUnsupported;
++            if (!o.own_prefill) return error.AffinePrefillUnsupported;
+             const cfg_path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
+             const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
+             defer gpa.free(cfg_text);
+@@ -271,8 +273,8 @@ pub const Model = struct {
                  const sms: usize = @intCast(try m.ctx.attribute(.multiprocessor_count));
                  const major = try m.ctx.attribute(.compute_capability_major);
                  const minor = try m.ctx.attribute(.compute_capability_minor);
