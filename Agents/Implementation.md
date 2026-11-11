@@ -18,14 +18,14 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Decisions recorded; layer-0 attention projection chain added offline; GPU runs deferred |
+| Overall status | External recipe reviewed; 600K rope.bin and GPU verification next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`/`0026` rebuild pending) |
-| Last updated | 2026-11-10 |
+| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0031` rebuild pending) |
+| Last updated | 2026-11-11 |
 
 ## Phase tracker
 
@@ -61,6 +61,10 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D14 | 2026-11-10 | Use a host-loop expert fallback for Stage 1; add a device kernel for throughput later | Device kernel first | The host loop reuses the tested `packExpert`/`AffineN` path and gets the one-layer gate correct sooner; the sync cost is acceptable for a correctness milestone |
 | D15 | 2026-11-10 | Read the target's native 4-bit Engram tables, streamed from SSD | FP8 conversion | 160 B/row (~114 GiB) is smaller than 264 B/row (~188.83 GiB) and avoids E4M3 requantization loss. The converter remains a fallback/tool |
 | D16 | 2026-11-10 | Target 600K context with YaRN; 1M is out | 32K/64K only, or 1M | YaRN already scales 65,536 to 1,048,576. 600K estimates at 125.05 GiB including reserve (~2.95 GiB headroom); measure live before fixing it |
+| D17 | 2026-11-11 | Generate dsv41 `rope.bin` for 600K + a prefill segment; cross-check with `core/rope_yarn.zig` and the MiaAI `yarn.py` formulas | Runtime YaRN override or a 1M table | 600K needs a table, not a new factor. The model already has factor 16; a 1M table is wasted rows. Confirm whether `mscale` is baked into the table or applied by the kernel |
+| D18 | 2026-11-11 | Measure 600K with bf16 KV first; defer dsv41 FP8 KV | Port FP8 KV immediately | dsv41 CUDA does not wire `kv8`; 600K bf16 KV is 13.05 GiB. The MiaAI FP8 cache quality (KL 0.0031, 98.7% top-1) is evidence if headroom is too small |
+| D19 | 2026-11-11 | Use a 4-8 GiB memory reserve, not 0, on a shared box; pin a KV pool only if `TF_DSV41_POOL_TOKENS`/`kv_pool` does not already pin | Copy MiaAI’s reserve 0 / PyTorch pool code | Reserve 0 risks freezing unified-memory hosts; the pool code is PyTorch-specific. Adopt the admission/refusal policy, not the code |
+| D20 | 2026-11-11 | Do not port the MiaAI patches; adopt its config/start script and measurement-table patterns | Cherry-pick `qwen3_5` patches | Those patches target TensorFold v0.6.0 Python/Triton; this base is 1.2.5 Zig/CUDA |
 
 ## Work log
 
@@ -85,6 +89,22 @@ next step.
   114.85 GiB; **600K 125.05 GiB (2.95 GiB headroom)**; 1M 134.81 GiB (does not fit).
 - **Next:** when the GPU is free, rebuild with `0025`/`0026` and run the 8/6/2-bit
   smoke; then the one-layer forward.
+
+### 2026-11-11 - External recipe review: MiaAI Qwen3.8
+
+- **Phase:** planning / Phase 2 preparation.
+- **Reviewed:** `MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold` README and patches `0002`-`0005`.
+  It runs TensorFold v0.6.0's Python/Triton `qwen3_5` engine, so its patches do not apply to
+  this 1.2.5 Zig/CUDA `deepseek_v41` base.
+- **Useful:** the YaRN `inv_freq`/`mscale` formulas (a cross-check for `core/rope_yarn.zig`);
+  the FP8-KV quality data (KL 0.0031, 98.7% top-1) and round/widen discipline; the
+  reserve/pinned-pool admission policy; the `config.sh`/`.env`/start-stop and measurement-table
+  patterns.
+- **Not portable:** `qwen3_5` Triton patches, image/video, DFlash2, Qwen geometry, the PyTorch
+  `PoolGate`, and the `YARN_FACTOR` override (this model already has factor 16).
+- **Concrete changes:** D17-D20 above. The immediate blocker is a 600K `rope.bin` covering the
+  context limit plus a prefill segment; then measure 600K with bf16 KV and a 4-8 GiB reserve.
+- **Artifacts:** `Agents.md`, `Agents/Implementation.md`, `Agents/Blockers.md`.
 
 ### 2026-11-10 - Layer-0 attention projection chain
 
@@ -709,18 +729,20 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 - Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
 - Engram: the native 4-bit reader is chosen (160 B/row, ~114 GiB, streamed from SSD, no E4M3 requantization). The FP8 converter remains a fallback; `engram.json` and RoPE assets are still required.
+- 600K: bf16 KV is 13.05 GiB; total 125.05 GiB with a 10 GiB reserve, leaving 2.95 GiB. Generate `rope.bin` for 600K plus a prefill segment and measure with a 4-8 GiB reserve before fixing the default. dsv41 CUDA has no `kv8`; FP8 KV is deferred until measurement.
+- Check `TF_DSV41_POOL_TOKENS`/`kv_pool`: if attention caches are not already pinned, adopt the pinned-pool admission policy (not MiaAI's PyTorch code) so KV is not taken by other workloads.
 - Phase 0 harness and image build are done; the projection guard and one-projection smoke pass on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture. It builds and admits.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan. MXFP4 will be requantized to affine-4/group-64 for the native `Affine4Experts`.
-- Runtime assets: `TF_DSV41_ASSETS` expects RoPE tables and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load. The RoPE table must cover 600K positions.
+- Runtime assets: `TF_DSV41_ASSETS` expects the 600K `rope.bin` and `engram.json`; the target repo does not ship them. The fork's kit may be reusable, but this must be verified before a full-model load. The RoPE table must cover 600K positions.
 - Docker is not installed on the local Windows host; the build runs on the Spark.
 - The base-image digest is `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`.
 - The `dsv41-serve` build and the upstream dsv41 family are verified by the Spark guard and smoke.
 
 ## Next actions
 
-1. Integrate affine projections into the dsv41 emitter; use the host-loop expert fallback for the one-layer gate.
-2. Wire the per-expert fallback loop for the 120 two-bit expert stacks; add the layer-0 attention/MoE forward and a full-layer reference.
+1. Generate and verify the 600K `rope.bin` (600K + prefill segment); measure 600K with bf16 KV and a 4-8 GiB reserve. Check whether `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention.
+2. Integrate affine projections into the dsv41 emitter; use the host-loop expert fallback for the one-layer gate; add the layer-0 attention/MoE forward and a full-layer reference.
 3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`.
-4. Add the native 4-bit Engram reader and 600K RoPE assets; measure 600K memory.
+4. Add the native 4-bit Engram reader and stream it from SSD.
 5. Then full model, server/vision, and qualification.

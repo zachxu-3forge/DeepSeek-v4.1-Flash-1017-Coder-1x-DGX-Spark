@@ -130,13 +130,35 @@ concern, not a host concern.
 The engine expects `TF_DSV41_ASSETS`: RoPE tables, `engram.json`, and the related runtime
 metadata. The target ships config, tokenizer, chat template, and safetensors only. The fork's
 `kit/` is built for the EXL3 model; the dimensions and vocabulary match, so it may be reusable,
-but this must be verified before a full-model load.
+but this must be verified before a full-model load. The CUDA dsv41 path reads
+`boot_mem.uploadRope`'s `rope.bin` (two f32 `[rows,64]` tables); the target has no such file.
+
+### B11. 600K rope table and memory headroom
+
+At 600K, the conservative bf16 KV is 13.05 GiB. With 98 GiB weights, 4 GiB overhead, and a
+10 GiB reserve, the total is 125.05 GiB, leaving 2.95 GiB. This fits on paper but is tight.
+A `rope.bin` covering 600K plus a prefill segment must be generated and verified; the model's
+YaRN factor is 16 from 65,536, so no runtime factor change is needed. Measure with a 4-8 GiB
+reserve before fixing the default. 1M is 134.81 GiB and does not fit.
+
+A pinned KV pool would keep this memory from being taken by another workload. Check whether
+`TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention caches; if not, adopt the admission
+policy (startup estimate plus a named largest fitting context), not MiaAI's PyTorch code.
+
+### B12. dsv41 CUDA has no FP8 KV cache
+
+The generic engine API has a `kv8` option, but dsv41's CUDA cache does not wire it. MiaAI's
+Qwen3.8 FP8 cache halves KV with KL 0.0031 and 98.7% top-1 agreement, but that code is Python/
+Triton and not portable. Use bf16 KV first; port FP8 KV only if 600K measurement leaves less
+than a safe margin. If ported, round keys/values through e4m3 before use and widen prompt rows
+to bf16, as their patch does, so draft and serial reads agree.
 
 ## Memory reality on one Spark
 
-97-99 GB resident plus KV cache. A 128 GB Mac leaves about 7 GB headroom; DGX Spark OS/driver
-overhead is comparable or worse. Short context may fit; 1,048,576 tokens will not. Engram must
-stream from SSD, and the repo's existing Engram AIO/spill paths are for the base-model format.
+83.4 GiB affine plus dense/native weights (~98 GB total), plus KV. At 32K the conservative
+total is 112.7 GiB (15.3 GiB headroom); at 600K it is 125.05 GiB (2.95 GiB headroom); 1M is
+134.8 GiB and does not fit. Engram must stream from SSD, and the repo's existing Engram AIO/
+spill paths are for the base-model format.
 
 ## Consequence
 

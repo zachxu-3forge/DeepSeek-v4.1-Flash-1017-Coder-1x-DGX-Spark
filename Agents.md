@@ -32,6 +32,24 @@ Risk: upstream's DeepSeek-V4.1 family is unreleased and PR #827 is closed/unmerg
 must prove the family builds and runs a tiny fixture before committing to it. If it does not,
 fall back to the fork base and port affine + world 1 into it.
 
+## External reference: MiaAI-Lab Qwen3.8 recipe
+
+`MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold` runs TensorFold v0.6.0's Python/Triton
+`qwen3_5` engine, not this Zig/CUDA `deepseek_v41` base. Its patches do not apply; use it as
+evidence and a design reference:
+
+- **YaRN:** its `yarn.py` matches `core/rope_yarn.zig` (beta 32/1, `mscale = 0.1 ln(factor) + 1`).
+  Use it to cross-check a 600K `rope.bin`, and confirm whether `mscale` is baked into the table
+  or applied by the kernel.
+- **FP8 KV:** its e4m3 cache halves KV with KL 0.0031 and 98.7% top-1 agreement. The dsv41 CUDA
+  path does not wire `kv8`; use bf16 first and port FP8 only if 600K does not fit.
+- **Memory:** do not set the reserve to 0 on a shared box; try 4-8 GiB. A pinned pool is a
+  policy to copy, not its PyTorch code; check `TF_DSV41_POOL_TOKENS`/`kv_pool` first.
+- **Operations:** its `config.sh`/`.env`/start-stop scripts, health smoke test, and measurement
+  tables are good patterns for this repo.
+- **Do not port:** the image/video patch, `qwen3_5` Triton kernels, DFlash2, Qwen geometry, or
+  the `YARN_FACTOR` override. This model already has YaRN factor 16 from 65,536.
+
 ## Docker contract
 
 Add `docker/Dockerfile.mlx` (or extend `zig/Dockerfile` behind a build arg) that:
@@ -105,8 +123,11 @@ Tasks:
 
 - Load all 40 layers plus DSpark and the vision tower on one rank.
 - Implement or adapt 2-bit affine expert gather kernels; verify decode and prefill rows.
+- Generate `rope.bin` for 600K plus a prefill segment; verify the YaRN frequencies and
+  `mscale` against `core/rope_yarn.zig` before loading.
 - Add memory admission for ~83.4 GB affine plus dense/native weights and KV; enforce a
-  conservative default context and validate 600K with YaRN.
+  conservative default context and validate 600K with YaRN. Start with a 4-8 GiB reserve;
+  only port dsv41 FP8 KV if bf16 KV does not leave a safe margin.
 - Validate greedy generation against omlx on a fixed prompt for 64-256 tokens (accept small
   divergence only where documented).
 
@@ -146,6 +167,8 @@ inside the container.
 - Run a fixed regression suite (greedy determinism, draft on/off equality where applicable,
   concurrent streams).
 - Document the exact image digest, TensorFold SHA, patch set, and run command.
+- Record the MiaAI-style tables: decode/prefill by stream count, KV dtype quality, memory
+  admission, and what was tuned or deliberately not tuned.
 - Record what is still missing for 1M context.
 
 ## Repo layout
