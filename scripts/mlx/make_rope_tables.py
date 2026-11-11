@@ -111,6 +111,18 @@ def self_test() -> int:
             raise AssertionError(f"YaRN freq {i}: {g!r} != 0x{want:08x}")
     if abs(mscale(4.0) - 1.138629436111989) > 1e-12:
         raise AssertionError(mscale(4.0))
+
+    # The target's spectra: plain window at theta, compressed at compress_theta/factor.
+    window = window_freqs(10000.0)
+    compressed = compressed_freqs(160000.0, 16.0, 65536)
+    base = window_freqs(160000.0)
+    if window[0] != 1.0 or compressed[0] != 1.0:
+        raise AssertionError((window[0], compressed[0]))
+    if abs(compressed[-1] - base[-1] / 16.0) > 1e-9:
+        raise AssertionError((compressed[-1], base[-1] / 16.0))
+    if abs(mscale(16.0) - 1.2772588722239782) > 1e-12:
+        raise AssertionError(mscale(16.0))
+    print("rope tables: dsv41 spectra and mscale 16x are consistent")
     print("rope tables: YaRN frequencies and scale match core/rope_yarn.zig")
     return 0
 
