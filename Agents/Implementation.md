@@ -147,7 +147,7 @@ next step.
 - **Context math:** 600K conservative KV is 13.05 GiB; total with 98 GiB weights, 4 GiB
   overhead, and 10 GiB reserve is 125.05 GiB, leaving 2.95 GiB headroom. 1M is 134.81 GiB.
 - **Format note:** TensorFold's MLX support is affine 2/3/4/5/6/8-bit. The 9 DSpark modules
-  are MXFP4 (E2M1/E8M0, group 32), a different format; requantization is the bridge.
+  are MXFP4 (4-bit codes with E8M0 scales, group 32), a different format; requantization is the bridge.
 - **Artifacts:** `AGENTS.md`, `Agents/Blockers.md`, `Agents/Implementation.md`,
   `scripts/mlx/memory_estimate.py` (600K row).
 
