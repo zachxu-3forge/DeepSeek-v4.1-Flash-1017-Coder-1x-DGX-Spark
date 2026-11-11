@@ -700,10 +700,10 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | AffineN packing | Device tiles for the launch | `affine_pack.zig` allocates and packs word/scale/bias buffers | First device-side affine step | `0016` committed; stub-CUDA test |
 | AffineN launch | Run a projection | `affine_launch.zig` allocates x/sums/out and calls decode/prompt | First actual affine kernel call | `0017` committed; stub-CUDA test |
 | Affine smoke | Compare one projection to golden | `affine_smoke.zig` loads `wq_a`, packs/decodes two rows | Proves reader→pack→launch before the full layer | `0018` committed; GPU run pending |
-| Engram | Convert 4-bit affine tables to engine rows | FP8 E4M3/E8M0 row shards (`264 B/row`) | Matches `engram_rows.zig` without engine changes | Converter + unit checks pass; ~203 GB output |
+| Engram | Read the target's 4-bit affine tables natively | 160 B rows (32 U32 words + 8 BF16 scales + 8 BF16 biases); FP8 264 B remains a fallback | Preserves the checkpoint bytes and avoids ~75 GiB and E4M3 loss | `0035`; decode/reader/packer tests pass; real shards pending |
 | Expert layout | Prefer native stacked gather; else load-time split | Raw reader preserves the stacked `[E, N, packed]` tensor; no split yet | Target has one tensor per projection | `0003` committed |
 | Affine kernels | Reuse upstream affine readers, add dsv41 expert path | Not started | - | - |
-| Engram | Offline convert to `TF_DS_ENGRAM` first | Inspection only | - | Not started |
+| Engram | Pack native rows, keep FP8 fallback | Native 160 B shards by default; `--format fp8` fallback | No requantization; readers take the size from the header | `0035`; tiny release packs and reads |
 | TP/world | World 1 serving path | Not started | - | - |
 | Context | 32K-64K first | Not started | - | - |
 
@@ -711,6 +711,10 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 | Date | Test | Command | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-11 | Native Engram decode | `zig test engram_native_test.zig` | Pass | 5/5: 160 B rows, 64-value prefix, cache, 160/264 headers |
+| 2026-11-11 | Native Engram packer | `test_convert_engram.py` | Pass | Tiny safetensors -> native and FP8 shards; `test_engram.py --shard-dir` |
+| 2026-11-11 | `0035` patch apply | `git apply` on `0001`-`0032` | Pass | Native reader only; `0033`/`0034` not needed |
+| 2026-11-11 | Linux reader type-check | `zig test -target x86_64-linux-gnu -fno-emit-bin` | Pass | Engram reader + test, stub `sys` module |
 | 2026-11-09 | Python syntax | `python -m py_compile scripts/mlx/*.py` | Pass | Local Windows |
 | 2026-11-09 | Shell syntax | `bash -n scripts/mlx/run_container.sh` | Pass | Git Bash |
 | 2026-11-09 | `0001` patch apply | `git apply --check patches-mlx/0001-admit-omlx-affine.patch` | Pass | Against pinned `26e1b074` |
