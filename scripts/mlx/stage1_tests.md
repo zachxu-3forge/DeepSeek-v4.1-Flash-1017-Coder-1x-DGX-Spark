@@ -26,6 +26,8 @@ Runs:
 - `test_translate_config.py`: non-affine `group_size: null` is omitted.
 - `test_plan_dispatch.py`: Engram and `main_proj` are counted in their own buckets.
 - `make_rope_tables.py --self-test`: the 600K YaRN frequencies/scale match `core/rope_yarn.zig`.
+- `make_rope_tables.py --check`: when `$ASSETS_HOST/rope.bin` exists, its header, size,
+  sampled window/YaRN values, and `mscale` are checked.
 - `translate_config.py --check`: every quantized module has its tensors.
 - `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
   fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`

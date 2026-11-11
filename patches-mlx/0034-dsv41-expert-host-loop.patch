@@ -1,0 +1,413 @@
+diff --git a/zig/src/families/deepseek_v41/affine_runtime.zig b/zig/src/families/deepseek_v41/affine_runtime.zig
+index 13666dc..6a3cbc5 100644
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -9,12 +9,28 @@ const cuda = @import("cuda");
+ const Pack = @import("pack.zig").Pack;
+ const exec = @import("affine_exec.zig");
+ const linears = @import("affine_linears.zig");
++const affine_load = @import("affine_load.zig");
++const affine_bind = @import("affine_bind.zig");
++const affine_cuda = @import("affine_cuda.zig");
++const affine_launch = @import("affine_launch.zig");
++const weights_load = @import("cuda_weights.zig");
++
++pub const ExpertModule = struct {
++    name: []const u8,
++    dev: affine_bind.Device,
++    layout: @import("affine.zig").Layout,
++    experts: u32,
++};
+ 
+ pub const Affine = struct {
+     mods: [3]cuda.Module,
+     wide: cuda.qlinear.AffineNKernels,
+     act: cuda.act_rows.ActRows,
+     linears: linears.Set,
++    /// the routed expert stacks, raw on device; the host loop packs one expert at a time
++    experts: []ExpertModule,
++    expert_map: std.StringHashMapUnmanaged(usize),
++    expert_weights: weights_load.Weights,
+ 
+     /// Loads the affine CUDA kernels and packs every affine linear in `bindings`.
+     pub fn load(
+@@ -26,6 +42,9 @@ pub const Affine = struct {
+         bindings: []const exec.Binding,
+         sms: usize,
+         gb10: bool,
++        backbone_experts: u32,
++        dspark_experts: u32,
++        layers: ?[]const u32,
+     ) !Affine {
+         var a: Affine = undefined;
+         a.mods[0] = try cuda.Module.load(d, cuda.kernels.affine8);
+@@ -39,11 +58,77 @@ pub const Affine = struct {
+         a.act = try cuda.act_rows.ActRows.load(d);
+         errdefer a.act.unload();
+         a.linears = try linears.loadAll(gpa, io, d, stream, &a.wide, pack, bindings);
++
++        var count: usize = 0;
++        for (bindings) |b| if (b.kind == .expert and b.mode == .affine_n_expert and b.affine_layout != null and inLayers(b.name, layers)) {
++            count += 1;
++        };
++        a.experts = try gpa.alloc(ExpertModule, count);
++        a.expert_map = .empty;
++        a.expert_weights = .{ .gpa = gpa, .digest = false };
++        var made: usize = 0;
++        errdefer {
++            for (a.experts[0..made]) |*m| gpa.free(m.name);
++            gpa.free(a.experts);
++            a.expert_map.deinit(gpa);
++            a.expert_weights.close() catch {};
++        }
++        var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++        defer builder.deinit();
++        for (bindings) |b| {
++            if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !inLayers(b.name, layers)) continue;
++            var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
++            try builder.add(images.weight);
++            try builder.add(images.scales);
++            try builder.add(images.biases);
++            images = undefined;
++            a.experts[made] = .{
++                .name = try gpa.dupe(u8, b.name),
++                .dev = undefined,
++                .layout = b.affine_layout.?,
++                .experts = if (std.mem.startsWith(u8, b.name, "mtp.")) dspark_experts else backbone_experts,
++            };
++            made += 1;
++        }
++        if (made != a.experts.len) return error.AffineExpertMismatch;
++        if (made > 0) {
++            try a.expert_weights.upload(d, &builder);
++            try a.expert_map.ensureTotalCapacity(gpa, @intCast(made));
++            for (a.experts, 0..) |*m, i| {
++                const b = findBinding(bindings, m.name) orelse return error.AffineExpertMismatch;
++                m.dev = try affine_bind.bind(&a.expert_weights, b, m.experts);
++                m.dev.name = m.name;
++                a.expert_map.putAssumeCapacity(m.name, i);
++            }
++        }
+         return a;
+     }
+ 
++    fn findBinding(bindings: []const exec.Binding, name: []const u8) ?*const exec.Binding {
++        for (bindings) |*b| if (std.mem.eql(u8, b.name, name)) return b;
++        return null;
++    }
++
++    fn inLayers(name: []const u8, layers: ?[]const u32) bool {
++        const want = layers orelse return true;
++        const rest = if (std.mem.startsWith(u8, name, "layers."))
++            name["layers.".len..]
++        else if (std.mem.startsWith(u8, name, "mtp."))
++            name["mtp.".len..]
++        else
++            return false;
++        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
++        const index = std.fmt.parseInt(u32, rest[0..dot], 10) catch return false;
++        for (want) |x| if (x == index) return true;
++        return false;
++    }
++
+     pub fn deinit(a: *Affine) void {
+         a.linears.deinit();
++        if (a.experts.len > 0) a.expert_weights.close() catch {};
++        for (a.experts) |m| a.expert_weights.gpa.free(m.name);
++        a.expert_weights.gpa.free(a.experts);
++        a.expert_map.deinit(a.expert_weights.gpa);
+         a.act.unload();
+         a.wide.deinit();
+         a.mods[2].unload();
+@@ -56,6 +141,49 @@ pub const Affine = struct {
+         return a.linears.bytes();
+     }
+ 
++    pub fn expertBytes(a: *const Affine) u64 {
++        return a.expert_weights.bytes;
++    }
++
++    pub fn expert(a: *const Affine, name: []const u8) ?*const ExpertModule {
++        const at = a.expert_map.get(name) orelse return null;
++        return &a.experts[at];
++    }
++
++    /// One affine linear on host rows: bf16 `x` -> bf16 rows out.
++    pub fn linearHost(
++        a: *const Affine,
++        gpa: std.mem.Allocator,
++        d: *const cuda.Driver,
++        stream: cuda.Stream,
++        name: []const u8,
++        x: []const u8,
++        rows: usize,
++    ) ![]u8 {
++        const item = a.linears.get(name) orelse return error.UnknownAffine;
++        var out = try affine_launch.linear(gpa, d, stream, &a.wide, &item.tiles, x, rows);
++        defer out.deinit();
++        return out.download(d, gpa);
++    }
++
++    /// One routed expert's projection on a host row: bf16 `x` -> bf16 `n` values.
++    pub fn expertHost(
++        a: *const Affine,
++        gpa: std.mem.Allocator,
++        d: *const cuda.Driver,
++        stream: cuda.Stream,
++        name: []const u8,
++        expert_index: u32,
++        x: []const u8,
++        rows: usize,
++    ) ![]u8 {
++        const m = a.expert(name) orelse return error.UnknownAffine;
++        const view = try affine_cuda.expertView(m.layout, m.experts, expert_index, m.dev.weight_len, m.dev.scales_len, m.dev.biases_len);
++        var out = try affine_launch.expert(gpa, d, stream, &a.wide, &m.dev, view, x, rows);
++        defer out.deinit();
++        return out.download(d, gpa);
++    }
++
+     /// One affine projection: `x` device bf16 [rows, k], `y` device bf16 [rows, n].
+     /// Decode rows (<= 16) take the group sums kernel; wider windows use the prompt GEMM.
+     pub fn linear(
+diff --git a/zig/src/families/deepseek_v41/block_moe.zig b/zig/src/families/deepseek_v41/block_moe.zig
+index 6f14d73..9438404 100644
+--- a/zig/src/families/deepseek_v41/block_moe.zig
++++ b/zig/src/families/deepseek_v41/block_moe.zig
+@@ -199,6 +199,13 @@ pub fn moe(e: *E, L: u32) !void {
+         }
+         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
+     }
++    if (e.cfg.format == .affine) {
++        if (!backbone) return error.AffineDSparkUnsupported;
++        const cw = if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts;
++        const out = try e.buf("L.moe", .{}, if (e.o.r1 and backbone) .bf16 else .f32, &.{ n, D });
++        try e.glue("moe_host", &.{ x, pick, cw, out, .{ .i = L }, .{ .i = ex.topk }, .{ .i = slots }, .{ .f = E.dec(e.cfg.swiglu_limit) } });
++        return;
++    }
+     const group_rot = !grouped and e.o.router_group_rot and n <= 64 and slots <= 9 and Et <= 512 and D == 5120;
+     if (!grouped and !group_rot) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
+     const pre = try e.fmt("s.L{d}.ex", .{L});
+@@ -294,7 +301,7 @@ pub fn engram(e: *E, L: u32) !void {
+     const N: i64 = (@as(i64, e.cfg.engram_max_ngram) + 1) * D;
+     const kv = try e.buf("L.engram.kv", .{}, .bf16, &.{ n, N });
+     try e.glue("engram_rows", &.{ try e.buf("L.engram.rows", .{}, .bf16, &.{ n, K }), .{ .i = L } });
+-    try e.upstream(try e.fmt("L{d}.engram.wkv", .{L}), try e.buf("L.engram.rows", .{}, .bf16, &.{ n, K }), K, N, kv);
++    try e.upstreamOrAffine(try e.fmt("L{d}.engram.wkv", .{L}), try e.buf("L.engram.rows", .{}, .bf16, &.{ n, K }), K, N, kv);
+     const qk = try e.weight("L{d}.engram.qk", .{L}, .f32, &.{ e.cfg.hc_mult, D });
+     try e.triton("_fuse_dec", .{ n, 1, 1 }, &.{
+         .{ .name = "X", .arg = try e.streams() },                              .{ .name = "x_stride", .arg = .{ .i = 4 * D } },
+diff --git a/zig/src/families/deepseek_v41/block_test.zig b/zig/src/families/deepseek_v41/block_test.zig
+index 3b15c49..fd7f0f8 100644
+--- a/zig/src/families/deepseek_v41/block_test.zig
++++ b/zig/src/families/deepseek_v41/block_test.zig
+@@ -118,6 +118,7 @@ test "affine format emits affine projections and a dense wo_a group" {
+     const cs = try block.emit(a, &c, &w, .{}, &.{0}, 1, 0, false);
+     var affine: usize = 0;
+     var dense: usize = 0;
++    var host_moe = false;
+     for (cs) |call| {
+         if (std.mem.eql(u8, call.name, "tf_dsv41_affine_v1.linear")) {
+             affine += 1;
+@@ -131,9 +132,11 @@ test "affine format emits affine projections and a dense wo_a group" {
+         } else if (std.mem.eql(u8, call.name, "tensorfold_exl3_linear_v4.linear")) {
+             return error.TestUnexpectedResult;
+         } else if (std.mem.eql(u8, call.name, "_plain")) dense += 1;
++        if (call.glue and std.mem.eql(u8, call.name, "glue.moe_host")) host_moe = true;
+     }
+     try t.expectEqual(@as(usize, 4), affine); // wq_a, wkv, wq_b, wo_b
+     try t.expectEqual(@as(usize, 8), dense); // wo_a's eight rank groups
++    try t.expect(host_moe);
+ 
+     const with_head = try block.emit(a, &c, &w, .{}, &.{0}, 1, 0, true);
+     var head = false;
+@@ -151,3 +154,38 @@ test "affine format emits affine projections and a dense wo_a group" {
+     }
+     try t.expect(head);
+ }
++
++test "affine format covers the Engram layer's wkv" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const w = try widths(a);
++    var c: Config = .{};
++    c.format = .affine;
++    const cs = try block.emit(a, &c, &w, .{ .limit = 4096, .rope_rows = 4096 }, &.{1}, 1, 0, false);
++    var affine: usize = 0;
++    for (cs) |call| {
++        if (std.mem.eql(u8, call.name, "tf_dsv41_affine_v1.linear")) affine += 1;
++        if (std.mem.eql(u8, call.name, "tensorfold_exl3_linear_v4.linear")) return error.TestUnexpectedResult;
++    }
++    try t.expectEqual(@as(usize, 5), affine); // wq_a, wkv, wq_b, wo_b, engram.wkv
++}
++
++test "affine format covers a compressor and indexer layer" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const w = try widths(a);
++    var c: Config = .{};
++    c.format = .affine;
++    const cs = try block.emit(a, &c, &w, .{ .limit = 4096, .rope_rows = 4096 }, &.{2}, 1, 0, false);
++    var affine: usize = 0;
++    var dense: usize = 0;
++    for (cs) |call| {
++        if (std.mem.eql(u8, call.name, "tf_dsv41_affine_v1.linear")) affine += 1;
++        if (std.mem.eql(u8, call.name, "_plain")) dense += 1;
++        if (std.mem.eql(u8, call.name, "tensorfold_exl3_linear_v4.linear")) return error.TestUnexpectedResult;
++    }
++    try t.expectEqual(@as(usize, 8), affine); // wq_a, wkv, comp_wkv, comp_wgate, wq_b, ix_wk, ix_wq_b, wo_b
++    try t.expectEqual(@as(usize, 8), dense); // wo_a's eight full-rank groups
++}
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index d165c41..659e78a 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -271,8 +271,8 @@ pub const Model = struct {
+                 const sms: usize = @intCast(try m.ctx.attribute(.multiprocessor_count));
+                 const major = try m.ctx.attribute(.compute_capability_major);
+                 const minor = try m.ctx.attribute(.compute_capability_minor);
+-                m.affine = try @import("affine_runtime.zig").Affine.load(gpa, io, &m.driver, m.stream, &m.pack, bindings.items, sms, major == 12 and minor == 1);
+-                if (!quiet) std.log.info("dsv41 affine load: {d} linears packed, {d:.2} GiB", .{ m.affine.?.linears.items.len, @as(f64, @floatFromInt(m.affine.?.bytes())) / (1 << 30) });
++                m.affine = try @import("affine_runtime.zig").Affine.load(gpa, io, &m.driver, m.stream, &m.pack, bindings.items, sms, major == 12 and minor == 1, m.cfg.experts, m.cfg.dspark_experts, o.layers);
++                if (!quiet) std.log.info("dsv41 affine load: {d} linears packed, {d:.2} GiB; {d} expert stacks, {d:.2} GiB", .{ m.affine.?.linears.items.len, @as(f64, @floatFromInt(m.affine.?.bytes())) / (1 << 30), m.affine.?.experts.len, @as(f64, @floatFromInt(m.affine.?.expertBytes())) / (1 << 30) });
+             }
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_SMOKE", false)) {
+                 m.weights = .{ .gpa = gpa, .digest = false };
+diff --git a/zig/src/families/deepseek_v41/forward_glue.zig b/zig/src/families/deepseek_v41/forward_glue.zig
+index 5cfda55..14f2ab9 100644
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -8,6 +8,7 @@ const run = @import("run.zig");
+ const hs = @import("host_stage.zig");
+ const fwd = @import("forward.zig");
+ const hooks = @import("forward_hooks.zig");
++const named = @import("named.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -174,5 +175,124 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
+         std.crypto.hash.sha2.Sha256.hash(host, &sha, .{});
+         return map.put(f.gpa, @intCast(c.args[1].arg.i), std.fmt.bytesToHex(sha, .lower));
+     }
++    if (std.mem.eql(u8, step, "moe_host")) return moeHost(f, r, c);
+     return glueMissing(step);
+ }
++
++/// The affine checkpoint's MoE correctness path: shared expert and each routed expert run
++/// one row at a time through the resident `AffineN` kernels; the combine is on the host.
++fn moeHost(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
++    const af = r.affine orelse return error.AffineNotLoaded;
++    const x = c.args[0].arg.t;
++    const pick = c.args[1].arg.t;
++    const wts = c.args[2].arg.t;
++    const out = c.args[3].arg.t;
++    const L: u32 = @intCast(c.args[4].arg.i);
++    const topk: usize = @intCast(c.args[5].arg.i);
++    const slots: usize = @intCast(c.args[6].arg.i);
++    const limit: f32 = @floatCast(c.args[7].arg.f);
++    const n: usize = @intCast(x.shape[0]);
++    const D: usize = @intCast(x.shape[1]);
++    if (pick.shape[0] != n or pick.shape[1] != slots or wts.shape[0] != n or wts.shape[1] != slots or out.shape[0] != n or out.shape[1] != D) return error.BadGlue;
++
++    try r.stream.synchronize();
++    const xb = try f.gpa.alloc(u8, n * D * 2);
++    defer f.gpa.free(xb);
++    const pb = try f.gpa.alloc(u8, n * slots * 4);
++    defer f.gpa.free(pb);
++    const wb = try f.gpa.alloc(u8, n * slots * 4);
++    defer f.gpa.free(wb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(pick), .len = pb.len }, 0, pb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(wts), .len = wb.len }, 0, wb);
++
++    const acc = try f.gpa.alloc(f32, n * D);
++    defer f.gpa.free(acc);
++    @memset(acc, 0);
++
++    var b1: [96]u8 = undefined;
++    var b2: [96]u8 = undefined;
++    var b3: [96]u8 = undefined;
++    const sh1 = try std.fmt.bufPrint(&b1, "layers.{d}.ffn.shared_experts.w1", .{L});
++    const sh3 = try std.fmt.bufPrint(&b2, "layers.{d}.ffn.shared_experts.w3", .{L});
++    const sh2 = try std.fmt.bufPrint(&b3, "layers.{d}.ffn.shared_experts.w2", .{L});
++    var e1: [96]u8 = undefined;
++    var e2: [96]u8 = undefined;
++    var e3: [96]u8 = undefined;
++    const w1n = try std.fmt.bufPrint(&e1, "layers.{d}.ffn.experts.w1", .{L});
++    const w3n = try std.fmt.bufPrint(&e2, "layers.{d}.ffn.experts.w3", .{L});
++    const w2n = try std.fmt.bufPrint(&e3, "layers.{d}.ffn.experts.w2", .{L});
++    const has_shared = af.linears.get(sh1) != null;
++    const I: usize = if (has_shared) af.linears.get(sh1).?.n else if (af.expert(w1n)) |m| m.layout.n else 0;
++
++    for (0..n) |i| {
++        const row = xb[i * D * 2 ..][0 .. D * 2];
++        if (has_shared) {
++            const gate = try af.linearHost(f.gpa, r.d, r.stream, sh1, row, 1);
++            defer f.gpa.free(gate);
++            const up = try af.linearHost(f.gpa, r.d, r.stream, sh3, row, 1);
++            defer f.gpa.free(up);
++            const act = try f.gpa.alloc(u8, I * 2);
++            defer f.gpa.free(act);
++            try swigluRow(gate, up, act, limit);
++            const down = try af.linearHost(f.gpa, r.d, r.stream, sh2, act, 1);
++            defer f.gpa.free(down);
++            for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, down[2 * d ..][0..2], .little));
++        }
++    }
++
++    for (0..n) |i| {
++        const row = xb[i * D * 2 ..][0 .. D * 2];
++        for (0..topk) |j| {
++            const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++            if (e < 0) continue;
++            const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++            if (w == 0) continue;
++            const y1 = try af.expertHost(f.gpa, r.d, r.stream, w1n, @intCast(e), row, 1);
++            defer f.gpa.free(y1);
++            const y3 = try af.expertHost(f.gpa, r.d, r.stream, w3n, @intCast(e), row, 1);
++            defer f.gpa.free(y3);
++            const act = try f.gpa.alloc(u8, I * 2);
++            defer f.gpa.free(act);
++            try swigluRow(y1, y3, act, limit);
++            const y2 = try af.expertHost(f.gpa, r.d, r.stream, w2n, @intCast(e), act, 1);
++            defer f.gpa.free(y2);
++            for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, y2[2 * d ..][0..2], .little));
++        }
++    }
++
++    if (out.dt == .bf16) {
++        const half = try f.gpa.alloc(u8, n * D * 2);
++        defer f.gpa.free(half);
++        for (acc, 0..) |v, i| std.mem.writeInt(u16, half[2 * i ..][0..2], named.bf16Round(v), .little);
++        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = half.len }, 0, half);
++    } else try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = std.mem.sliceAsBytes(acc).len }, 0, std.mem.sliceAsBytes(acc));
++}
++
++fn swigluRow(gate: []const u8, up: []const u8, out: []u8, limit: f32) !void {
++    if (gate.len != up.len or out.len != gate.len) return error.BadGlue;
++    for (0..gate.len / 2) |i| {
++        const g = named.bf16Widen(std.mem.readInt(u16, gate[2 * i ..][0..2], .little));
++        const u = named.bf16Widen(std.mem.readInt(u16, up[2 * i ..][0..2], .little));
++        const c = std.math.clamp(g, -limit, limit);
++        const v = (c / (1 + @exp(-c))) * u;
++        std.mem.writeInt(u16, out[2 * i ..][0..2], named.bf16Round(v), .little);
++    }
++}
++
++test "the affine MoE host activation clamps before silu and rounds once" {
++    var gate: [4]u8 = undefined;
++    var up: [4]u8 = undefined;
++    var out: [4]u8 = undefined;
++    std.mem.writeInt(u16, gate[0..2], named.bf16Round(20.0), .little);
++    std.mem.writeInt(u16, gate[2..4], named.bf16Round(1.0), .little);
++    std.mem.writeInt(u16, up[0..2], named.bf16Round(2.0), .little);
++    std.mem.writeInt(u16, up[2..4], named.bf16Round(3.0), .little);
++    try swigluRow(&gate, &up, &out, 10.0);
++    const a = named.bf16Widen(std.mem.readInt(u16, out[0..2], .little));
++    const b = named.bf16Widen(std.mem.readInt(u16, out[2..4], .little));
++    const want_a = (10.0 / (1 + @exp(-10.0))) * 2.0;
++    const want_b = (1.0 / (1 + @exp(-1.0))) * 3.0;
++    try std.testing.expectApproxEqAbs(want_a, a, 0.02);
++    try std.testing.expectApproxEqAbs(want_b, b, 0.02);
++}

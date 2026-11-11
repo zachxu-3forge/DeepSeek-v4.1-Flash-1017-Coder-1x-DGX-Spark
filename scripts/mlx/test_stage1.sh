@@ -74,6 +74,11 @@ step make_one_layer_fixture "$PY" "$ROOT/scripts/mlx/test_make_one_layer.py"
 step test_translate_config "$PY" "$ROOT/scripts/mlx/test_translate_config.py"
 step test_plan_dispatch "$PY" "$ROOT/scripts/mlx/test_plan_dispatch.py"
 step test_rope_tables "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --self-test
+if [[ -n "${ASSETS_HOST:-}" && -f "$ASSETS_HOST/rope.bin" ]]; then
+  step check_rope_bin "$PY" "$ROOT/scripts/mlx/make_rope_tables.py" --check "$ASSETS_HOST/rope.bin"
+else
+  lines+=("| check_rope_bin | SKIP | no \$ASSETS_HOST/rope.bin |")
+fi
 if "$PY" -c "import numpy" >/dev/null 2>&1; then
   step test_convert_engram "$PY" "$ROOT/scripts/mlx/test_convert_engram.py"
 else

@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Affine dense/native loader wired; expert host loop next |
+| Overall status | Affine dense/expert loaders and host-loop MoE wired; affine boot path next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -32,7 +32,7 @@ needed. This file is the history.
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches reference; affine runtime, emitter, dense/native loader wired; MoE host loop next |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches; affine dense/linear/expert loaders and host-loop MoE wired; affine boot path next |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
 | 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; native 160 B reader and packer tested; real-shard check pending |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -70,6 +70,35 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-11 - Host-loop experts, affine emitter coverage, 600K RoPE
+
+- **Phase:** 1/3 (offline; no GPU).
+- **Done (`0034`):** `affine_runtime.zig` now loads the raw routed expert stacks for the
+  selected layers (filtered by `TF_DSV41_LAYERS`) into one `Weights` owner and binds a
+  `Device` + `Layout` per `layers.N.ffn.experts.w*` module. `Affine.linearHost` and
+  `Affine.expertHost` run one row through an `AffineN` projection or one packed expert.
+- **Done (`0034`):** the affine MoE path emits `glue.moe_host(x, pick, wts, out, L, topk,
+  slots, limit)`. The glue step downloads the window, runs the shared expert through the
+  resident `w1/w3 -> SwiGLU(clamp) -> w2` linears, then each routed top-k expert through
+  per-expert `AffineN` packing, and uploads the fp32/bf16 sum. This is the correctness path;
+  the device gather/GEMM kernel remains a throughput follow-up.
+- **Done:** affine emitter coverage now includes a ratio-2 compressor/indexer layer
+  (8 affine projections, including `comp_wgate`/`ix_wk`/`ix_wq_b`) and the Engram layer’s
+  `engram.wkv`; grouped outputs use `glue.copy_cols`.
+- **Done:** the dense head emits `_plain` in affine mode, and `named.top` maps
+  `head.weight` to the `head` role.
+- **Done (asset):** generated the full 600K `rope.bin` locally (`602,048` rows,
+  308,248,592 bytes) with `make_rope_tables.py`; added `--check`, which validates the
+  header, size, sampled window/YaRN values, and `mscale = 1.2772589`.
+- **Verification:** Linux `test-dsv41-forward`: 200 pass, 1 skip, 1 fail (the pre-existing
+  `prepared.zig` mtime test). `compile-dsv41-device-host` and `compile-dsv41-server` pass.
+  The new tests cover the host SwiGLU clamp/rounding, affine MoE emission, compressor/
+  indexer coverage, Engram wkv, and the dense/head roles.
+- **Still open:** the affine branch still returns `AffineForwardNotPorted`; it needs the
+  affine boot path to bind `Forward`/KV/buffers and run the layer-0 window. DSpark affine
+  experts are refused. MXFP4 requant wiring remains.
+- **Next:** wire the affine one-layer boot and gate, then the GPU window.
 
 ### 2026-11-11 - Affine runtime and emitter call site
 

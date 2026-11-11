@@ -119,7 +119,10 @@ Writes the dsv41 CUDA `rope.bin`: 16-byte header, then the plain window table an
 YaRN compressed table, each f32 `[rows, 64]`. The default `--rows 602048` covers 600K plus a
 2,048-row prefill segment. The compressed table carries `mscale = 0.1 ln(factor) + 1`; verify
 the frequencies against `core/rope_yarn.zig` and the target's MLX reference before serving.
-`--self-test` checks the known Qwen3.6 YaRN vector.
+`--self-test` checks the known Qwen3.6 YaRN vector; `--check FILE` validates an existing
+asset's header, size, sampled cos/sin values, and scale.
+
+Locally generated: `602048` rows, `308,248,592` bytes, `--check` passes.
 
 ## Engram conversion
 

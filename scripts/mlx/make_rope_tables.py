@@ -127,9 +127,40 @@ def self_test() -> int:
     return 0
 
 
+def check(path: str) -> int:
+    with open(path, "rb") as f:
+        head = f.read(HEADER)
+        if len(head) != HEADER:
+            raise SystemExit(f"{path}: short header")
+        magic, rows, dim, reserved = struct.unpack("<4sIII", head)
+        if magic != b"ROPE" or dim != DIM or reserved != 0 or rows == 0:
+            raise SystemExit(f"{path}: bad header {magic!r} rows {rows} dim {dim}")
+        table = array("f")
+        table.fromfile(f, 2 * rows * DIM)
+        if f.read(1):
+            raise SystemExit(f"{path}: trailing bytes")
+    if len(table) != 2 * rows * DIM:
+        raise SystemExit(f"{path}: short table")
+    window = window_freqs(10000.0)
+    compressed = compressed_freqs(160000.0, 16.0, 65536)
+    scale = mscale(16.0)
+    picks = sorted({0, 1, rows // 2, rows - 1})
+    for pos in picks:
+        for i in (0, 1, DIM // 2 - 1):
+            w = table[pos * DIM + i]
+            c = table[rows * DIM + pos * DIM + i]
+            want_w = math.cos(pos * window[i])
+            want_c = math.cos(pos * compressed[i]) * scale
+            if abs(w - want_w) > 1e-5 or abs(c - want_c) > 1e-5:
+                raise SystemExit(f"{path}: row {pos} pair {i}: {w}/{c} != {want_w}/{want_c}")
+    print(f"{path}: {rows} rows, window + YaRN compressed tables, mscale {scale:.7f}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("out", nargs="?", help="write rope.bin here")
+    ap.add_argument("--check", help="validate an existing rope.bin instead of writing")
     ap.add_argument("--rows", type=int, default=602048, help="positions (600K + a 2,048-row prefill segment)")
     ap.add_argument("--theta", type=float, default=10000.0)
     ap.add_argument("--compress-theta", type=float, default=160000.0)
@@ -141,8 +172,12 @@ def main() -> int:
     args = ap.parse_args()
     if args.self_test:
         return self_test()
+    if args.check:
+        if args.out:
+            ap.error("OUT and --check are exclusive")
+        return check(args.check)
     if not args.out:
-        ap.error("OUT is required unless --self-test is used")
+        ap.error("OUT is required unless --self-test or --check is used")
     if args.rows <= 0:
         ap.error("--rows must be positive")
     build(args.out, args.rows, args.theta, args.compress_theta, args.factor, args.original, args.beta_fast, args.beta_slow)

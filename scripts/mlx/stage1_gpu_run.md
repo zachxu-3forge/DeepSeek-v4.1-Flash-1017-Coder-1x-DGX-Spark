@@ -122,13 +122,14 @@ Expected:
 ```text
 dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; ...
 dsv41 affine dense: N tensors, M GiB
-dsv41 affine load: 309 linears packed, 4.30 GiB
+dsv41 affine load: 309 linears packed, 4.30 GiB; K expert stacks, E GiB
 AffineForwardNotPorted
 ```
 
 The dense set is the norms, mHC mixers, router gate/bias, `wo_a`, this rank’s embed rows
-and head rows; the linears are the packed projections. Both are freed before exit; the log
-proves the affine load path fits without OOM.
+and head rows; the linears are the packed projections; the expert stacks are raw for the
+host-loop path. All are freed before exit; the log proves the affine load path fits
+without OOM.
 
 ## 5. If a smoke line fails
 
