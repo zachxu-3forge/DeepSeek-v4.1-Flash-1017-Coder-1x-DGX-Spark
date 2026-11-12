@@ -107,9 +107,10 @@ The target is not uniformly affine. Its omlx map has:
 The DSpark head is the full model's release-format head, not an affine quant. The dsv41 loader
 must admit per-module affine, MXFP8, MXFP4, and dense formats. Upstream's `release_fp8` path
 handles the release's FP8/MXFP4 blocks, and the Qwen affine reader handles affine, but neither
-combines them in one dsv41 checkpoint. The affine path currently refuses
-`TF_DSV41_DRAFTS=1` (`AffineDSparkUnsupported`) and `TF_DSV41_OWN_PREFILL=0`
-(`AffinePrefillUnsupported`) until the mixed DSpark and prefill emitters are wired.
+combines them in one dsv41 checkpoint. The affine path currently refuses `TF_DSV41_DRAFTS=1`
+(`AffineDSparkUnsupported`) until the mixed DSpark emitters and the MXFP4→affine-4
+expert path are wired. Affine prefill is still skipped: prompts run as decode windows,
+so `TF_DSV41_OWN_PREFILL` is forced off for affine.
 
 ### B7. Vision, tokenizer, chat template
 
@@ -150,7 +151,8 @@ runtime factor change is needed. Measure with a 4-8 GiB reserve before fixing th
 `scripts/mlx/make_rope_tables.py` writes the two-table asset (default 602,048 rows),
 `--self-test` matches `core/rope_yarn.zig`'s known YaRN vector, and `--check FILE` validates
 an existing asset's header, size, sampled values, and scale. The compressed table applies
-`mscale = 0.1 ln(factor) + 1`; confirm that against the target's MLX reference before serving.
+`mscale = 0.1 ln(factor) + 1`; pass `--no-mscale` if the target reference applies the
+YaRN scale itself. Confirm the convention against the target's MLX reference before serving.
 
 A pinned KV pool would keep this memory from being taken by another workload. Check whether
 `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention caches; if not, adopt the admission
