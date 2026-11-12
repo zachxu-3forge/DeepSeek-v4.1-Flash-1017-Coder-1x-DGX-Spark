@@ -96,9 +96,13 @@ next step.
   assertion, and graph `moe_host` audit test. `test-dsv41-forward` 203 pass, 1 skip, and
   the same `prepared.zig` mtime-precision failure on the mounted filesystem;
   `compile-dsv41-device-host` and `compile-dsv41-server` pass. `0001`-`0036` apply cleanly.
+- **Fixed:** the Zig Engram packer and manifest now understand native 160-byte rows too:
+  `engram_tables.Plan` detects U32/`scales`/`biases`, `engram_pack` copies native rows and
+  verifies them through `engram_rows.decodeRow`, and `engram_manifest` records three
+  sources per native table. `convert_engram.py --verify` remains the independent Python
+  check.
 - **Next:** rebuild the image, run `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` on `dgx1`
-  when free, then the layer-0 sweep and one-layer forward. Real Engram native shards still
-  use `convert_engram.py --verify`; Zig `engram_manifest` remains the FP8 packer's checker.
+  when free, then the layer-0 sweep and one-layer forward.
 
 ### 2026-11-11 - Review fixes: MXFP decode, SwiGLU clamp, affine leak
 

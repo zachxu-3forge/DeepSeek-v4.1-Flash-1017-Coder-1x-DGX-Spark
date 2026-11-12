@@ -846,6 +846,382 @@ index da42e3e..423a2f9 100644
              return error.BadKnob;
          }
          if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
+diff --git a/zig/src/families/deepseek_v41/engram_manifest.zig b/zig/src/families/deepseek_v41/engram_manifest.zig
+index 246b635..f3cee5a 100644
+--- a/zig/src/families/deepseek_v41/engram_manifest.zig
++++ b/zig/src/families/deepseek_v41/engram_manifest.zig
+@@ -15,6 +15,10 @@ pub const filename = "engram-manifest.json";
+ pub const tmp_name = ".engram-manifest.json.tmp";
+ const format_name = "dsv41-engram-manifest";
+ 
++fn rowBytes(f: er.RowFormat) u64 {
++    return if (f == .affine4) er.native_row_bytes else er.fp8_row_bytes;
++}
++
+ /// One source tensor of a release's Engram table: where its bytes live, as the packer read them.
+ pub const Source = struct {
+     name: []const u8,
+@@ -59,14 +63,26 @@ pub const Manifest = struct {
+         var span: u64 = 0;
+         for (plans) |t| span = if (span == 0 or t.rows < span) t.rows else span;
+         var m = Manifest{ .root = a, .arena = arena_p, .seed = seed };
++        if (plans.len > 0) m.rows = rowBytes(plans[0].format);
++        for (plans) |t| if (t.format != plans[0].format) return error.EngramMixedFormats;
+         if (span > 0) m.samples = try ep.samples(al, span, 48, seed);
+         var srcs: std.ArrayList(Source) = .empty;
+         var tabs: std.ArrayList(Table) = .empty;
+         for (plans) |t| {
+-            for ([_]usize{ 0, 1 }) |k| {
+-                const i: Info = if (k == 0) t.weight else t.scale;
++            const native = t.format == .affine4;
++            const count: usize = if (native) 3 else 2;
++            for (0..count) |k| {
++                const i: Info = switch (k) {
++                    0 => t.weight,
++                    1 => t.scale,
++                    else => t.biases orelse return error.InvalidEngramTable,
++                };
+                 var nb: [96]u8 = undefined;
+-                const name = try std.fmt.bufPrint(&nb, "layers.{d}.engram.embed.{s}", .{ t.layer, if (k == 0) "weight" else "scale" });
++                const suffix = if (native)
++                    ([_][]const u8{ "weight", "scales", "biases" })[k]
++                else
++                    ([_][]const u8{ "weight", "scale" })[k];
++                const name = try std.fmt.bufPrint(&nb, "layers.{d}.engram.embed.{s}", .{ t.layer, suffix });
+                 try srcs.append(al, Source{
+                     .name = try al.dupe(u8, name),
+                     .file = try al.dupe(u8, p.files.items[i.file]),
+@@ -295,11 +311,23 @@ pub fn manifestFor(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []
+         if (try f.readPositionalAll(io, &hb, 0) != 48) return error.EngramShardCorrupt;
+         const h = er.Header.parse(&hb, size) catch return error.EngramShardCorrupt;
+         const p = Plan.fromPack(&pack, @intCast(h.layer), h.total) catch return error.EngramSourceMismatch;
++        if (h.row_bytes != rowBytes(p.format)) return error.EngramShardCorrupt;
++        m.rows = rowBytes(p.format);
+         span = if (span == 0 or h.total < span) h.total else span;
++        const native = p.format == .affine4;
++        const count: usize = if (native) 3 else 2;
+         var nb: [96]u8 = undefined;
+-        for ([_]usize{ 0, 1 }) |k| {
+-            const i: Info = if (k == 0) p.weight else p.scale;
+-            const name = try std.fmt.bufPrint(&nb, "layers.{d}.engram.embed.{s}", .{ h.layer, if (k == 0) "weight" else "scale" });
++        for (0..count) |k| {
++            const i: Info = switch (k) {
++                0 => p.weight,
++                1 => p.scale,
++                else => p.biases orelse return error.InvalidEngramTable,
++            };
++            const suffix = if (native)
++                ([_][]const u8{ "weight", "scales", "biases" })[k]
++            else
++                ([_][]const u8{ "weight", "scale" })[k];
++            const name = try std.fmt.bufPrint(&nb, "layers.{d}.engram.embed.{s}", .{ h.layer, suffix });
+             try srcs.append(al, Source{
+                 .name = try al.dupe(u8, name),
+                 .file = try al.dupe(u8, pack.files.items[i.file]),
+@@ -340,16 +368,20 @@ fn checkText(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const
+     const m = try Manifest.parse(a, text);
+     defer m.deinit();
+     if (m.version != 1) return error.EngramManifestBad;
+-    if (m.rows != er.row_bytes or m.values != er.values) return error.EngramManifestBad;
+-    if (m.tables.len == 0 or m.sources.len != m.tables.len * 2 or m.samples.len == 0) return error.EngramManifestBad;
++    if (er.formatOf(m.rows) == null or m.values != er.values) return error.EngramManifestBad;
++    const native = m.rows == er.native_row_bytes;
++    const per_table: usize = if (native) 3 else 2;
++    if (m.tables.len == 0 or m.sources.len != m.tables.len * per_table or m.samples.len == 0) return error.EngramManifestBad;
+     var pack = try Pack.open(a, io, release_dir);
+     defer pack.deinit();
+     var got: Checked = .{ .samples = 0, .bytes = 0 };
+     for (m.tables, 0..) |t, ti| {
+-        const w = m.sources[ti * 2];
+-        const s = m.sources[ti * 2 + 1];
++        const w = m.sources[ti * per_table];
++        const s = m.sources[ti * per_table + 1];
++        const b: Source = if (native) m.sources[ti * per_table + 2] else undefined;
+         try sourceMatches(a, io, &pack, w);
+         try sourceMatches(a, io, &pack, s);
++        if (native) try sourceMatches(a, io, &pack, b);
+         const tpath = try std.fs.path.join(a, &.{ tables_dir, t.file });
+         defer a.free(tpath);
+         const f = std.Io.Dir.cwd().openFile(io, tpath, .{}) catch return error.EngramShardCorrupt;
+@@ -359,21 +391,34 @@ fn checkText(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const
+         var hb: [48]u8 = undefined;
+         if (try f.readPositionalAll(io, &hb, 0) != 48) return error.EngramShardCorrupt;
+         const h = er.Header.parse(&hb, size) catch return error.EngramShardCorrupt;
+-        if (h.layer != t.layer or h.lo != t.lo or h.hi != t.hi or h.total != t.total) return error.EngramShardCorrupt;
+-        const wi = pack.get(w.name).?;
+-        const si = pack.get(s.name).?;
++        if (h.layer != t.layer or h.lo != t.lo or h.hi != t.hi or h.total != t.total or h.row_bytes != m.rows) return error.EngramShardCorrupt;
++        var wb: [256]u8 = undefined;
++        var sb: [256]u8 = undefined;
++        const wi = pack.resolve(w.name, &wb) orelse return error.EngramSourceMismatch;
++        const si = pack.resolve(s.name, &sb) orelse return error.EngramSourceMismatch;
+         for (m.samples) |x| {
+             if (x < h.lo or x >= h.hi) continue;
+-            if (x > (std.math.maxInt(u64) - er.header_bytes) / er.row_bytes) return error.EngramShardCorrupt;
+-            var row: [er.row_bytes]u8 = undefined;
+-            if (try f.readPositionalAll(io, &row, er.header_bytes + x * er.row_bytes) != er.row_bytes) return error.EngramShardCorrupt;
+-            var wrow: [er.values]u8 = undefined;
+-            var srow: [8]u8 = undefined;
+-            try pack.read(io, wi, .{ .offset = x * er.values, .len = er.values }, &wrow);
+-            try pack.read(io, si, .{ .offset = x * 8, .len = 8 }, &srow);
+-            if (!std.mem.eql(u8, row[0..er.values], &wrow) or !std.mem.eql(u8, row[er.values..], &srow)) return error.EngramSampleMismatch;
++            if (x > (std.math.maxInt(u64) - er.header_bytes) / h.row_bytes) return error.EngramShardCorrupt;
++            const rb: usize = @intCast(h.row_bytes);
++            var row: [264]u8 = undefined;
++            if (try f.readPositionalAll(io, row[0..rb], er.header_bytes + x * h.row_bytes) != rb) return error.EngramShardCorrupt;
++            if (native) {
++                var want: [160]u8 = undefined;
++                try pack.read(io, wi, .{ .offset = x * 128, .len = 128 }, want[0..128]);
++                try pack.read(io, si, .{ .offset = x * 16, .len = 16 }, want[128..144]);
++                var bb: [256]u8 = undefined;
++                const bi = pack.resolve(b.name, &bb) orelse return error.EngramSourceMismatch;
++                try pack.read(io, bi, .{ .offset = x * 16, .len = 16 }, want[144..160]);
++                if (!std.mem.eql(u8, row[0..160], &want)) return error.EngramSampleMismatch;
++            } else {
++                var wrow: [er.values]u8 = undefined;
++                var srow: [8]u8 = undefined;
++                try pack.read(io, wi, .{ .offset = x * er.values, .len = er.values }, &wrow);
++                try pack.read(io, si, .{ .offset = x * 8, .len = 8 }, &srow);
++                if (!std.mem.eql(u8, row[0..er.values], &wrow) or !std.mem.eql(u8, row[er.values..264], &srow)) return error.EngramSampleMismatch;
++            }
+             got.samples += 1;
+-            got.bytes += er.row_bytes;
++            got.bytes += h.row_bytes;
+         }
+         if (full) {
+             const whole = try shaOf(f, io);
+@@ -386,7 +431,8 @@ fn checkText(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const
+ 
+ /// One recorded source tensor against its release pack: file, dtype, shape, offset and length still match.
+ fn sourceMatches(a: Allocator, io: Io, p: *const Pack, s: Source) !void {
+-    const i = p.get(s.name) orelse return error.EngramSourceMismatch;
++    var buf: [256]u8 = undefined;
++    const i = p.resolve(s.name, &buf) orelse return error.EngramSourceMismatch;
+     if (!std.mem.eql(u8, dtypeName(i.dtype), s.dtype) or !std.mem.eql(usize, i.dims(), s.shape) or !std.mem.eql(u8, p.files.items[i.file], s.file) or i.start != s.offset or i.nbytes != s.length) return error.EngramSourceMismatch;
+     const spath = try std.fs.path.join(a, &.{ p.dir, s.file });
+     defer a.free(spath);
+diff --git a/zig/src/families/deepseek_v41/engram_native_test.zig b/zig/src/families/deepseek_v41/engram_native_test.zig
+index 76deb6d..1792c44 100644
+--- a/zig/src/families/deepseek_v41/engram_native_test.zig
++++ b/zig/src/families/deepseek_v41/engram_native_test.zig
+@@ -3,6 +3,10 @@
+ const std = @import("std");
+ const testing = std.testing;
+ const er = @import("engram_rows.zig");
++const ep = @import("engram_pack.zig");
++const em = @import("engram_manifest.zig");
++const pk = @import("pack.zig");
++const Pack = pk.Pack;
+ 
+ /// One deterministic native row: 32 U32 words, then 8 BF16 scales and 8 BF16 biases.
+ fn putNativeRow(row: []u8, seed: u64) void {
+@@ -66,3 +70,32 @@ test "a native shard reads rows at the header's 160-byte size" {
+         try testing.expectEqualSlices(u16, want[0..64], again[i * 64 ..][0..64]);
+     }
+ }
++
++test "a prefixed native table packs, verifies, and manifests" {
++    const a = testing.allocator;
++    const io = testing.io;
++    const rows = 4;
++    const image = try pk.image(a, &.{
++        .{ .name = "language_model.layers.1.engram.embed.weight", .dtype = "U32", .shape = &.{ rows, 32 } },
++        .{ .name = "language_model.layers.1.engram.embed.scales", .dtype = "BF16", .shape = &.{ rows, 8 } },
++        .{ .name = "language_model.layers.1.engram.embed.biases", .dtype = "BF16", .shape = &.{ rows, 8 } },
++    });
++    defer a.free(image);
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = image });
++    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
++    defer a.free(root);
++    var p = try Pack.open(a, io, root);
++    defer p.deinit();
++    const t = try ep.tableOf(&p, 1);
++    try testing.expectEqual(er.RowFormat.affine4, t.format);
++    try testing.expectEqual(@as(u64, rows), try ep.pack(a, io, &p, tmp.dir, 1, 2, null));
++    const v = try ep.verify(a, io, &p, root, &.{1}, rows, 7);
++    try testing.expectEqual(@as(u64, rows), v.rows);
++    try testing.expectEqual(@as(u64, 0), v.bad);
++    const m = try em.manifestFor(a, io, root, root, 7);
++    try testing.expectEqual(@as(u64, 1), m.tables);
++    const got = try em.check(a, io, root, root, false);
++    try testing.expect(got.samples > 0);
++}
+diff --git a/zig/src/families/deepseek_v41/engram_pack.zig b/zig/src/families/deepseek_v41/engram_pack.zig
+index 7b0d10c..72522e8 100644
+--- a/zig/src/families/deepseek_v41/engram_pack.zig
++++ b/zig/src/families/deepseek_v41/engram_pack.zig
+@@ -16,9 +16,9 @@ pub fn shardName(buf: []u8, layer: u32) ![]u8 {
+ }
+ 
+ /// The shard's header block: magic, layer, first row, end row, total rows, row bytes, then zeros to 4096.
+-pub fn header(layer: u32, rows: u64) [er.header_bytes]u8 {
++pub fn header(layer: u32, rows: u64, row_bytes: u64) [er.header_bytes]u8 {
+     var b: [er.header_bytes]u8 = @splat(0);
+-    for ([_]u64{ er.magic, layer, 0, rows, rows, er.row_bytes }, 0..) |v, i| std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);
++    for ([_]u64{ er.magic, layer, 0, rows, rows, row_bytes }, 0..) |v, i| std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);
+     return b;
+ }
+ 
+@@ -29,8 +29,14 @@ pub fn layersOf(a: std.mem.Allocator, p: *const Pack) ![]u32 {
+     var it = p.names.iterator();
+     while (it.next()) |e| {
+         const n = e.key_ptr.*;
+-        if (!std.mem.startsWith(u8, n, "layers.") or !std.mem.endsWith(u8, n, weight_suffix)) continue;
+-        const id = n["layers.".len .. n.len - weight_suffix.len];
++        if (!std.mem.endsWith(u8, n, weight_suffix)) continue;
++        const end = n.len - weight_suffix.len;
++        const id = if (std.mem.startsWith(u8, n, "layers."))
++            n["layers.".len..end]
++        else if (std.mem.lastIndexOf(u8, n[0..end], ".layers.")) |at|
++            n[at + ".layers.".len .. end]
++        else
++            continue;
+         try out.append(a, std.fmt.parseInt(u32, id, 10) catch continue);
+     }
+     std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+@@ -81,27 +87,52 @@ pub fn pack(a: std.mem.Allocator, io: Io, p: *const Pack, dir: Io.Dir, layer: u3
+         if (!closed) file.close(io);
+         dir.deleteFile(io, part) catch {};
+     }
+-    const head = header(layer, t.rows);
++    const row_bytes: u64 = if (t.format == .affine4) er.native_row_bytes else er.fp8_row_bytes;
++    const head = header(layer, t.rows, row_bytes);
+     try file.writePositionalAll(io, &head, 0);
+     const n: usize = @intCast(@min(chunk, t.rows));
+-    const codes = try a.alloc(u8, n * er.values);
+-    defer a.free(codes);
+-    const scales = try a.alloc(u8, n * 8);
+-    defer a.free(scales);
+-    const out = try a.alloc(u8, n * er.row_bytes);
++    const out = try a.alloc(u8, n * row_bytes);
+     defer a.free(out);
+     var row: u64 = 0;
+-    while (row < t.rows) {
+-        const k: usize = @intCast(@min(n, t.rows - row));
+-        try p.read(io, t.weight, .{ .offset = row * er.values, .len = k * er.values }, codes[0 .. k * er.values]);
+-        try p.read(io, t.scale, .{ .offset = row * 8, .len = k * 8 }, scales[0 .. k * 8]);
+-        for (0..k) |i| {
+-            @memcpy(out[i * er.row_bytes ..][0..er.values], codes[i * er.values ..][0..er.values]);
+-            @memcpy(out[i * er.row_bytes + er.values ..][0..8], scales[i * 8 ..][0..8]);
++    if (t.format == .fp8) {
++        const codes = try a.alloc(u8, n * er.values);
++        defer a.free(codes);
++        const scales = try a.alloc(u8, n * 8);
++        defer a.free(scales);
++        while (row < t.rows) {
++            const k: usize = @intCast(@min(n, t.rows - row));
++            try p.read(io, t.weight, .{ .offset = row * er.values, .len = k * er.values }, codes[0 .. k * er.values]);
++            try p.read(io, t.scale, .{ .offset = row * 8, .len = k * 8 }, scales[0 .. k * 8]);
++            for (0..k) |i| {
++                @memcpy(out[i * row_bytes ..][0..er.values], codes[i * er.values ..][0..er.values]);
++                @memcpy(out[i * row_bytes + er.values ..][0..8], scales[i * 8 ..][0..8]);
++            }
++            try file.writePositionalAll(io, out[0 .. k * row_bytes], er.header_bytes + row * row_bytes);
++            row += k;
++            if (progress) |f| f(layer, row, t.rows);
++        }
++    } else {
++        const words = try a.alloc(u8, n * 128);
++        defer a.free(words);
++        const scales = try a.alloc(u8, n * 16);
++        defer a.free(scales);
++        const biases = try a.alloc(u8, n * 16);
++        defer a.free(biases);
++        const bsrc = t.biases orelse return error.InvalidEngramTable;
++        while (row < t.rows) {
++            const k: usize = @intCast(@min(n, t.rows - row));
++            try p.read(io, t.weight, .{ .offset = row * 128, .len = k * 128 }, words[0 .. k * 128]);
++            try p.read(io, t.scale, .{ .offset = row * 16, .len = k * 16 }, scales[0 .. k * 16]);
++            try p.read(io, bsrc, .{ .offset = row * 16, .len = k * 16 }, biases[0 .. k * 16]);
++            for (0..k) |i| {
++                @memcpy(out[i * row_bytes ..][0..128], words[i * 128 ..][0..128]);
++                @memcpy(out[i * row_bytes + 128 ..][0..16], scales[i * 16 ..][0..16]);
++                @memcpy(out[i * row_bytes + 144 ..][0..16], biases[i * 16 ..][0..16]);
++            }
++            try file.writePositionalAll(io, out[0 .. k * row_bytes], er.header_bytes + row * row_bytes);
++            row += k;
++            if (progress) |f| f(layer, row, t.rows);
+         }
+-        try file.writePositionalAll(io, out[0 .. k * er.row_bytes], er.header_bytes + row * er.row_bytes);
+-        row += k;
+-        if (progress) |f| f(layer, row, t.rows);
+     }
+     try file.sync(io);
+     file.close(io);
+@@ -134,13 +165,21 @@ pub fn verify(a: std.mem.Allocator, io: Io, p: *const Pack, dir_path: []const u8
+             }
+             try rows.rows(li, idx[0..k], er.values, got[0 .. k * er.values]);
+             for (idx[0..k], 0..) |x, i| {
+-                var codes: [er.values]u8 = undefined;
+-                var sc: [8]u8 = undefined;
+                 const r: u64 = @intCast(x);
+-                try p.read(io, t.weight, .{ .offset = r * er.values, .len = er.values }, &codes);
+-                try p.read(io, t.scale, .{ .offset = r * 8, .len = 8 }, &sc);
+                 var exp: [er.values]u16 = undefined;
+-                try (er.Table{ .weights = &codes, .scales = &sc, .rows = 1 }).row(0, &exp);
++                if (t.format == .fp8) {
++                    var codes: [er.values]u8 = undefined;
++                    var sc: [8]u8 = undefined;
++                    try p.read(io, t.weight, .{ .offset = r * er.values, .len = er.values }, &codes);
++                    try p.read(io, t.scale, .{ .offset = r * 8, .len = 8 }, &sc);
++                    try (er.Table{ .weights = &codes, .scales = &sc, .rows = 1 }).row(0, &exp);
++                } else {
++                    var rec: [160]u8 = undefined;
++                    try p.read(io, t.weight, .{ .offset = r * 128, .len = 128 }, rec[0..128]);
++                    try p.read(io, t.scale, .{ .offset = r * 16, .len = 16 }, rec[128..144]);
++                    try p.read(io, t.biases orelse return error.InvalidEngramTable, .{ .offset = r * 16, .len = 16 }, rec[144..160]);
++                    try er.decodeRow(&rec, er.values, null, &exp);
++                }
+                 v.rows += 1;
+                 if (!std.mem.eql(u16, &exp, got[i * er.values ..][0..er.values])) v.bad += 1;
+             }
+diff --git a/zig/src/families/deepseek_v41/engram_tables.zig b/zig/src/families/deepseek_v41/engram_tables.zig
+index 9278255..2ba989c 100644
+--- a/zig/src/families/deepseek_v41/engram_tables.zig
++++ b/zig/src/families/deepseek_v41/engram_tables.zig
+@@ -2,19 +2,35 @@
+ const std = @import("std");
+ const Pack = @import("pack.zig").Pack;
+ const Info = @import("pack.zig").Info;
++const er = @import("engram_rows.zig");
++
+ pub const Plan = struct {
+     layer: u32,
+     rows: u64,
++    format: er.RowFormat,
+     weight: Info,
+     scale: Info,
++    biases: ?Info = null,
++
++    /// The release table, in the FP8 form (`weight`/`scale`) or the native affine form
++    /// (`weight` U32 words, `scales`, `biases`).
+     pub fn fromPack(pack: *const Pack, layer: u32, rows: u64) !Plan {
+         if (rows == 0 or rows > std.math.maxInt(u32)) return error.InvalidEngramTable;
+-        var buf: [128]u8 = undefined;
++        var buf: [160]u8 = undefined;
+         const weight = try pack.need(try std.fmt.bufPrint(&buf, "layers.{d}.engram.embed.weight", .{layer}));
+-        const scale = try pack.need(try std.fmt.bufPrint(&buf, "layers.{d}.engram.embed.scale", .{layer}));
+-        if (!weight.is(.f8_e4m3, &.{ @intCast(rows), 256 }) or !scale.is(.f8_e8m0, &.{ @intCast(rows), 8 }))
+-            return error.InvalidEngramTable;
+-        return .{ .layer = layer, .rows = rows, .weight = weight, .scale = scale };
++        if (weight.is(.f8_e4m3, &.{ @intCast(rows), 256 })) {
++            const scale = try pack.need(try std.fmt.bufPrint(&buf, "layers.{d}.engram.embed.scale", .{layer}));
++            if (!scale.is(.f8_e8m0, &.{ @intCast(rows), 8 })) return error.InvalidEngramTable;
++            return .{ .layer = layer, .rows = rows, .format = .fp8, .weight = weight, .scale = scale };
++        }
++        if (weight.is(.u32, &.{ @intCast(rows), 32 })) {
++            const scale = try pack.need(try std.fmt.bufPrint(&buf, "layers.{d}.engram.embed.scales", .{layer}));
++            const biases = try pack.need(try std.fmt.bufPrint(&buf, "layers.{d}.engram.embed.biases", .{layer}));
++            if (!scale.is(.bf16, &.{ @intCast(rows), 8 }) or !biases.is(.bf16, &.{ @intCast(rows), 8 }))
++                return error.InvalidEngramTable;
++            return .{ .layer = layer, .rows = rows, .format = .affine4, .weight = weight, .scale = scale, .biases = biases };
++        }
++        return error.InvalidEngramTable;
+     }
+ };
+ test "separate rowwise scales use eight entries per row, not a matrix scale grid" {
 diff --git a/zig/src/families/deepseek_v41/forward_glue.zig b/zig/src/families/deepseek_v41/forward_glue.zig
 index 05bc9cd..b3be501 100644
 --- a/zig/src/families/deepseek_v41/forward_glue.zig
