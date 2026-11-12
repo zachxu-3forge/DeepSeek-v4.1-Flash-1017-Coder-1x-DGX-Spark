@@ -350,7 +350,7 @@ index 13561bc..05e4763 100644
      const a = std.testing.allocator;
      var cfg = @import("config.zig").tiny();
 diff --git a/zig/src/families/deepseek_v41/affine_runtime.zig b/zig/src/families/deepseek_v41/affine_runtime.zig
-index 6a3cbc5..0f03e1e 100644
+index 6a3cbc5..2ce1b4e 100644
 --- a/zig/src/families/deepseek_v41/affine_runtime.zig
 +++ b/zig/src/families/deepseek_v41/affine_runtime.zig
 @@ -16,7 +16,10 @@ const affine_launch = @import("affine_launch.zig");
@@ -377,7 +377,7 @@ index 6a3cbc5..0f03e1e 100644
              count += 1;
          };
          a.experts = try gpa.alloc(ExpertModule, count);
-@@ -68,7 +71,10 @@ pub const Affine = struct {
+@@ -68,37 +71,50 @@ pub const Affine = struct {
          a.expert_weights = .{ .gpa = gpa, .digest = false };
          var made: usize = 0;
          errdefer {
@@ -389,17 +389,29 @@ index 6a3cbc5..0f03e1e 100644
              gpa.free(a.experts);
              a.expert_map.deinit(gpa);
              a.expert_weights.close() catch {};
-@@ -76,17 +82,23 @@ pub const Affine = struct {
-         var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
-         defer builder.deinit();
+         }
+-        var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+-        defer builder.deinit();
          for (bindings) |b| {
 -            if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !inLayers(b.name, layers)) continue;
+-            var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
+-            try builder.add(images.weight);
+-            try builder.add(images.scales);
+-            try builder.add(images.biases);
+-            images = undefined;
 +            if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !exec.selected(&b, layers)) continue;
-             var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
-             try builder.add(images.weight);
-             try builder.add(images.scales);
-             try builder.add(images.biases);
-             images = undefined;
++            // Upload one stack at a time: the host images are the second copy that would
++            // otherwise make the full model's peak exceed a 128 GB GB10.
++            {
++                var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++                defer builder.deinit();
++                var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
++                try builder.add(images.weight);
++                try builder.add(images.scales);
++                try builder.add(images.biases);
++                images = undefined;
++                try a.expert_weights.upload(d, &builder);
++            }
 +            const name = try gpa.dupe(u8, b.name);
 +            const role = gpa.dupe(u8, if (b.role.len > 0) b.role else b.name) catch |err| {
 +                gpa.free(name);
@@ -416,7 +428,10 @@ index 6a3cbc5..0f03e1e 100644
              };
              made += 1;
          }
-@@ -97,8 +109,8 @@ pub const Affine = struct {
+         if (made != a.experts.len) return error.AffineExpertMismatch;
+         if (made > 0) {
+-            try a.expert_weights.upload(d, &builder);
+             try a.expert_map.ensureTotalCapacity(gpa, @intCast(made));
              for (a.experts, 0..) |*m, i| {
                  const b = findBinding(bindings, m.name) orelse return error.AffineExpertMismatch;
                  m.dev = try affine_bind.bind(&a.expert_weights, b, m.experts);
@@ -427,7 +442,7 @@ index 6a3cbc5..0f03e1e 100644
              }
          }
          return a;
-@@ -109,26 +121,17 @@ pub const Affine = struct {
+@@ -109,26 +125,17 @@ pub const Affine = struct {
          return null;
      }
  
@@ -556,7 +571,7 @@ index 3afd452..e53f53b 100644
      try e.paced(try e.fmt("s.L{d}.pf.x", .{nxt}), e.take(try e.srcSizes(try e.l2pfSources(nxt, .x))));
  }
 diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
-index da42e3e..423a2f9 100644
+index da42e3e..46f0bc9 100644
 --- a/zig/src/families/deepseek_v41/cuda_model.zig
 +++ b/zig/src/families/deepseek_v41/cuda_model.zig
 @@ -234,11 +234,18 @@ pub const Model = struct {
@@ -581,7 +596,7 @@ index da42e3e..423a2f9 100644
              const cfg_path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
              const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
              defer gpa.free(cfg_text);
-@@ -250,7 +257,17 @@ pub const Model = struct {
+@@ -250,7 +257,19 @@ pub const Model = struct {
              defer dispatch.deinit();
              var bindings = try @import("affine_exec.zig").build(gpa, &dispatch);
              defer bindings.deinit();
@@ -590,8 +605,10 @@ index da42e3e..423a2f9 100644
 +            if (try @import("sys").environment.read(?f64, "TF_DSV41_AFFINE_MAX_GIB", null)) |max_gib| {
 +                if (!std.math.isFinite(max_gib) or max_gib <= 0) return error.AffineBudgetExceeded;
 +                const limit: u64 = @intFromFloat(max_gib * (1 << 30));
-+                // Peak includes the host builder images while the expert stacks upload.
-+                const peak = budget.totalPacked() + budget.expert_raw;
++                // Peak includes one expert stack's host images while it uploads; the
++                // loader streams stacks one at a time.
++                const host_one = if (budget.expert_stacks > 0) budget.expert_raw / budget.expert_stacks else 0;
++                const peak = budget.totalPacked() + host_one;
 +                if (peak > limit) {
 +                    if (!quiet) std.log.err("dsv41 affine: peak {d:.2} GiB exceeds TF_DSV41_AFFINE_MAX_GIB={d:.2}", .{ @as(f64, @floatFromInt(peak)) / (1 << 30), max_gib });
 +                    return error.AffineBudgetExceeded;
@@ -600,7 +617,7 @@ index da42e3e..423a2f9 100644
              if (!quiet) std.log.info("dsv41 affine bytes: linears raw {d:.2} GiB, packed {d:.2} GiB; experts raw {d:.2} GiB (largest packed expert {d:.2} MiB); total raw {d:.2} GiB, resident with packed linears {d:.2} GiB", .{
                  @as(f64, @floatFromInt(budget.linear_raw)) / (1 << 30),
                  @as(f64, @floatFromInt(budget.linear_packed_bytes)) / (1 << 30),
-@@ -304,84 +321,83 @@ pub const Model = struct {
+@@ -304,84 +323,83 @@ pub const Model = struct {
                      }
                  }
              }
@@ -755,7 +772,7 @@ index da42e3e..423a2f9 100644
          m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
          if (m.affine != null) m.runner.affine = &m.affine.?;
          // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed, JSON written at close
-@@ -389,6 +405,7 @@ pub const Model = struct {
+@@ -389,6 +407,7 @@ pub const Model = struct {
          const topp = try @import("sys").environment.read(?f64, "TF_DSV41_EXPERT_TOPP", null);
          // TF_DSV41_R1=1, or the eight separate R1 knobs (the knob reader's r1)
          const r1 = try @import("serve_knobs.zig").r1(&@import("serve_knobs.zig").env);
@@ -763,7 +780,7 @@ index da42e3e..423a2f9 100644
          m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
          try @import("engine_hooks.zig").open(&m.f); // the forward's later-layer hooks and prefill state
          m.f.layers = backbone;
-@@ -405,7 +422,7 @@ pub const Model = struct {
+@@ -405,7 +424,7 @@ pub const Model = struct {
              // the long-prompt stream scratch the buffer plan will hold (not in the measured terms)
              ko.resident = if ((try longpf.lazyEnv())) 0 else @import("serve_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
              // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
@@ -772,7 +789,7 @@ index da42e3e..423a2f9 100644
              tr.step("forward", cuda.usage(false));
              m.boot_check = try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
              m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
-@@ -418,9 +435,9 @@ pub const Model = struct {
+@@ -418,9 +437,9 @@ pub const Model = struct {
          for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
          var bp = try m.f.plan(buckets[0..nb]);
          // the pass ingests a prompt's prefilled tail in one call (the drafter's window) with the own prefill
@@ -784,7 +801,7 @@ index da42e3e..423a2f9 100644
          const rows_cap = try batch.capFromEnv();
          if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
          // TF_DSV41_SLOT_DRAFTS=1: DSpark over every live slot (off: drafts are refused with several slots)
-@@ -432,27 +449,29 @@ pub const Model = struct {
+@@ -432,27 +451,29 @@ pub const Model = struct {
          if ((try longpf.lazyEnv())) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
              pf.state(&m.f).long.lazy = .{ .bytes = kv.value };
          };
@@ -830,7 +847,7 @@ index da42e3e..423a2f9 100644
          // no size cap: a 1M limit + 2,048 rows is 538 MB
          const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
          const RopeSink = struct {
-@@ -485,12 +504,12 @@ pub const Model = struct {
+@@ -485,12 +506,12 @@ pub const Model = struct {
              m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks, .checkpoint = if (so.disk != null) try prepared.packIdentity(io, &m.pack, if (cache) |*c| c else null) else null });
          }
          tr.step("engram host and sessions", cuda.usage(false));

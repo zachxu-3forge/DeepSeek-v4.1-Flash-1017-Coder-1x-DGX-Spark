@@ -90,11 +90,13 @@ next step.
   returning `AffineForwardNotPorted`; unset still stops at `AffineLoadDisabled` after the
   plan/budget guard.
   Affine prefill is skipped (`own_prefill=false`), and `r1` is refused explicitly.
-- **Fixed:** `TF_DSV41_AFFINE_MAX_GIB` checks the peak (resident packed linears + host
-  expert images); `Affine.deinit` saves the GPA before `Weights.close` clears it.
+- **Fixed:** `TF_DSV41_AFFINE_MAX_GIB` checks the peak (resident packed linears + one
+  host expert stack; `Affine.load` now streams expert stacks instead of holding all host
+  images at once); `Affine.deinit` saves the GPA before `Weights.close` clears it.
 - **Tests:** new `Pack.resolve` prefixed-name test, affine role test, dense empty-layout
-  assertion, and graph `moe_host` audit test. `test-dsv41-forward` 203 pass, 1 skip, and
-  the same `prepared.zig` mtime-precision failure on the mounted filesystem;
+  assertion, graph `moe_host` audit test, and native Engram pack/manifest test.
+  `test-dsv41-forward` 203 pass, 1 skip; `test-dsv41-shared` 129 pass, 1 skip; both have
+  only the same `prepared.zig` mtime-precision failure on the mounted filesystem.
   `compile-dsv41-device-host` and `compile-dsv41-server` pass. `0001`-`0036` apply cleanly.
 - **Fixed:** the Zig Engram packer and manifest now understand native 160-byte rows too:
   `engram_tables.Plan` detects U32/`scales`/`biases`, `engram_pack` copies native rows and

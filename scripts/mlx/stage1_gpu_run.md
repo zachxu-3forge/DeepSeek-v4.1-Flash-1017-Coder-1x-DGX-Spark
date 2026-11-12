@@ -115,6 +115,7 @@ dense/native half of the affine checkpoint:
 
 ```sh
 TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_LOAD=1 \
+TF_DSV41_GRAPHS=0 TF_DSV41_AFFINE_MAX_GIB=118 \
 MODEL_DIR="$OVERLAY" OUT_DIR="$WORK/stage1-load" \
   scripts/mlx/run_container.sh tensorfold-dsv41 serve /model \
   2>&1 | tee "$WORK/affine-load.log"
