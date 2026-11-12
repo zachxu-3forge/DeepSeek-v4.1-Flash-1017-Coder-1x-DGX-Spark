@@ -556,7 +556,7 @@ index 3afd452..e53f53b 100644
      try e.paced(try e.fmt("s.L{d}.pf.x", .{nxt}), e.take(try e.srcSizes(try e.l2pfSources(nxt, .x))));
  }
 diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
-index da42e3e..afbac01 100644
+index da42e3e..423a2f9 100644
 --- a/zig/src/families/deepseek_v41/cuda_model.zig
 +++ b/zig/src/families/deepseek_v41/cuda_model.zig
 @@ -234,11 +234,18 @@ pub const Model = struct {
@@ -600,15 +600,6 @@ index da42e3e..afbac01 100644
              if (!quiet) std.log.info("dsv41 affine bytes: linears raw {d:.2} GiB, packed {d:.2} GiB; experts raw {d:.2} GiB (largest packed expert {d:.2} MiB); total raw {d:.2} GiB, resident with packed linears {d:.2} GiB", .{
                  @as(f64, @floatFromInt(budget.linear_raw)) / (1 << 30),
                  @as(f64, @floatFromInt(budget.linear_packed_bytes)) / (1 << 30),
-@@ -259,7 +276,7 @@ pub const Model = struct {
-                 @as(f64, @floatFromInt(budget.totalRaw())) / (1 << 30),
-                 @as(f64, @floatFromInt(budget.totalPacked())) / (1 << 30),
-             });
--            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", false)) {
-+            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", true)) {
-                 // the dense/native half of the affine checkpoint: norms, mHC, router, wo_a, embed, head
-                 const blocks = if (o.layers) |ls| ls else blk: {
-                     const all = try a.alloc(u32, m.cfg.layers);
 @@ -304,84 +321,83 @@ pub const Model = struct {
                      }
                  }

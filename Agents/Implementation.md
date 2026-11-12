@@ -86,8 +86,9 @@ next step.
   empty `exl3.Layout` instead of `undefined`.
 - **Fixed:** affine prefetch (`F`/`O`/`X`) is a no-op, so emit no longer hits `NoWidth`
   with empty EXL3 widths. `glue.moe_host` is refused by `graphs.audit`.
-- **Fixed:** `TF_DSV41_AFFINE_LOAD` defaults on for affine checkpoints; the boot path now
-  continues into the runner/forward instead of returning `AffineForwardNotPorted`.
+- **Fixed:** `TF_DSV41_AFFINE_LOAD=1` now continues into the runner/forward instead of
+  returning `AffineForwardNotPorted`; unset still stops at `AffineLoadDisabled` after the
+  plan/budget guard.
   Affine prefill is skipped (`own_prefill=false`), and `r1` is refused explicitly.
 - **Fixed:** `TF_DSV41_AFFINE_MAX_GIB` checks the peak (resident packed linears + host
   expert images); `Affine.deinit` saves the GPA before `Weights.close` clears it.

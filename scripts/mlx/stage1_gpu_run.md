@@ -82,8 +82,11 @@ Expected guard line:
 ```text
 dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; experts raw 79.10 GiB (largest packed expert 3.52 MiB); total raw 83.37 GiB, resident with packed linears 83.38 GiB
 dsv41 affine: 43 layers, ... dispatch: 307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4
-AffineForwardNotPorted
+AffineLoadDisabled
 ```
+
+`AffineLoadDisabled` is the guard's expected stop when `TF_DSV41_AFFINE_LOAD` is
+unset; the plan and budget are still printed.
 
 Then the smoke/sweep run:
 
@@ -100,7 +103,7 @@ Expected in `smoke.log`:
 - `affine smoke attn layers.0: qa0=... q0=... kv0=... kvn0=...` for the attention chain;
 - `smoke values match`;
 - `dispatch counts match`;
-- `AffineForwardNotPorted` after the smoke.
+- `AffineLoadDisabled` after the smoke (the smoke path does not set `TF_DSV41_AFFINE_LOAD`).
 
 The harness compares every CPU/GPU pair with `abs(gpu - cpu) <= 0.01 + 0.01 * abs(cpu)`
 and checks `wq_a`, `shared_experts.w1`, and expert 0 against `reference_layer.json`.
@@ -123,8 +126,12 @@ Expected:
 dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; ...
 dsv41 affine dense: N tensors, M GiB
 dsv41 affine load: 309 linears packed, 4.30 GiB; K expert stacks, E GiB
-AffineForwardNotPorted
 ```
+
+The process now continues into the runner and forward. Keep `TF_DSV41_GRAPHS=0` for the
+first affine run: `glue.moe_host` synchronizes and reads the device on the host, so the
+graph audit refuses it. Set `TF_DSV41_AFFINE_MAX_GIB` to a value that leaves the 4-8 GiB
+reserve; the load refuses before uploading when the peak exceeds it.
 
 The dense set is the norms, mHC mixers, router gate/bias, `wo_a`, this rank’s embed rows
 and head rows; the linears are the packed projections; the expert stacks are raw for the
@@ -145,7 +152,7 @@ Stop and send the failing module plus its CPU/GPU values.
 
 ## 6. Next after the sweep passes
 
-The remaining Stage 1 gate is the one-layer forward. The sweep proves every layer-0
-affine projection and expert stack; the forward still needs the attention and MoE
-composition wired into the engine call graph. Do not start that in the same GPU window
-as the first sweep unless the sweep is clean.
+The one-layer forward is now wired: `TF_DSV41_AFFINE_LOAD=1` continues from the dense
+load into the runner/forward instead of returning a guard. Run it with graphs off and a
+4-8 GiB reserve, then compare the first window against the MLX reference. Do not start
+that in the same GPU window as the first sweep unless the sweep is clean.

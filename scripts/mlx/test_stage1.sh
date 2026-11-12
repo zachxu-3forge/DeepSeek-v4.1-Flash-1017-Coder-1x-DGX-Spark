@@ -114,11 +114,12 @@ if [[ "$CONTAINER" == "1" ]]; then
   # only layer 0.
   set +e
   TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 \
+    TF_DSV41_AFFINE_LOAD=${TF_DSV41_AFFINE_LOAD:-$EXPECT_FORWARD} \
     timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
     >"$OUT_DIR/engine.log" 2>&1
   rc=$?
   set -e
-  if grep -q "AffineForwardNotPorted" "$OUT_DIR/engine.log"; then
+  if grep -qE "AffineForwardNotPorted|AffineLoadDisabled" "$OUT_DIR/engine.log"; then
     if [[ "$EXPECT_FORWARD" == "1" ]]; then
       lines+=("| engine | FAIL | affine forward still guarded |")
       fail=1
