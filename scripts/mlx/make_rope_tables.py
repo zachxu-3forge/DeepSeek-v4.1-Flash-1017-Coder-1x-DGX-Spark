@@ -84,16 +84,18 @@ def build(
     original: int = 65536,
     beta_fast: float = 32.0,
     beta_slow: float = 1.0,
+    apply_mscale: bool = True,
 ) -> None:
     window = table(window_freqs(theta), rows)
-    compressed = table(compressed_freqs(compress_theta, factor, original, beta_fast, beta_slow), rows, mscale(factor))
+    scale = mscale(factor) if apply_mscale else 1.0
+    compressed = table(compressed_freqs(compress_theta, factor, original, beta_fast, beta_slow), rows, scale)
     with open(out_path, "wb") as f:
         f.write(struct.pack("<4sIII", b"ROPE", rows, DIM, 0))
         window.tofile(f)
         compressed.tofile(f)
     print(
         f"wrote {out_path}: {rows} rows, window theta {theta}, compressed theta {compress_theta}, "
-        f"YaRN factor {factor} over {original}, mscale {mscale(factor):.7f}"
+        f"YaRN factor {factor} over {original}, mscale {scale:.7f}"
     )
 
 
@@ -127,7 +129,7 @@ def self_test() -> int:
     return 0
 
 
-def check(path: str) -> int:
+def check(path: str, apply_mscale: bool = True) -> int:
     with open(path, "rb") as f:
         head = f.read(HEADER)
         if len(head) != HEADER:
@@ -143,7 +145,7 @@ def check(path: str) -> int:
         raise SystemExit(f"{path}: short table")
     window = window_freqs(10000.0)
     compressed = compressed_freqs(160000.0, 16.0, 65536)
-    scale = mscale(16.0)
+    scale = mscale(16.0) if apply_mscale else 1.0
     picks = sorted({0, 1, rows // 2, rows - 1})
     for pos in picks:
         for i in (0, 1, DIM // 2 - 1):
@@ -168,6 +170,7 @@ def main() -> int:
     ap.add_argument("--original", type=int, default=65536)
     ap.add_argument("--beta-fast", type=float, default=32.0)
     ap.add_argument("--beta-slow", type=float, default=1.0)
+    ap.add_argument("--no-mscale", action="store_true", help="leave the compressed table unscaled (the target reference applies YaRN's attention scale itself)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -175,12 +178,12 @@ def main() -> int:
     if args.check:
         if args.out:
             ap.error("OUT and --check are exclusive")
-        return check(args.check)
+        return check(args.check, not args.no_mscale)
     if not args.out:
         ap.error("OUT is required unless --self-test or --check is used")
     if args.rows <= 0:
         ap.error("--rows must be positive")
-    build(args.out, args.rows, args.theta, args.compress_theta, args.factor, args.original, args.beta_fast, args.beta_slow)
+    build(args.out, args.rows, args.theta, args.compress_theta, args.factor, args.original, args.beta_fast, args.beta_slow, not args.no_mscale)
     return 0
 
 

@@ -18,21 +18,21 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Review fixes applied; affine boot path next |
+| Overall status | Affine boot path wired; one-layer GPU gate next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
 | Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` and `0035` rebuild pending) |
-| Last updated | 2026-11-11 |
+| Last updated | 2026-11-12 |
 
 ## Phase tracker
 
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches; affine dense/linear/expert loaders and host-loop MoE wired; affine boot path next |
+| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches; affine dense/linear/expert loaders, host-loop MoE, and the boot path are wired; one-layer GPU gate pending |
 | 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
 | 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; native 160 B reader and packer tested; real-shard check pending |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
@@ -70,6 +70,34 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
+
+- **Phase:** 1 (patch review follow-up; host-only, no GPU).
+- **Fixed:** `Pack.need` now resolves a canonical tensor name under the checkpoint's
+  `language_model.`/`model.` prefixes. The dense/native plan uses it, so `embed`, `norm`,
+  `head`, and every block native load from the real MLX pack.
+- **Fixed:** affine modules carry both the pack spelling and an emitter role (`L<i>.…`).
+  `affine_linears`, `Affine.expert`, the `tf_dsv41_affine_v1.linear` hash, and `moeHost`
+  all use the role; `inLayers` is gone, so `language_model.layers.*` experts load and
+  `TF_DSV41_LAYERS` filters linears and experts by the stored layer index.
+- **Fixed:** the dense plan drops the affine `attn.indexer.weights_proj.weight` native;
+  the emitter routes it through `upstreamOrAffine`; dense expert layouts are a valid
+  empty `exl3.Layout` instead of `undefined`.
+- **Fixed:** affine prefetch (`F`/`O`/`X`) is a no-op, so emit no longer hits `NoWidth`
+  with empty EXL3 widths. `glue.moe_host` is refused by `graphs.audit`.
+- **Fixed:** `TF_DSV41_AFFINE_LOAD` defaults on for affine checkpoints; the boot path now
+  continues into the runner/forward instead of returning `AffineForwardNotPorted`.
+  Affine prefill is skipped (`own_prefill=false`), and `r1` is refused explicitly.
+- **Fixed:** `TF_DSV41_AFFINE_MAX_GIB` checks the peak (resident packed linears + host
+  expert images); `Affine.deinit` saves the GPA before `Weights.close` clears it.
+- **Tests:** new `Pack.resolve` prefixed-name test, affine role test, dense empty-layout
+  assertion, and graph `moe_host` audit test. `test-dsv41-forward` 203 pass, 1 skip, and
+  the same `prepared.zig` mtime-precision failure on the mounted filesystem;
+  `compile-dsv41-device-host` and `compile-dsv41-server` pass. `0001`-`0036` apply cleanly.
+- **Next:** rebuild the image, run `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` on `dgx1`
+  when free, then the layer-0 sweep and one-layer forward. Real Engram native shards still
+  use `convert_engram.py --verify`; Zig `engram_manifest` remains the FP8 packer's checker.
 
 ### 2026-11-11 - Review fixes: MXFP decode, SwiGLU clamp, affine leak
 

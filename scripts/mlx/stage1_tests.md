@@ -28,7 +28,8 @@ Runs:
 - `test_reference_mixed.py`: MXFP8 E4M3 / MXFP4 E2M1 code points and the mixed decode path.
 - `make_rope_tables.py --self-test`: the 600K YaRN frequencies/scale match `core/rope_yarn.zig`.
 - `make_rope_tables.py --check`: when `$ASSETS_HOST/rope.bin` exists, its header, size,
-  sampled window/YaRN values, and `mscale` are checked.
+  sampled window/YaRN values, and `mscale` are checked. `--no-mscale` selects the
+  unscaled-table convention; match it to the target reference.
 - `translate_config.py --check`: every quantized module has its tensors.
 - `plan_dispatch.py`: expected dispatch counts (307 affine8 linears, 120 expert
   fallbacks, 21 MXFP8, 9 MXFP4). Two affine Engram tables and the DSpark `main_proj`

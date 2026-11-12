@@ -1,0 +1,1026 @@
+diff --git a/zig/src/families/deepseek_v41/affine_budget.zig b/zig/src/families/deepseek_v41/affine_budget.zig
+index f2b0658..9ec756c 100644
+--- a/zig/src/families/deepseek_v41/affine_budget.zig
++++ b/zig/src/families/deepseek_v41/affine_budget.zig
+@@ -49,10 +49,11 @@ fn linearBytes(n: u64, k: u64, bits: u8, group: u32) !Bytes {
+     return .{ .raw = raw, .packed_bytes = packed_bytes };
+ }
+ 
+-pub fn compute(bindings: []const exec.Binding, experts: u32, dspark_experts: u32) !Report {
++pub fn compute(bindings: []const exec.Binding, experts: u32, dspark_experts: u32, layers: ?[]const u32) !Report {
+     var r: Report = .{};
+     for (bindings) |b| {
+         if (b.mode != .affine8_linear and b.mode != .affine_n_expert) continue;
++        if (!exec.selected(&b, layers)) continue;
+         const n: u64 = b.n;
+         const k: u64 = b.k;
+         const bytes = try linearBytes(n, k, b.spec.bits, b.spec.group);
+@@ -63,7 +64,7 @@ pub fn compute(bindings: []const exec.Binding, experts: u32, dspark_experts: u32
+                 r.modules += 1;
+             },
+             .expert => {
+-                const count: u64 = if (std.mem.indexOf(u8, b.name, "mtp.") != null) dspark_experts else experts;
++                const count: u64 = if (b.dspark) dspark_experts else experts;
+                 const raw = std.math.mul(u64, bytes.raw, count) catch return error.BadAffine;
+                 r.expert_raw = std.math.add(u64, r.expert_raw, raw) catch return error.BadAffine;
+                 r.expert_packed_one = @max(r.expert_packed_one, bytes.packed_bytes);
+@@ -83,6 +84,9 @@ fn binding(kind: @import("affine_plan.zig").Kind, name: []const u8, n: u32, k: u
+         .n = n,
+         .k = k,
+         .affine_layout = .{ .n = n, .k = k, .bits = bits, .group = 64 },
++        .role = name,
++        .layer = 0,
++        .dspark = std.mem.startsWith(u8, name, "mtp."),
+     };
+ }
+ 
+@@ -91,7 +95,7 @@ test "budget counts a linear once and an expert stack by its expert count" {
+         binding(.linear, "layers.0.attn.wq_a", 1280, 5120, 8, .affine8_linear),
+         binding(.expert, "layers.0.ffn.experts.w1", 2304, 5120, 2, .affine_n_expert),
+     };
+-    const r = try compute(&b, 192, 128);
++    const r = try compute(&b, 192, 128, null);
+     try std.testing.expectEqual(@as(u32, 1), r.modules);
+     try std.testing.expectEqual(@as(u32, 1), r.expert_stacks);
+     try std.testing.expect(r.linear_raw > 0 and r.linear_packed_bytes > 0);
+@@ -105,8 +109,8 @@ test "MTP experts use the DSpark expert count" {
+     const b = [_]exec.Binding{
+         binding(.expert, "mtp.0.ffn.experts.w1", 2304, 5120, 4, .affine_n_expert),
+     };
+-    const r = try compute(&b, 192, 128);
++    const r = try compute(&b, 192, 128, null);
+     try std.testing.expect(r.expert_raw > 0);
+-    const two = try compute(&b, 192, 256);
++    const two = try compute(&b, 192, 256, null);
+     try std.testing.expectEqual(r.expert_raw * 2, two.expert_raw);
+ }
+diff --git a/zig/src/families/deepseek_v41/affine_dispatch.zig b/zig/src/families/deepseek_v41/affine_dispatch.zig
+index 9b77255..e38935e 100644
+--- a/zig/src/families/deepseek_v41/affine_dispatch.zig
++++ b/zig/src/families/deepseek_v41/affine_dispatch.zig
+@@ -12,11 +12,16 @@ pub const Mode = enum { affine8_linear, affine_n_expert, mxfp8, mxfp4 };
+ 
+ pub const Entry = struct {
+     kind: plan.Kind,
++    /// The pack's spelling.
+     name: []const u8,
+     spec: affine.Spec,
+     mode: Mode,
+     n: u32,
+     k: u32,
++    /// The emitter/runtime name.
++    role: []const u8 = "",
++    layer: u32 = 0,
++    dspark: bool = false,
+ };
+ 
+ pub const Dispatch = struct {
+@@ -58,7 +63,7 @@ pub fn build(gpa: std.mem.Allocator, p: *const plan.Plan) !Dispatch {
+     for (p.layers) |layer| {
+         for (layer.modules) |mod| {
+             const mode = try modeFor(mod.kind, mod.spec);
+-            try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode, .n = mod.layout.n, .k = mod.layout.k });
++            try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .role = mod.role, .layer = mod.layer, .dspark = mod.dspark, .spec = mod.spec, .mode = mode, .n = mod.layout.n, .k = mod.layout.k });
+             switch (mode) {
+                 .affine8_linear => out.linear += 1,
+                 .affine_n_expert => out.expert += 1,
+@@ -69,7 +74,7 @@ pub fn build(gpa: std.mem.Allocator, p: *const plan.Plan) !Dispatch {
+     }
+     for (p.mixed) |mod| {
+         const mode = try modeFor(mod.kind, mod.spec);
+-        try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .spec = mod.spec, .mode = mode, .n = mod.n, .k = mod.k });
++        try entries.append(a, .{ .kind = mod.kind, .name = mod.name, .role = mod.role, .layer = mod.layer, .dspark = mod.dspark, .spec = mod.spec, .mode = mode, .n = mod.n, .k = mod.k });
+         switch (mode) {
+             .affine8_linear => out.linear += 1,
+             .affine_n_expert => out.expert += 1,
+diff --git a/zig/src/families/deepseek_v41/affine_exec.zig b/zig/src/families/deepseek_v41/affine_exec.zig
+index 6010812..45fa898 100644
+--- a/zig/src/families/deepseek_v41/affine_exec.zig
++++ b/zig/src/families/deepseek_v41/affine_exec.zig
+@@ -12,6 +12,7 @@ const dispatch = @import("affine_dispatch.zig");
+ 
+ pub const Binding = struct {
+     kind: plan.Kind,
++    /// The pack's spelling, used to read tensors.
+     name: []const u8,
+     spec: affine.Spec,
+     mode: dispatch.Mode,
+@@ -19,8 +20,21 @@ pub const Binding = struct {
+     k: u32,
+     affine_layout: ?affine.Layout = null,
+     mixed_layout: ?mixed.Layout = null,
++    /// The emitter/runtime name.
++    role: []const u8 = "",
++    layer: u32 = 0,
++    dspark: bool = false,
+ };
+ 
++/// Whether a layer filter admits this binding. DSpark blocks are only selected when the
++/// filter is absent (the backbone range names backbone layers only).
++pub fn selected(b: *const Binding, layers: ?[]const u32) bool {
++    const want = layers orelse return true;
++    if (b.dspark) return false;
++    for (want) |x| if (x == b.layer) return true;
++    return false;
++}
++
+ pub const Bindings = struct {
+     arena: std.heap.ArenaAllocator,
+     items: []Binding,
+@@ -44,6 +58,9 @@ pub fn build(gpa: std.mem.Allocator, d: *const dispatch.Dispatch) !Bindings {
+             .mode = e.mode,
+             .n = e.n,
+             .k = e.k,
++            .role = e.role,
++            .layer = e.layer,
++            .dspark = e.dspark,
+         };
+         switch (e.mode) {
+             .affine8_linear, .affine_n_expert => {
+diff --git a/zig/src/families/deepseek_v41/affine_linears.zig b/zig/src/families/deepseek_v41/affine_linears.zig
+index 2c73c9d..56439d8 100644
+--- a/zig/src/families/deepseek_v41/affine_linears.zig
++++ b/zig/src/families/deepseek_v41/affine_linears.zig
+@@ -69,10 +69,11 @@ pub fn loadAll(
+     kernels: *const cuda.qlinear.AffineNKernels,
+     pack: *const Pack,
+     bindings: []const affine_exec.Binding,
++    layers: ?[]const u32,
+ ) !Set {
+     var count: usize = 0;
+     for (bindings) |b| {
+-        if (b.mode == .affine8_linear and b.affine_layout != null) count += 1;
++        if (b.mode == .affine8_linear and b.affine_layout != null and affine_exec.selected(&b, layers)) count += 1;
+     }
+     var arena = std.heap.ArenaAllocator.init(gpa);
+     errdefer arena.deinit();
+@@ -89,7 +90,7 @@ pub fn loadAll(
+     errdefer hashed.deinit(gpa);
+ 
+     for (bindings) |b| {
+-        if (b.mode != .affine8_linear or b.affine_layout == null) continue;
++        if (b.mode != .affine8_linear or b.affine_layout == null or !affine_exec.selected(&b, layers)) continue;
+         const layout = b.affine_layout.?;
+         var images = try affine_load.readModule(gpa, io, pack, b.name, layout);
+         var builder: named.Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+@@ -105,7 +106,7 @@ pub fn loadAll(
+         const dev = try affine_bind.bind(&weights, &b, 1);
+         var tiles = try affine_pack.packLinear(driver, stream, kernels, &dev, b.n, b.k, b.spec.bits);
+         errdefer tiles.deinit();
+-        const name = try a.dupe(u8, b.name);
++        const name = try a.dupe(u8, if (b.role.len > 0) b.role else b.name);
+         try map.put(gpa, name, made);
+         items[made] = .{ .name = name, .tiles = tiles, .n = b.n, .k = b.k, .bits = b.spec.bits };
+         made += 1;
+diff --git a/zig/src/families/deepseek_v41/affine_plan.zig b/zig/src/families/deepseek_v41/affine_plan.zig
+index 13561bc..05e4763 100644
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -11,10 +11,17 @@ const affine = @import("affine.zig");
+ 
+ pub const Kind = enum { linear, expert };
+ 
++/// The emitter's name for a release projection. The pack's own `name` may carry a
++/// `language_model.` prefix; the role is always `L<layer>.…` (or `mtp.<i>.…` for DSpark).
+ pub const Module = struct {
+     kind: Kind,
+-    /// Canonical module name, e.g. `layers.0.attn.wq_a` or `layers.0.ffn.experts.w1`.
++    /// The pack's spelling, e.g. `language_model.layers.0.attn.wq_a`.
+     name: []const u8,
++    /// The emitter's name, e.g. `L0.attn.wq_a`.
++    role: []const u8,
++    /// Absolute block index (`cfg.layers + i` for DSpark).
++    layer: u32,
++    dspark: bool,
+     spec: affine.Spec,
+     layout: affine.Layout,
+ };
+@@ -24,11 +31,41 @@ pub const Module = struct {
+ pub const Mixed = struct {
+     kind: Kind,
+     name: []const u8,
++    role: []const u8,
++    layer: u32,
++    dspark: bool,
+     spec: affine.Spec,
+     n: u32,
+     k: u32,
+ };
+ 
++fn linearRole(p: names.ReleaseProj) []const u8 {
++    return switch (p) {
++        .wq_a => "attn.wq_a",
++        .wkv => "attn.wkv",
++        .wq_b => "attn.wq_b",
++        .wo_a => "attn.wo_a",
++        .wo_b => "attn.wo_b",
++        .comp_wkv => "attn.comp_wkv",
++        .comp_wgate => "attn.comp_wgate",
++        .ix_wq_b => "attn.ix_wq_b",
++        .ix_wk => "attn.ix_wk",
++        .shared_w1 => "moe.shared.0.w1",
++        .shared_w2 => "moe.shared.0.w2",
++        .shared_w3 => "moe.shared.0.w3",
++        .engram_wkv => "engram.wkv",
++        .engram_embed => "engram.embed",
++    };
++}
++
++fn expertRole(p: names.ExpertProj) []const u8 {
++    return switch (p) {
++        .w1 => "moe.w1",
++        .w2 => "moe.w2",
++        .w3 => "moe.w3",
++    };
++}
++
+ pub const Reason = enum { dense, non_affine, engram };
+ 
+ pub const Skipped = struct {
+@@ -65,7 +102,9 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+     var spell_buf: [160]u8 = undefined;
+     var prefix_buf: [32]u8 = undefined;
+     for (layers, 0..) |*layer, i| {
+-        const prefix = try a.dupe(u8, try names.blockPrefix(cfg, @intCast(i), &prefix_buf));
++        const layer_index: u32 = @intCast(i);
++        const dspark = !cfg.isBackbone(layer_index);
++        const prefix = try a.dupe(u8, try names.blockPrefix(cfg, layer_index, &prefix_buf));
+         const shared = try std.fmt.bufPrint(&name_buf, "{s}.ffn.shared_experts.w1", .{prefix});
+         const has_shared = pack.spellModule(shared, &spell_buf) != null;
+         var modules: std.ArrayList(Module) = .empty;
+@@ -82,8 +121,9 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 try skipped.append(a, .{ .name = name, .reason = .dense });
+                 continue;
+             }
++            const role = try std.fmt.allocPrint(a, "L{d}.{s}", .{ layer_index, linearRole(r.proj) });
+             if (spec.?.mode != .affine) {
+-                try mixed.append(a, .{ .kind = .linear, .name = name, .spec = spec.?, .n = r.n, .k = r.k });
++                try mixed.append(a, .{ .kind = .linear, .name = name, .role = role, .layer = layer_index, .dspark = dspark, .spec = spec.?, .n = r.n, .k = r.k });
+                 continue;
+             }
+             if (r.k == 0 or r.n == 0) {
+@@ -93,6 +133,9 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+             try modules.append(a, .{
+                 .kind = .linear,
+                 .name = name,
++                .role = role,
++                .layer = layer_index,
++                .dspark = dspark,
+                 .spec = spec.?,
+                 .layout = try spec.?.layout(r.n, r.k),
+             });
+@@ -103,12 +146,16 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+             const name = try a.dupe(u8, pack.spellModule(canonical, &spell_buf) orelse canonical);
+             const spec = try formats.resolve(name);
+             if (spec) |s| {
++                const role = try std.fmt.allocPrint(a, "L{d}.attn.ix_wp", .{layer_index});
+                 if (s.mode != .affine) {
+-                    try mixed.append(a, .{ .kind = .linear, .name = name, .spec = s, .n = cfg.index_heads, .k = cfg.hidden });
++                    try mixed.append(a, .{ .kind = .linear, .name = name, .role = role, .layer = layer_index, .dspark = dspark, .spec = s, .n = cfg.index_heads, .k = cfg.hidden });
+                 } else {
+                     try modules.append(a, .{
+                         .kind = .linear,
+                         .name = name,
++                        .role = role,
++                        .layer = layer_index,
++                        .dspark = dspark,
+                         .spec = s,
+                         .layout = try s.layout(cfg.index_heads, cfg.hidden),
+                     });
+@@ -124,13 +171,17 @@ pub fn build(gpa: std.mem.Allocator, cfg: *const Config, pack: *const Pack, form
+                 continue;
+             }
+             const kn = names.ExpertProj.kn(p, cfg);
++            const role = try std.fmt.allocPrint(a, "L{d}.{s}", .{ layer_index, expertRole(p) });
+             if (spec.?.mode != .affine) {
+-                try mixed.append(a, .{ .kind = .expert, .name = name, .spec = spec.?, .n = kn[1], .k = kn[0] });
++                try mixed.append(a, .{ .kind = .expert, .name = name, .role = role, .layer = layer_index, .dspark = dspark, .spec = spec.?, .n = kn[1], .k = kn[0] });
+                 continue;
+             }
+             try modules.append(a, .{
+                 .kind = .expert,
+                 .name = name,
++                .role = role,
++                .layer = layer_index,
++                .dspark = dspark,
+                 .spec = spec.?,
+                 .layout = try spec.?.layout(kn[1], kn[0]),
+             });
+@@ -201,6 +252,42 @@ test "MTP MXFP8 and MXFP4 modules are listed as mixed, not affine" {
+     try std.testing.expectEqual(Kind.expert, plan.mixed[1].kind);
+ }
+ 
++test "roles are L<layer> names while module names keep the pack prefix" {
++    const a = std.testing.allocator;
++    var cfg = @import("config.zig").tiny();
++    cfg.layers = 1;
++    cfg.mtp_layers = 0;
++    cfg.q_lora = 64;
++    cfg.compress_ratios = @import("config.zig").Ids.of(&.{0});
++    cfg.kv_sources = .{};
++    cfg.index_sources = .{};
++    cfg.engram_layers = .{};
++    cfg.engram_rows = @import("config.zig").List(u64, 8).of(&.{});
++    const json =
++        \\{"quantization":{"quant_method":"affine","bits":4,"group_size":64,"dense_by_default":true,
++        \\"language_model.layers.0.attn.wq_a":{"bits":8,"group_size":64}}}
++    ;
++    var formats = try affine.Formats.init(a, json);
++    defer formats.deinit();
++    const image = try @import("pack.zig").headerOnly(a, &.{
++        .{ .name = "language_model.layers.0.attn.wq_a.weight", .dtype = "U32", .shape = &.{ 64, 64 } },
++        .{ .name = "language_model.layers.0.attn.wq_a.scales", .dtype = "BF16", .shape = &.{ 64, 4 } },
++        .{ .name = "language_model.layers.0.attn.wq_a.biases", .dtype = "BF16", .shape = &.{ 64, 4 } },
++    });
++    defer a.free(image);
++    var p = Pack.init(a);
++    defer p.deinit();
++    try p.addHeaderDump("model.safetensors", image);
++    var plan = try build(a, &cfg, &p, &formats);
++    defer plan.deinit();
++    try std.testing.expectEqual(@as(usize, 1), plan.layers[0].modules.len);
++    const m = plan.layers[0].modules[0];
++    try std.testing.expectEqualStrings("language_model.layers.0.attn.wq_a", m.name);
++    try std.testing.expectEqualStrings("L0.attn.wq_a", m.role);
++    try std.testing.expectEqual(@as(u32, 0), m.layer);
++    try std.testing.expect(!m.dspark);
++}
++
+ test "one tiny layer plans four linears and three expert stacks; wo_a is dense" {
+     const a = std.testing.allocator;
+     var cfg = @import("config.zig").tiny();
+diff --git a/zig/src/families/deepseek_v41/affine_runtime.zig b/zig/src/families/deepseek_v41/affine_runtime.zig
+index 6a3cbc5..0f03e1e 100644
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -16,7 +16,10 @@ const affine_launch = @import("affine_launch.zig");
+ const weights_load = @import("cuda_weights.zig");
+ 
+ pub const ExpertModule = struct {
++    /// The pack's spelling, used to find the binding.
+     name: []const u8,
++    /// The emitter/runtime name.
++    role: []const u8,
+     dev: affine_bind.Device,
+     layout: @import("affine.zig").Layout,
+     experts: u32,
+@@ -57,10 +60,10 @@ pub const Affine = struct {
+         errdefer a.wide.deinit();
+         a.act = try cuda.act_rows.ActRows.load(d);
+         errdefer a.act.unload();
+-        a.linears = try linears.loadAll(gpa, io, d, stream, &a.wide, pack, bindings);
++        a.linears = try linears.loadAll(gpa, io, d, stream, &a.wide, pack, bindings, layers);
+ 
+         var count: usize = 0;
+-        for (bindings) |b| if (b.kind == .expert and b.mode == .affine_n_expert and b.affine_layout != null and inLayers(b.name, layers)) {
++        for (bindings) |b| if (b.kind == .expert and b.mode == .affine_n_expert and b.affine_layout != null and exec.selected(&b, layers)) {
+             count += 1;
+         };
+         a.experts = try gpa.alloc(ExpertModule, count);
+@@ -68,7 +71,10 @@ pub const Affine = struct {
+         a.expert_weights = .{ .gpa = gpa, .digest = false };
+         var made: usize = 0;
+         errdefer {
+-            for (a.experts[0..made]) |*m| gpa.free(m.name);
++            for (a.experts[0..made]) |*m| {
++                gpa.free(m.name);
++                gpa.free(m.role);
++            }
+             gpa.free(a.experts);
+             a.expert_map.deinit(gpa);
+             a.expert_weights.close() catch {};
+@@ -76,17 +82,23 @@ pub const Affine = struct {
+         var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+         defer builder.deinit();
+         for (bindings) |b| {
+-            if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !inLayers(b.name, layers)) continue;
++            if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !exec.selected(&b, layers)) continue;
+             var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
+             try builder.add(images.weight);
+             try builder.add(images.scales);
+             try builder.add(images.biases);
+             images = undefined;
++            const name = try gpa.dupe(u8, b.name);
++            const role = gpa.dupe(u8, if (b.role.len > 0) b.role else b.name) catch |err| {
++                gpa.free(name);
++                return err;
++            };
+             a.experts[made] = .{
+-                .name = try gpa.dupe(u8, b.name),
++                .name = name,
++                .role = role,
+                 .dev = undefined,
+                 .layout = b.affine_layout.?,
+-                .experts = if (std.mem.startsWith(u8, b.name, "mtp.")) dspark_experts else backbone_experts,
++                .experts = if (b.dspark) dspark_experts else backbone_experts,
+             };
+             made += 1;
+         }
+@@ -97,8 +109,8 @@ pub const Affine = struct {
+             for (a.experts, 0..) |*m, i| {
+                 const b = findBinding(bindings, m.name) orelse return error.AffineExpertMismatch;
+                 m.dev = try affine_bind.bind(&a.expert_weights, b, m.experts);
+-                m.dev.name = m.name;
+-                a.expert_map.putAssumeCapacity(m.name, i);
++                m.dev.name = m.role;
++                a.expert_map.putAssumeCapacity(m.role, i);
+             }
+         }
+         return a;
+@@ -109,26 +121,17 @@ pub const Affine = struct {
+         return null;
+     }
+ 
+-    fn inLayers(name: []const u8, layers: ?[]const u32) bool {
+-        const want = layers orelse return true;
+-        const rest = if (std.mem.startsWith(u8, name, "layers."))
+-            name["layers.".len..]
+-        else if (std.mem.startsWith(u8, name, "mtp."))
+-            name["mtp.".len..]
+-        else
+-            return false;
+-        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+-        const index = std.fmt.parseInt(u32, rest[0..dot], 10) catch return false;
+-        for (want) |x| if (x == index) return true;
+-        return false;
+-    }
+-
+     pub fn deinit(a: *Affine) void {
++        // `close()` sets the whole Weights to undefined; keep its allocator first.
++        const gpa = a.expert_weights.gpa;
+         a.linears.deinit();
+         if (a.experts.len > 0) a.expert_weights.close() catch {};
+-        for (a.experts) |m| a.expert_weights.gpa.free(m.name);
+-        a.expert_weights.gpa.free(a.experts);
+-        a.expert_map.deinit(a.expert_weights.gpa);
++        for (a.experts) |m| {
++            gpa.free(m.name);
++            gpa.free(m.role);
++        }
++        gpa.free(a.experts);
++        a.expert_map.deinit(gpa);
+         a.act.unload();
+         a.wide.deinit();
+         a.mods[2].unload();
+diff --git a/zig/src/families/deepseek_v41/affine_smoke.zig b/zig/src/families/deepseek_v41/affine_smoke.zig
+index 11114e8..29254fd 100644
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -40,7 +40,7 @@ const layer0_experts = [_][]const u8{
+ 
+ fn find(bindings: *const affine_exec.Bindings, name: []const u8) ?*const affine_exec.Binding {
+     for (bindings.items) |*b| {
+-        if (std.mem.endsWith(u8, b.name, name)) return b;
++        if (std.mem.endsWith(u8, b.name, name) or std.mem.eql(u8, b.role, name)) return b;
+     }
+     return null;
+ }
+@@ -277,18 +277,18 @@ fn runAttentionChain(
+     act: *const cuda.act_rows.ActRows,
+     cfg: *const Config,
+ ) !void {
+-    const selected_names = [_][]const u8{ "layers.0.attn.wq_a", "layers.0.attn.wq_b", "layers.0.attn.wkv" };
++    const selected_names = [_][]const u8{ "L0.attn.wq_a", "L0.attn.wq_b", "L0.attn.wkv" };
+     var selected: [selected_names.len]affine_exec.Binding = undefined;
+     for (selected_names, &selected) |name, *dst| {
+         const b = find(bindings, name) orelse return error.SmokeModuleMissing;
+         if (b.mode != .affine8_linear or b.affine_layout == null) return error.SmokeNotAffine;
+         dst.* = b.*;
+     }
+-    var set = try affine_linears.loadAll(gpa, io, driver, stream, wide, pack, &selected);
++    var set = try affine_linears.loadAll(gpa, io, driver, stream, wide, pack, &selected, null);
+     defer set.deinit();
+-    const wq_a = setItem(&set, "layers.0.attn.wq_a") orelse return error.SmokeModuleMissing;
+-    const wq_b = setItem(&set, "layers.0.attn.wq_b") orelse return error.SmokeModuleMissing;
+-    const wkv = setItem(&set, "layers.0.attn.wkv") orelse return error.SmokeModuleMissing;
++    const wq_a = setItem(&set, "L0.attn.wq_a") orelse return error.SmokeModuleMissing;
++    const wq_b = setItem(&set, "L0.attn.wq_b") orelse return error.SmokeModuleMissing;
++    const wkv = setItem(&set, "L0.attn.wkv") orelse return error.SmokeModuleMissing;
+ 
+     const hidden: usize = cfg.hidden;
+     const q_lora: usize = cfg.q_lora;
+diff --git a/zig/src/families/deepseek_v41/block_attn.zig b/zig/src/families/deepseek_v41/block_attn.zig
+index 76d7557..906a57b 100644
+--- a/zig/src/families/deepseek_v41/block_attn.zig
++++ b/zig/src/families/deepseek_v41/block_attn.zig
+@@ -197,13 +197,18 @@ pub fn attention(e: *Emitter, L: u32) !void {
+     const iw = try e.buf("L.ix_w", .{}, .bf16, &.{ n, IH });
+     // index layer: fork, side indexer chain, main q group, join, attn; other layers: side SWA store, main q group
+     if (indexer) e.fork();
+-    if (indexer) try e.triton("_plain", .{ n, IH, 1 }, &.{
+-        .{ .name = "X", .arg = x },                                                        .{ .name = "x_rs", .arg = .{ .i = D } },
+-        .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_wp", .{L}, .f32, &.{ IH, D }) }, .{ .name = "w_rs", .arg = .{ .i = D } },
+-        .{ .name = "OUT", .arg = iw },                                                     .{ .name = "K", .arg = .{ .i = D } },
+-        .{ .name = "N", .arg = .{ .i = IH } },                                             .{ .name = "BK", .arg = .{ .i = 256 } },
+-        .{ .name = "PDL", .arg = .{ .b = false } },                                        .{ .name = "BF16", .arg = .{ .b = true } },
+-    });
++    if (indexer) {
++        const wp = try e.fmt("L{d}.attn.ix_wp", .{L});
++        if (e.cfg.format == .affine) {
++            try e.upstreamOrAffine(wp, x, D, IH, iw);
++        } else try e.triton("_plain", .{ n, IH, 1 }, &.{
++            .{ .name = "X", .arg = x },                                             .{ .name = "x_rs", .arg = .{ .i = D } },
++            .{ .name = "W", .arg = try e.weight("{s}", .{wp}, .f32, &.{ IH, D }) }, .{ .name = "w_rs", .arg = .{ .i = D } },
++            .{ .name = "OUT", .arg = iw },                                          .{ .name = "K", .arg = .{ .i = D } },
++            .{ .name = "N", .arg = .{ .i = IH } },                                  .{ .name = "BK", .arg = .{ .i = 256 } },
++            .{ .name = "PDL", .arg = .{ .b = false } },                             .{ .name = "BF16", .arg = .{ .b = true } },
++        });
++    }
+     e.onMain();
+     // x group: wq_a, wkv (+ the compressor's on a KV source)
+     const xg = try e.xGroup(L);
+diff --git a/zig/src/families/deepseek_v41/block_prefetch.zig b/zig/src/families/deepseek_v41/block_prefetch.zig
+index 3afd452..e53f53b 100644
+--- a/zig/src/families/deepseek_v41/block_prefetch.zig
++++ b/zig/src/families/deepseek_v41/block_prefetch.zig
+@@ -79,6 +79,8 @@ pub fn take(e: *const Emitter, sizes: []const u64) i64 {
+ 
+ /// Site "o" (after wq_b): wo_a's groups, then wo_b; l2pf segments.
+ pub fn prefetchO(e: *Emitter, L: u32) !void {
++    // Affine weights are resident (linears) or host-looped (experts); there is no L2 trellis to fetch.
++    if (e.cfg.format == .affine) return;
+     const sizes = try e.srcSizes(try e.l2pfSources(L, .o));
+     var total: u64 = 0;
+     var left = e.o.l2pf_budget;
+@@ -101,10 +103,12 @@ pub fn paced(e: *Emitter, role: []const u8, rows: i64) !void {
+ 
+ /// Site "f" (after the attention sublayer): the router's gate, then the shared expert's gate and up trellises.
+ pub fn prefetchF(e: *Emitter, L: u32) !void {
++    if (e.cfg.format == .affine) return;
+     try e.paced(try e.fmt("s.L{d}.pf.f", .{L}), e.take(try e.srcSizes(try e.l2pfSources(L, .f))));
+ }
+ 
+ /// Site "x" of the block before `nxt` (after its MoE): `nxt`'s x group, then its q group.
+ pub fn prefetchX(e: *Emitter, nxt: u32) !void {
++    if (e.cfg.format == .affine) return;
+     try e.paced(try e.fmt("s.L{d}.pf.x", .{nxt}), e.take(try e.srcSizes(try e.l2pfSources(nxt, .x))));
+ }
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index da42e3e..afbac01 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -234,11 +234,18 @@ pub const Model = struct {
+             return error.UnsupportedCheckpoint;
+         }
+         try @import("block_admission.zig").serving(&m.cfg, world);
+-        if (o.own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
++        const affine = m.cfg.format == .affine;
++        // Affine prefill is not ported; prompts run as decode windows until it is.
++        const own_prefill = o.own_prefill and !affine;
++        if (own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
+         m.pack = try Pack.open(gpa, io, pack_dir);
+-        if (m.cfg.format == .affine) {
++        const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
++            const all = try a.alloc(u32, m.cfg.layers);
++            for (all, 0..) |*l, i| l.* = @intCast(i);
++            break :blk all;
++        };
++        if (affine) {
+             if (o.drafts) return error.AffineDSparkUnsupported;
+-            if (!o.own_prefill) return error.AffinePrefillUnsupported;
+             const cfg_path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
+             const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
+             defer gpa.free(cfg_text);
+@@ -250,7 +257,17 @@ pub const Model = struct {
+             defer dispatch.deinit();
+             var bindings = try @import("affine_exec.zig").build(gpa, &dispatch);
+             defer bindings.deinit();
+-            const budget = try @import("affine_budget.zig").compute(bindings.items, m.cfg.experts, m.cfg.dspark_experts);
++            const budget = try @import("affine_budget.zig").compute(bindings.items, m.cfg.experts, m.cfg.dspark_experts, o.layers);
++            if (try @import("sys").environment.read(?f64, "TF_DSV41_AFFINE_MAX_GIB", null)) |max_gib| {
++                if (!std.math.isFinite(max_gib) or max_gib <= 0) return error.AffineBudgetExceeded;
++                const limit: u64 = @intFromFloat(max_gib * (1 << 30));
++                // Peak includes the host builder images while the expert stacks upload.
++                const peak = budget.totalPacked() + budget.expert_raw;
++                if (peak > limit) {
++                    if (!quiet) std.log.err("dsv41 affine: peak {d:.2} GiB exceeds TF_DSV41_AFFINE_MAX_GIB={d:.2}", .{ @as(f64, @floatFromInt(peak)) / (1 << 30), max_gib });
++                    return error.AffineBudgetExceeded;
++                }
++            }
+             if (!quiet) std.log.info("dsv41 affine bytes: linears raw {d:.2} GiB, packed {d:.2} GiB; experts raw {d:.2} GiB (largest packed expert {d:.2} MiB); total raw {d:.2} GiB, resident with packed linears {d:.2} GiB", .{
+                 @as(f64, @floatFromInt(budget.linear_raw)) / (1 << 30),
+                 @as(f64, @floatFromInt(budget.linear_packed_bytes)) / (1 << 30),
+@@ -259,7 +276,7 @@ pub const Model = struct {
+                 @as(f64, @floatFromInt(budget.totalRaw())) / (1 << 30),
+                 @as(f64, @floatFromInt(budget.totalPacked())) / (1 << 30),
+             });
+-            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", false)) {
++            if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", true)) {
+                 // the dense/native half of the affine checkpoint: norms, mHC, router, wo_a, embed, head
+                 const blocks = if (o.layers) |ls| ls else blk: {
+                     const all = try a.alloc(u32, m.cfg.layers);
+@@ -304,84 +321,83 @@ pub const Model = struct {
+                     }
+                 }
+             }
+-            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; dispatch: {d} affine8 linears, {d} expert fallbacks, {d} mxfp8, {d} mxfp4; affine emitter ready, dense/MoE forward pending", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears, dispatch.linear, dispatch.expert, dispatch.mxfp8, dispatch.mxfp4 });
+-            return error.AffineForwardNotPorted;
++            if (!quiet) std.log.info("dsv41 affine: {d} layers, {d} modules, {d} mixed, {d} skipped; kernels: {d} native experts, {d} fallback experts, {d} unsupported linears; dispatch: {d} affine8 linears, {d} expert fallbacks, {d} mxfp8, {d} mxfp4", .{ ap.layers.len, modules, ap.mixed.len, ap.skipped.len, native_experts, fallback_experts, unsupported_linears, dispatch.linear, dispatch.expert, dispatch.mxfp8, dispatch.mxfp4 });
++            if (m.affine == null) return error.AffineLoadDisabled;
+         }
+-        const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+-            const all = try a.alloc(u32, m.cfg.layers);
+-            for (all, 0..) |*l, i| l.* = @intCast(i);
+-            break :blk all;
+-        };
+-        var ds: [8]u32 = undefined;
+-        const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
+-        m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
+-        try load.admitPlan(io, &m.cfg, &m.pack, &m.pl);
+-        m.weights = .{ .gpa = gpa, .digest = false }; // no weights check reads the digests here (load.zig)
+-        // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
+-        var cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
++        var cache: ?prepared.Cache = null;
+         defer if (cache) |*c| c.deinit();
+-        var t_build: i96 = 0;
+-        var t_upload: i96 = 0;
+-        const t_load = std.Io.Clock.awake.now(io).toNanoseconds();
+-        const readers = try @import("core").checkpoint_read_ahead.optInReaders();
+-        for (m.pl.layers, 0..) |*l, i| {
+-            var reading: @import("core").checkpoint_read_ahead.Scope = .{};
+-            defer reading.deinit();
+-            var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
+-            defer b.deinit();
+-            var tag_buf: [16]u8 = undefined;
+-            const tag = try std.fmt.bufPrint(&tag_buf, "L{d}", .{i});
+-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
+-            defer schema.deinit();
+-            if (cache != null) try schema.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+-            if (cache == null or !try cache.?.get(&b, tag, schema.out.items)) {
+-                reading = try @import("cuda_load_prefetch.zig").begin(gpa, io, &m.pack, &m.cfg, l.index, readers);
+-                try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+-                _ = try reading.check();
+-                if (cache) |*c| c.put(&b, tag) catch |e| if (!quiet) std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
+-            }
+-            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            // the next prepared file read ahead by the kernel while this layer uploads
+-            if (cache) |*c| {
+-                var next_buf: [16]u8 = undefined;
+-                c.willNeed(if (i + 1 < m.pl.layers.len) std.fmt.bufPrint(&next_buf, "L{d}", .{i + 1}) catch "" else "top");
+-            }
+-            try m.weights.upload(&m.driver, &b);
+-            t_build += t1 - t0;
+-            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
+-        }
+-        {
+-            var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
+-            defer b.deinit();
+-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
+-            defer schema.deinit();
+-            if (cache != null) {
+-                try schema.top(&m.pl);
+-                try schema.dspark(&m.pl);
++        if (!affine) {
++            var ds: [8]u32 = undefined;
++            const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
++            m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
++            try load.admitPlan(io, &m.cfg, &m.pack, &m.pl);
++            m.weights = .{ .gpa = gpa, .digest = false }; // no weights check reads the digests here (load.zig)
++            // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
++            cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
++            var t_build: i96 = 0;
++            var t_upload: i96 = 0;
++            const t_load = std.Io.Clock.awake.now(io).toNanoseconds();
++            const readers = try @import("core").checkpoint_read_ahead.optInReaders();
++            for (m.pl.layers, 0..) |*l, i| {
++                var reading: @import("core").checkpoint_read_ahead.Scope = .{};
++                defer reading.deinit();
++                var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
++                defer b.deinit();
++                var tag_buf: [16]u8 = undefined;
++                const tag = try std.fmt.bufPrint(&tag_buf, "L{d}", .{i});
++                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++                var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
++                defer schema.deinit();
++                if (cache != null) try schema.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
++                if (cache == null or !try cache.?.get(&b, tag, schema.out.items)) {
++                    reading = try @import("cuda_load_prefetch.zig").begin(gpa, io, &m.pack, &m.cfg, l.index, readers);
++                    try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
++                    _ = try reading.check();
++                    if (cache) |*c| c.put(&b, tag) catch |e| if (!quiet) std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
++                }
++                const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++                // the next prepared file read ahead by the kernel while this layer uploads
++                if (cache) |*c| {
++                    var next_buf: [16]u8 = undefined;
++                    c.willNeed(if (i + 1 < m.pl.layers.len) std.fmt.bufPrint(&next_buf, "L{d}", .{i + 1}) catch "" else "top");
++                }
++                try m.weights.upload(&m.driver, &b);
++                t_build += t1 - t0;
++                t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
+             }
+-            if (cache == null or !try cache.?.get(&b, "top", schema.out.items)) {
+-                try b.top(&m.pl);
+-                try b.dspark(&m.pl);
+-                if (cache) |*c| c.put(&b, "top") catch |e| if (!quiet) std.log.warn("dsv41 prepared: top not written ({t})", .{e});
++            {
++                var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
++                defer b.deinit();
++                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++                var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
++                defer schema.deinit();
++                if (cache != null) {
++                    try schema.top(&m.pl);
++                    try schema.dspark(&m.pl);
++                }
++                if (cache == null or !try cache.?.get(&b, "top", schema.out.items)) {
++                    try b.top(&m.pl);
++                    try b.dspark(&m.pl);
++                    if (cache) |*c| c.put(&b, "top") catch |e| if (!quiet) std.log.warn("dsv41 prepared: top not written ({t})", .{e});
++                }
++                const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++                try m.weights.upload(&m.driver, &b);
++                t_build += t1 - t0;
++                t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
+             }
+-            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            try m.weights.upload(&m.driver, &b);
+-            t_build += t1 - t0;
+-            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
++            @import("core").checkpoint.cache.files(io, m.pack.dir, m.pack.files.items);
++            const ms = struct {
++                fn of(ns: i96) f64 {
++                    return @as(f64, @floatFromInt(ns)) / 1e6;
++                }
++            }.of;
++            if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
++            tr.step("weights", cuda.usage(false));
+         }
+-        @import("core").checkpoint.cache.files(io, m.pack.dir, m.pack.files.items);
+-        const ms = struct {
+-            fn of(ns: i96) f64 {
+-                return @as(f64, @floatFromInt(ns)) / 1e6;
+-            }
+-        }.of;
+-        if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
+-        tr.step("weights", cuda.usage(false));
+         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, asset_names.aot }));
+         try @import("aot_trace.zig").attach(gpa, io, &m.aot, @import("aot_trace.zig").pathFromEnv());
+-        m.widths = try gate_forward.widths(a, &m.weights, &m.pl);
++        // Affine prefetch is a no-op, so the EXL3 trellis widths are not needed.
++        m.widths = if (affine) .{} else try gate_forward.widths(a, &m.weights, &m.pl);
+         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
+         if (m.affine != null) m.runner.affine = &m.affine.?;
+         // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed, JSON written at close
+@@ -389,6 +405,7 @@ pub const Model = struct {
+         const topp = try @import("sys").environment.read(?f64, "TF_DSV41_EXPERT_TOPP", null);
+         // TF_DSV41_R1=1, or the eight separate R1 knobs (the knob reader's r1)
+         const r1 = try @import("serve_knobs.zig").r1(&@import("serve_knobs.zig").env);
++        if (affine and r1) return error.AffineR1Unsupported;
+         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
+         try @import("engine_hooks.zig").open(&m.f); // the forward's later-layer hooks and prefill state
+         m.f.layers = backbone;
+@@ -405,7 +422,7 @@ pub const Model = struct {
+             // the long-prompt stream scratch the buffer plan will hold (not in the measured terms)
+             ko.resident = if ((try longpf.lazyEnv())) 0 else @import("serve_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
+             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
+-            if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
++            if (own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
+             tr.step("forward", cuda.usage(false));
+             m.boot_check = try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
+             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
+@@ -418,9 +435,9 @@ pub const Model = struct {
+         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
+         var bp = try m.f.plan(buckets[0..nb]);
+         // the pass ingests a prompt's prefilled tail in one call (the drafter's window) with the own prefill
+-        const ingest_rows: u32 = if (o.own_prefill) @max(nb, m.cfg.window) else nb;
++        const ingest_rows: u32 = if (own_prefill) @max(nb, m.cfg.window) else nb;
+         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, ingest_rows);
+-        if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
++        if (own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
+         const rows_cap = try batch.capFromEnv();
+         if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
+         // TF_DSV41_SLOT_DRAFTS=1: DSpark over every live slot (off: drafts are refused with several slots)
+@@ -432,27 +449,29 @@ pub const Model = struct {
+         if ((try longpf.lazyEnv())) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
+             pf.state(&m.f).long.lazy = .{ .bytes = kv.value };
+         };
+-        // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
+-        if ((try ex_stacks.enabled())) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
+-        // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
+-        if ((try forms_inplace.enabled())) {
+-            const ws = &pf.state(&m.f).k4ws.plan;
+-            _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
+-        }
+         tr.plan(bp.totals());
+         try m.runner.bind(&bp);
+         tr.step("buffer plan", cuda.usage(false));
+-        const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
+-        for (bp.sizes.keys()) |role| {
+-            if (buffers.scopeOf(role) != .persistent) continue;
+-            var ra = std.heap.ArenaAllocator.init(gpa);
+-            defer ra.deinit();
+-            const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
+-            try m.f.upload(m.runner.addressOf(role).?, bytes);
++        if (!affine) {
++            // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
++            if ((try ex_stacks.enabled())) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
++            // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
++            if ((try forms_inplace.enabled())) {
++                const ws = &pf.state(&m.f).k4ws.plan;
++                _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
++            }
++            const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
++            for (bp.sizes.keys()) |role| {
++                if (buffers.scopeOf(role) != .persistent) continue;
++                var ra = std.heap.ArenaAllocator.init(gpa);
++                defer ra.deinit();
++                const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
++                try m.f.upload(m.runner.addressOf(role).?, bytes);
++            }
++            // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
++            m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
+         }
+         tr.step("forms", cuda.usage(false));
+-        // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
+-        m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
+         // no size cap: a 1M limit + 2,048 rows is 538 MB
+         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
+         const RopeSink = struct {
+@@ -485,12 +504,12 @@ pub const Model = struct {
+             m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks, .checkpoint = if (so.disk != null) try prepared.packIdentity(io, &m.pack, if (cache) |*c| c else null) else null });
+         }
+         tr.step("engram host and sessions", cuda.usage(false));
+-        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
++        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = own_prefill, .sessions = m.sessions };
+         // TF_DSV41_PROMPT_TAIL: the prompt's last token as the first decode row
+         m.gt.prompt_tail = try @import("serve_knobs.zig").promptTail(&@import("serve_knobs.zig").env);
+         // TF_DSV41_PREFILL=replay (ced.zig): own prefill over [0, n - 1), decoder replay, last token as verify row
+-        if (pf.state(&m.f).mode == .replay and (!o.own_prefill or m.gt.prompt_tail != .verify)) {
+-            std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay needs TF_DSV41_OWN_PREFILL=1 and TF_DSV41_PROMPT_TAIL=verify, as Python's server (own prefill {}, prompt tail {t})", .{ o.own_prefill, m.gt.prompt_tail });
++        if (pf.state(&m.f).mode == .replay and (!own_prefill or m.gt.prompt_tail != .verify)) {
++            std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay needs TF_DSV41_OWN_PREFILL=1 and TF_DSV41_PROMPT_TAIL=verify, as Python's server (own prefill {}, prompt tail {t})", .{ own_prefill, m.gt.prompt_tail });
+             return error.BadKnob;
+         }
+         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
+diff --git a/zig/src/families/deepseek_v41/forward_glue.zig b/zig/src/families/deepseek_v41/forward_glue.zig
+index 05bc9cd..b3be501 100644
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -214,15 +214,15 @@ fn moeHost(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+     var b1: [96]u8 = undefined;
+     var b2: [96]u8 = undefined;
+     var b3: [96]u8 = undefined;
+-    const sh1 = try std.fmt.bufPrint(&b1, "layers.{d}.ffn.shared_experts.w1", .{L});
+-    const sh3 = try std.fmt.bufPrint(&b2, "layers.{d}.ffn.shared_experts.w3", .{L});
+-    const sh2 = try std.fmt.bufPrint(&b3, "layers.{d}.ffn.shared_experts.w2", .{L});
++    const sh1 = try std.fmt.bufPrint(&b1, "L{d}.moe.shared.0.w1", .{L});
++    const sh3 = try std.fmt.bufPrint(&b2, "L{d}.moe.shared.0.w3", .{L});
++    const sh2 = try std.fmt.bufPrint(&b3, "L{d}.moe.shared.0.w2", .{L});
+     var e1: [96]u8 = undefined;
+     var e2: [96]u8 = undefined;
+     var e3: [96]u8 = undefined;
+-    const w1n = try std.fmt.bufPrint(&e1, "layers.{d}.ffn.experts.w1", .{L});
+-    const w3n = try std.fmt.bufPrint(&e2, "layers.{d}.ffn.experts.w3", .{L});
+-    const w2n = try std.fmt.bufPrint(&e3, "layers.{d}.ffn.experts.w2", .{L});
++    const w1n = try std.fmt.bufPrint(&e1, "L{d}.moe.w1", .{L});
++    const w3n = try std.fmt.bufPrint(&e2, "L{d}.moe.w3", .{L});
++    const w2n = try std.fmt.bufPrint(&e3, "L{d}.moe.w2", .{L});
+     const has_shared = af.linears.get(sh1) != null;
+     const I: usize = if (has_shared) af.linears.get(sh1).?.n else if (af.expert(w1n)) |m| m.layout.n else 0;
+     if (has_shared) {
+diff --git a/zig/src/families/deepseek_v41/graphs.zig b/zig/src/families/deepseek_v41/graphs.zig
+index cdc7b6f..96ad1b6 100644
+--- a/zig/src/families/deepseek_v41/graphs.zig
++++ b/zig/src/families/deepseek_v41/graphs.zig
+@@ -90,7 +90,12 @@ pub fn emitStart(n: u32, b: u32, s: Settings, limit: u64) i64 {
+ 
+ /// Why a window's program cannot be captured (null: it can): a glue step that reads the device on the host.
+ pub fn audit(cs: []const calls.Call) ?[]const u8 {
+-    for (cs) |c| if (c.glue and std.mem.eql(u8, c.name, "glue.trace")) return "glue.trace downloads the streams";
++    for (cs) |c| {
++        if (!c.glue) continue;
++        if (std.mem.eql(u8, c.name, "glue.trace")) return "glue.trace downloads the streams";
++        // The affine MoE correctness path synchronizes, downloads and uploads on the host.
++        if (std.mem.eql(u8, c.name, "glue.moe_host")) return "glue.moe_host reads and writes the device on the host";
++    }
+     return null;
+ }
+ 
+@@ -273,6 +278,13 @@ pub const EngramStage = struct {
+ 
+ // -- host tests ---------------------------------------------------------------------------------------------------
+ 
++test "graphs: the affine host MoE is not capture-safe" {
++    const cs = [_]calls.Call{
++        .{ .triton = false, .glue = true, .name = "glue.moe_host", .args = &.{} },
++    };
++    try std.testing.expectEqualStrings("glue.moe_host reads and writes the device on the host", audit(&cs).?);
++}
++
+ test "graphs: context buckets as Python's (2,048 steps to 32K, then 1.25x rounded up to 2,048)" {
+     // _ends(2048, 1.25, ...) = 2048, 4096, ..., 32768, 40960, 51200, 65536, 81920, 102400, 129024, ...
+     const want = [_]u64{ 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624, 28672, 30720, 32768, 40960, 51200, 65536, 81920, 102400, 129024 };
+diff --git a/zig/src/families/deepseek_v41/names.zig b/zig/src/families/deepseek_v41/names.zig
+index d0fab68..7614a06 100644
+--- a/zig/src/families/deepseek_v41/names.zig
++++ b/zig/src/families/deepseek_v41/names.zig
+@@ -211,8 +211,14 @@ pub fn blockNatives(c: *const Config, layer: u32) !Natives {
+ }
+ 
+ /// A block's native tensors for an affine checkpoint: the regular natives plus the whole dense `wo_a`.
++/// `attn.indexer.weights_proj.weight` is affine in the MLX checkpoint, so it is left to the affine
++/// plan instead of being loaded as a half-precision native.
+ pub fn denseBlockNatives(c: *const Config, layer: u32) !Natives {
+-    var n = try blockNatives(c, layer);
++    var n: Natives = .{};
++    for ((try blockNatives(c, layer)).items()) |s| {
++        if (std.mem.eql(u8, s.suffix, "attn.indexer.weights_proj.weight")) continue;
++        try n.push(s);
++    }
+     const per_group_k = c.heads / c.o_groups * c.head_dim;
+     try n.push(.m("attn.wo_a.weight", .half, c.o_groups * c.o_lora, per_group_k));
+     return n;
+diff --git a/zig/src/families/deepseek_v41/pack.zig b/zig/src/families/deepseek_v41/pack.zig
+index 6538268..6f65101 100644
+--- a/zig/src/families/deepseek_v41/pack.zig
++++ b/zig/src/families/deepseek_v41/pack.zig
+@@ -184,9 +184,21 @@ pub const Pack = struct {
+         return null;
+     }
+ 
++    /// A tensor under its canonical name, else under one of the checkpoint's module prefixes.
++    /// The returned `Info` is enough to read the payload; `name` stays canonical for roles.
++    pub fn resolve(p: *const Pack, name: []const u8, buf: []u8) ?Info {
++        if (p.get(name)) |i| return i;
++        for (module_prefixes) |prefix| {
++            const full = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, name }) catch continue;
++            if (p.get(full)) |i| return i;
++        }
++        return null;
++    }
++
+     /// A required tensor; a missing name is logged and refused.
+     pub fn need(p: *const Pack, name: []const u8) !Info {
+-        return p.get(name) orelse {
++        var buf: [256]u8 = undefined;
++        return p.resolve(name, &buf) orelse {
+             if (!quiet) log.warn("pack has no tensor {s}", .{name});
+             return error.MissingTensor;
+         };
+@@ -377,6 +389,23 @@ test "a folder by its headers: index order, groups checked, strided reads, codeb
+     try testing.expectError(error.BadSpan, p.read(io, p.get("y.weight").?, .{ .offset = 8, .len = 8 }, out[0..8]));
+ }
+ 
++test "resolve finds language_model-prefixed tensors under canonical names" {
++    const a = testing.allocator;
++    const image_bytes = try headerOnly(a, &.{
++        .{ .name = "language_model.embed.weight", .dtype = "BF16", .shape = &.{ 4, 4 } },
++        .{ .name = "language_model.layers.0.engram.q_weight", .dtype = "BF16", .shape = &.{ 8, 8 } },
++    });
++    defer a.free(image_bytes);
++    var p = Pack.init(a);
++    defer p.deinit();
++    try p.addHeaderDump("model.safetensors", image_bytes);
++    var buf: [128]u8 = undefined;
++    try testing.expect(p.resolve("embed.weight", &buf) != null);
++    try testing.expect(p.resolve("layers.0.engram.q_weight", &buf) != null);
++    try testing.expectEqual(@as(u64, 32), (try p.need("embed.weight")).nbytes);
++    try testing.expectError(error.MissingTensor, p.need("embed.bias"));
++}
++
+ test "a shard's header length is read as core reads it: past the file, past 100 MB or the u64 maximum is refused" {
+     const io = testing.io;
+     const a = testing.allocator;
+diff --git a/zig/src/families/deepseek_v41/plan.zig b/zig/src/families/deepseek_v41/plan.zig
+index a6a1873..562e789 100644
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -211,7 +211,14 @@ const Builder = struct {
+                 var nb: [128]u8 = undefined;
+                 v.* = try b.native(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ block, s.suffix }), s);
+             }
+-            const empty: ExpertsPlan = .{ .proj = .w1, .parts = &.{}, .prefixes = &.{}, .layout = undefined };
++            // A dense plan has no routed experts. Keep a valid empty layout so consumers can
++            // iterate `layout.words` without tripping over `undefined`.
++            const empty: ExpertsPlan = .{
++                .proj = .w1,
++                .parts = &.{},
++                .prefixes = &.{},
++                .layout = .{ .kind = .stack, .k_tiles = 0, .n_tiles = 0, .words = &.{}, .offsets = &.{}, .elements = 0 },
++            };
+             return .{ .index = index, .prefix = block, .mode = b.c.mode(index), .groups = &.{}, .natives = natives, .experts = .{ empty, empty, empty }, .gate_up_mismatch = 0 };
+         }
+         const has_shared = b.pack.has(try std.fmt.bufPrint(&b.buf, "{s}.ffn.shared_experts.w1.trellis", .{block}));
+@@ -415,6 +422,7 @@ test "the dense plan keeps only affine/native tensors and adds wo_a and head" {
+     const l = &d.layers[0];
+     try testing.expectEqual(@as(usize, 0), l.groups.len);
+     try testing.expectEqual(@as(usize, 0), l.experts[0].parts.len);
++    for (l.experts) |e| try testing.expectEqual(@as(usize, 0), e.layout.words.len);
+     var has_wo_a = false;
+     var has_gate = false;
+     for (l.natives) |v| {
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 6aeeef9..663259a 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -81,6 +81,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_DSV41_DRAFTS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_SMOKE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_LOAD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_DSV41_AFFINE_MAX_GIB", .scope = .dsv41, .kind = .positive_real, .forms = "a positive GiB limit for the affine load's peak (resident packed linears + expert images)" },
+     .{ .name = "TF_DSV41_GRAPHS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AOT_GUARD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_ENGRAM_PREFETCH", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
