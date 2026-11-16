@@ -18,7 +18,7 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Full text runs coherently on one Spark (`1df195f247ca`); exact omlx diff and 600K next |
+| Overall status | Full text + 600K context measured on one Spark (`1df195f247ca`); affine prefill/DSpark/vision next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
@@ -67,6 +67,7 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D20 | 2026-11-11 | Do not port the MiaAI patches; adopt its config/start script and measurement-table patterns | Cherry-pick `qwen3_5` patches | Those patches target TensorFold v0.6.0 Python/Triton; this base is 1.2.5 Zig/CUDA |
 | D21 | 2026-11-16 | Do not bake `mscale` into the dsv41 RoPE table | Keep the MiaAI/Qwen mscale convention | `omlx/patches/deepseek_v41/language.py` builds plain YaRN cos/sin; it has no `mscale`. The compressed table must be unscaled to match the target runtime |
 | D22 | 2026-11-16 | Apply the checkpoint's `quantize_input` FP8 E4M3 group-32 activation round-trip before affine linears, experts, and `wo_a` | Raw BF16 activations | Every target module sets `quantize_input: true`; `QuantizedProjection.__call__` quantizes and dequantizes the activation, and attention applies the same round-trip to `o` before `wo_a` |
+| D23 | 2026-11-16 | 600K target stands; KV is ~1.58 GiB, not 13.05 GiB | Per-layer flat `layers * 584 B/token` estimate | The engine stores compressed values/scales once per KV source (reuse layers read that cache) and index keys per index source; the full 600K boot measured 99 GiB used / 22 GiB available on `dgx2`. `memory_estimate.py` now models this layout |
 
 ## Work log
 
@@ -180,6 +181,21 @@ next step.
   identical); the engine logs `rows from /engram-native`.
 - **Guard:** PASS on `1df195f247ca`; the dispatch check now adds the 2 Engram linears
   (`309 = 307 + 2`).
+
+### 2026-11-16 - 600K context measured
+
+- **Run:** full model, real native Engram, `TF_DSV41_CONTEXT=600000` with the 602,048-row
+  `rope.bin`; AOT needs 31 variants (4 more than 4K), all compiled.
+- **Memory:** 99 GiB used, 22 GiB available; loaded in 101.7 s. `The capital of France is` →
+  ` Paris. The Eiffel Tower is...`; TTFT 2.21 s, 2.17 tok/s (host-loop experts).
+- **Corrected KV model:** `memory_estimate.py` now follows the engine layout — SWA layers keep
+  `2*window`, compressed values/scales are stored once per KV source (reuse layers read the
+  source), index keys once per index source, plus the RoPE tables. At 600K that is
+  **1.58 GiB** (total 108.8 GiB, 19.2 GiB headroom), not the earlier 13.05 GiB estimate that
+  counted every layer as a compressed source.
+- **Remaining for long prompts:** affine prefill is still skipped, so prompts run as 16-token
+  decode windows; a 600K *prompt* is not practical until the affine prefill is ported. The
+  context capacity itself is measured.
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
@@ -1023,8 +1039,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Quantify the exact greedy divergence from omlx on the `bench.json` LRU prompt (the bf16 KV cache vs omlx's packed 4-bit / e4m3 formats and the affine activation quantization are the expected sources); document accepted divergence.
-2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default, then measure 600K with YaRN.
+1. Port the affine prefill (`block_prefill_attn`/`block_prefill_moe`/the prefill emitter) so long prompts do not run as 16-token decode windows; this is the remaining 600K blocker.
+2. Document the exact greedy divergence from omlx: 136-139 characters match the `bench.json` LRU reference before the parenthetical wording differs; the bf16 KV cache vs omlx's packed 4-bit/e4m3 formats and the activation quantization are the expected sources.
 3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter and measure acceptance.
 4. Add the device expert gather/GEMM to replace the host loop (2.2 tok/s decode on the full model).
 5. Then server/vision and qualification.

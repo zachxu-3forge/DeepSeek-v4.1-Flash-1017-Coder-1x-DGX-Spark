@@ -176,6 +176,13 @@ window + YaRN tables, unscaled (`mscale 1.0`). The model's YaRN factor is 16 fro
 runtime factor change is needed. Measure with a 4-8 GiB reserve before fixing the default.
 1M is 134.81 GiB and does not fit.
 
+Update 2026-11-16: the 13.05 GiB bound counted every layer as a compressed source. The engine
+stores compressed values/scales once per KV source (reuse layers read that cache) and index
+keys once per index source; the real 600K KV is **1.58 GiB**. The live 600K boot measured
+**99 GiB used / 22 GiB available** on `dgx2` (loaded 101.7 s, coherent output, 2.17 tok/s).
+`memory_estimate.py` now models this layout. A 600K *prompt* still needs the affine prefill;
+the context capacity itself is measured.
+
 `scripts/mlx/make_rope_tables.py` writes the two-table asset (default 602,048 rows),
 `--self-test` matches `core/rope_yarn.zig`'s known YaRN vector, and `--check FILE` validates
 an existing asset's header, size, sampled values, and scale. The compressed table is unscaled, matching the
@@ -200,6 +207,10 @@ to bf16, as their patch does, so draft and serial reads agree.
 total is 112.7 GiB (15.3 GiB headroom); at 600K it is 125.05 GiB (2.95 GiB headroom); 1M is
 134.8 GiB and does not fit. Engram must stream from SSD, and the repo's existing Engram AIO/
 spill paths are for the base-model format.
+
+Update 2026-11-16: with the source-shared KV layout, 600K is 108.8 GiB on paper (1.58 GiB KV,
+19.2 GiB headroom) and measured 99 GiB used / 22 GiB available. The weights are 88.6 GiB
+(83.37 affine + 5.19 dense), not 98 GiB.
 
 ## Consequence
 

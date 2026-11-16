@@ -105,9 +105,11 @@ python3 scripts/mlx/memory_estimate.py "$MODEL_DIR"
 ```
 
 `make_one_layer.py` copies layer 0 plus the embedding, final norm, and head into a translated
-fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` reports weights + conservative KV +
-reserve against 128 GiB at each context. With 600K in the defaults it reports 125.05 GiB
-(2.95 GiB headroom); 1M does not fit.
+fixture for `TF_DSV41_LAYERS=0-0`. `memory_estimate.py` now follows the engine's KV layout:
+SWA layers keep `2*window`, compressed values/scales are stored once per KV source, index
+keys once per index source, plus the RoPE tables. At 600K it reports a **1.58 GiB** KV, 108.8
+GiB total and 19.2 GiB headroom; the live 600K boot measured 99 GiB used / 22 GiB available.
+1M is ~110 GiB on paper but remains out of scope.
 
 ## RoPE tables
 
