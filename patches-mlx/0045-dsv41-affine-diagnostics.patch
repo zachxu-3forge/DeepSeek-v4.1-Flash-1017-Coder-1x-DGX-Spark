@@ -1,0 +1,75 @@
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -367,6 +367,8 @@
+     /// One affine projection: a `tf_dsv41_affine_v1.linear` call naming the resident packed
+     /// linear by hash, with an output view when the group writes one column range.
+     pub fn affineProj(e: *Emitter, p: Proj) !void {
++        if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_TRACE", false))
++            std.log.info("affine call {s} k={d} n={d}", .{ p.w, p.k, p.n });
+         const xt = p.x.t;
+         if (xt.dt != .bf16 or xt.shape.len != 2 or xt.shape[0] != e.n or xt.shape[1] != @as(i64, @intCast(p.k)) or xt.stride[0] != @as(i64, @intCast(p.k)))
+             return error.AffineInput;
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -419,7 +419,22 @@
+             for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
+             const sp = try tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = addrOf });
+             const g = c.grid;
+-            return r.triton.run(stream, c.name, .{ @intCast(g[0]), @intCast(g[1]), @intCast(g[2]) }, sp.args, sp.consts);
++            r.triton.run(stream, c.name, .{ @intCast(g[0]), @intCast(g[1]), @intCast(g[2]) }, sp.args, sp.consts) catch |e| {
++                if (!@import("builtin").is_test) {
++                    std.log.err("triton {s} grid {d}x{d}x{d}: {t}", .{ c.name, g[0], g[1], g[2], e });
++                    for (c.args) |x| switch (x.arg) {
++                        .t => |t| std.log.err("  {s} role={s} off={d} dt={t} shape={any} stride={any}", .{ x.name, switch (t.role) {
++                            .buf => |b| b,
++                            .weight => |w| w,
++                            .empty => "",
++                        }, t.offset, t.dt, t.shape, t.stride }),
++                        .i => |v| std.log.err("  {s} = {d}", .{ x.name, v }),
++                        else => {},
++                    };
++                }
++                return e;
++            };
++            return;
+         }
+         const dot = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse return error.BadName;
+         const args = try a.alloc(rp.Arg, c.args.len);
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -170,7 +170,10 @@
+         x: []const u8,
+         rows: usize,
+     ) ![]u8 {
+-        const item = a.linears.get(name) orelse return error.UnknownAffine;
++        const item = a.linears.get(name) orelse {
++            std.log.err("affine linear {s} is not resident", .{name});
++            return error.UnknownAffine;
++        };
+         const xq = try gpa.alloc(u8, x.len);
+         defer gpa.free(xq);
+         try act_quant.quantizeRow(x, xq, @intCast(item.k));
+@@ -190,7 +193,10 @@
+         x: []const u8,
+         rows: usize,
+     ) ![]u8 {
+-        const m = a.expert(name) orelse return error.UnknownAffine;
++        const m = a.expert(name) orelse {
++            std.log.err("affine expert {s} is not resident", .{name});
++            return error.UnknownAffine;
++        };
+         const xq = try gpa.alloc(u8, x.len);
+         defer gpa.free(xq);
+         try act_quant.quantizeRow(x, xq, @intCast(m.layout.k));
+@@ -213,7 +219,10 @@
+         k: usize,
+         n: usize,
+     ) !void {
+-        const item = a.linears.getHashed(id) orelse return error.UnknownAffine;
++        const item = a.linears.getHashed(id) orelse {
++            std.log.err("affine linear id 0x{x} is not resident", .{id});
++            return error.UnknownAffine;
++        };
+         if (item.k != k or item.n != n or rows == 0 or k % 64 != 0) return error.BadShape;
+         if (rows <= 16) {
+             if (sums == 0) return error.BadShape;

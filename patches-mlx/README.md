@@ -49,9 +49,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0042-dsv41-aot-needs-affine.patch` | Optionally read the checkpoint config in `aot-needs`, so the affine decode programs (not the EXL3 widths/prefill set) are enumerated |
 | `0043-dsv41-quant-rank.patch` | Accept the attention output's `[rows, heads, head_dim]` rank in the `wo_a` FP8 round-trip call |
 | `0044-dsv41-plain-head-chunks.patch` | Launch the vocabulary-sized dense head in aligned 32,768-column `_plain` chunks (CUDA `grid.y` limit) |
-| `0045-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0045-dsv41-affine-diagnostics.patch` | Name a missing affine role and a failing Triton call (grid, args) instead of returning a bare error |
+| `0046-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0044`. Planned: `0045`.
+Implemented: `0001`-`0045`. Planned: `0046`.
 
 Rules:
 
