@@ -72,6 +72,11 @@ docker run --rm -v "$MODEL_DIR:/model:ro" -v "$WORK/assets:/assets" "$IMAGE" \
 Then pass `ASSETS_HOST="$WORK/assets"`, set `TF_DSV41_CONTEXT=600000`, and start with
 `TENSORFOLD_MEMORY_RESERVE_GIB=4..8`. Do not set the reserve to 0 on a shared box.
 
+The affine decode path also needs the Triton AOT set; without it every request fails with
+`MissingTritonVariant`. Generate it once from the recipe's pinned reference tree as described
+in `scripts/mlx/README.md` ("Triton AOT set"). At 4,096 context the affine decode plan needs
+27 variants; regenerate after changing context, slots, drafts, or a computation knob.
+
 Pack the native Engram shards once (CPU and disk only; ~114 GiB):
 
 ```sh

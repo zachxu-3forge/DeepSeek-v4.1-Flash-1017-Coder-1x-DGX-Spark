@@ -143,6 +143,35 @@ The map builder checks the release tokenizer's compressed vocabulary count (99,0
 and writes `engram-token-map.bin.json` beside it. The engine reads the map, not the
 manifest; use the translated config the engine will boot with.
 
+## Triton AOT set
+
+The affine decode path still launches the family's Triton kernels. Without their cubins the
+engine admits the model but refuses each request with `MissingTritonVariant`. The set is
+generated from the recipe's pinned Python reference tree; the image carries the required
+Triton 3.7.1 and ptxas 13.3.73.
+
+```sh
+git clone --depth 1 https://github.com/jayleaton/deepseek-v41-tensorfold-spark recipe
+(cd recipe && scripts/fetch-reference.sh build/reference)      # build/reference/src
+IMAGE=tf-dsv41-mlx:dev
+R=/home/deploy/dsv41-recipe
+A=/home/deploy/dsv41-mlx/assets
+PY="docker run --rm --user $(id -u):$(id -g) -v $R:/recipe -v $R/build/reference/src:/refsrc:ro -v $A:/assets -w /recipe/engine/zig -e HOME=/tmp -e TRITON_CACHE_DIR=/tmp/triton --entrypoint python3 $IMAGE"
+$PY tools/zig/triton_fill.py sigs --py /refsrc --out /assets/sigs.json
+docker run --rm --user $(id -u):$(id -g) -v /path/model:/model:ro -v $A:/assets \
+  -e TF_EXPERIMENTAL=deepseek -e TF_TP_WORLD=1 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_GRAPHS=0 \
+  -e TF_DSV41_CONTEXT=4096 -e TF_DSV41_AOT_CONFIG=/model/config.json \
+  --entrypoint /opt/tensorfold/bin/tf-dsv41 $IMAGE aot-needs /assets/sigs.json /assets/needs.json
+$PY tools/zig/triton_fill.py compile --py /refsrc --needs /assets/needs.json \
+  --options tools/zig/dsv41_triton_options.json --arch 121 --have /assets/aot --out /assets/aot
+```
+
+At 4,096 context the affine decode plan needs 27 variants (from 12,545 programs); the fill
+reported 27 compiled, 0 failed. Re-run `aot-needs` and `compile --have "$ASSETS/aot"` after
+changing context, slots, drafts, or a computation knob. `aot-needs` uses
+`TF_DSV41_AOT_CONFIG` so the affine format and its pruned 192-expert count are visible; it
+skips native prefill (the affine path runs prompts as decode windows).
+
 ## Engram conversion
 
 The chosen path is the engine's native 4-bit reader, streamed from SSD: 160 B/row, ~114 GiB,

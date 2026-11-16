@@ -1,0 +1,32 @@
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -404,13 +404,22 @@
+ 
+     /// One dense BF16 projection: `_plain` over a whole `[n, k]` weight role.
+     pub fn denseLinear(e: *Emitter, base: []const u8, x: Arg, k: i64, n: i64, y: Arg) !void {
+-        try e.triton("_plain", .{ e.n, n, 1 }, &.{
+-            .{ .name = "X", .arg = x },                                               .{ .name = "x_rs", .arg = .{ .i = k } },
+-            .{ .name = "W", .arg = try e.weight("{s}", .{base}, .bf16, &.{ n, k }) }, .{ .name = "w_rs", .arg = .{ .i = k } },
+-            .{ .name = "OUT", .arg = y },                                             .{ .name = "K", .arg = .{ .i = k } },
+-            .{ .name = "N", .arg = .{ .i = n } },                                     .{ .name = "BK", .arg = .{ .i = 256 } },
+-            .{ .name = "PDL", .arg = .{ .b = false } },                               .{ .name = "BF16", .arg = .{ .b = true } },
+-        });
++        // CUDA's grid.y is 65,535: the vocabulary-sized head is launched in aligned column
++        // chunks. The runtime `N` stays the full row stride, so the same variant serves them.
++        const chunk: i64 = 32768;
++        var off: i64 = 0;
++        while (off < n) : (off += chunk) {
++            const len = @min(chunk, n - off);
++            const w = if (n <= chunk) try e.weight("{s}", .{base}, .bf16, &.{ n, k }) else try e.view(.{ .weight = base }, .bf16, &.{ len, k }, &.{ k, 1 }, off * k * 2);
++            const out = if (n <= chunk) y else try e.view(y.t.role, y.t.dt, &.{ e.n, len }, &.{ n, 1 }, y.t.offset + off * @as(i64, @intCast(@import("buffers.zig").dtSize(y.t.dt))));
++            try e.triton("_plain", .{ e.n, len, 1 }, &.{
++                .{ .name = "X", .arg = x },                 .{ .name = "x_rs", .arg = .{ .i = k } },
++                .{ .name = "W", .arg = w },                 .{ .name = "w_rs", .arg = .{ .i = k } },
++                .{ .name = "OUT", .arg = out },             .{ .name = "K", .arg = .{ .i = k } },
++                .{ .name = "N", .arg = .{ .i = n } },       .{ .name = "BK", .arg = .{ .i = 256 } },
++                .{ .name = "PDL", .arg = .{ .b = false } }, .{ .name = "BF16", .arg = .{ .b = true } },
++            });
++        }
+     }
+ 
+     /// One BF16 block of a dense group (`wo_a` in the affine checkpoint): `_plain` over a row view

@@ -48,9 +48,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0041-dsv41-dense-mark-spelling.patch` | Resolve coverage marks to the pack's module-prefixed spelling, so the affine dense plan loads `language_model.*` tensors |
 | `0042-dsv41-aot-needs-affine.patch` | Optionally read the checkpoint config in `aot-needs`, so the affine decode programs (not the EXL3 widths/prefill set) are enumerated |
 | `0043-dsv41-quant-rank.patch` | Accept the attention output's `[rows, heads, head_dim]` rank in the `wo_a` FP8 round-trip call |
-| `0044-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0044-dsv41-plain-head-chunks.patch` | Launch the vocabulary-sized dense head in aligned 32,768-column `_plain` chunks (CUDA `grid.y` limit) |
+| `0045-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0043`. Planned: `0044`.
+Implemented: `0001`-`0044`. Planned: `0045`.
 
 Rules:
 

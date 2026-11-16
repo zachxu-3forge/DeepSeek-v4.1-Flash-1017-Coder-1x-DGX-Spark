@@ -121,6 +121,10 @@ next step.
 - **Fixed:** the `wo_a` FP8 round-trip call receives the attention output as
   `[rows, heads, head_dim]`; `quantCall` required rank 2 and returned `BadAffineCall`
   (`0043`). It now checks the element count and the destination shape.
+- **Fixed:** the dense head's `_plain` launch used the vocabulary row count as `grid.y`
+  (129,280 > CUDA's 65,535) and failed with `CUDA_ERROR_INVALID_VALUE`. `denseLinear` now
+  launches aligned 32,768-column chunks under the same variant, and the chunk view keeps the
+  output dtype (f32 logits) (`0044`).
 - **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
   `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
 
