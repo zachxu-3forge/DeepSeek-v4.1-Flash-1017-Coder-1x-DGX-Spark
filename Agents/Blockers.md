@@ -113,6 +113,12 @@ generate`/`follow`) and exits with `AffineDSparkUnsupported` when the speculator
 `TF_DSV41_DRAFTS=1` remains unsupported for affine. Affine prefill is still skipped: prompts run as decode windows,
 so `TF_DSV41_OWN_PREFILL` is forced off for affine.
 
+Update 2026-11-16: the affine decode path runs end to end for one layer on `dgx2`
+(`055886260245`, patches `0001`-`0044`): guard, token map, Triton AOT set, load, and HTTP
+generation pass. The remaining piece in this section is the full 40-layer expert/DSpark set.
+The Triton AOT set is now a required boot asset (`$ASSETS/aot`); without it the engine admits
+the model but refuses requests with `MissingTritonVariant`.
+
 ### B7. Vision, tokenizer, chat template
 
 Tokenizer and chat template are the same DeepSeek-V4.1 family, and the vision tower is copied

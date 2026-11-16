@@ -194,10 +194,16 @@ table tensors are present. The `engram.json` token map/kit is still required.
 `test_engram.py --shard-dir` checks row 0 of every packed shard against the release bytes
 (native) or the decoded values (FP8).
 
-## Phase 0 gate
+## Stage 1 gate
 
 The harness is ready: the image builds, `tensorfold-dsv41 --version` runs, and the engine
 admits the 192-expert, world-1 affine plan. The Stage 1p guard logs
 `307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4` and the layer-0 projection
 sweep (every 8/6-bit linear and all three 2-bit expert stacks) matches the CPU rows within
 BF16 rounding.
+
+Verified on `dgx2` at image `055886260245` (patches `0001`-`0044`): host checks and the
+container guard PASS; the projection smoke matches the reference; the layer-0 fixture loads
+(dense 17 tensors/2.53 GiB, 7 linears/0.10 GiB, 3 expert stacks/1.98 GiB) and answers
+`POST /v1/completions` with HTTP 200 (5-token prompt, 4 tokens, 3 decode rounds). The affine
+decode path needs the 27-variant Triton AOT set described above.

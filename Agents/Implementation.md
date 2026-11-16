@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Activation quant + unscaled RoPE applied; dgx2 layer-0 gate next |
+| Overall status | Layer-0 affine forward runs on `dgx2` (image `055886260245`); full model and 600K next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` and `0035` rebuild pending) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:055886260245c480d2e9ff0744555abe11c11f736bc20319c604c903ea4c185b` (patches `0001`-`0044`) |
 | Last updated | 2026-11-16 |
 
 ## Phase tracker
@@ -125,8 +125,22 @@ next step.
   (129,280 > CUDA's 65,535) and failed with `CUDA_ERROR_INVALID_VALUE`. `denseLinear` now
   launches aligned 32,768-column chunks under the same variant, and the chunk view keeps the
   output dtype (f32 logits) (`0044`).
-- **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
-  `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
+- **Verified on `dgx2` (final image `sha256:055886260245…`, patches `0001`-`0044`):**
+  - Guard on the hardlinked overlay: PASS, 43 layers, dispatch `307/120/21/9`, 83.14 GiB raw.
+  - Token map built from the release config: 129,280 ids → 99,092 keys, 2 layers.
+  - Triton AOT set: `aot-needs` on the affine config at 4,096 context lists 27 variants
+    (12,545 programs); `triton_fill.py` compiled 27/27 with 0 failures. The image carries the
+    required Triton 3.7.1 and ptxas 13.3.73.
+  - Layer-0 load: affine dense 17 tensors/2.53 GiB, 7 linears packed/0.10 GiB, 3 expert
+    stacks/1.98 GiB; served in 7.1 s.
+  - Layer-0 forward: `POST /v1/completions` HTTP 200 (1 token, TTFT 25.6 ms); a 5-token
+    prompt with 4 tokens completed in 3 decode rounds at 47.9 tok/s (drafts off).
+  - Smoke on the fixture with `0039`'s quantized inputs: 10/10 CPU/GPU pairs match and the
+    three reference dots match `reference_layer.json` (`wq_a -0.15332/2.453125`,
+    `shared.w1 0.084961/3.3125`, `experts.w1 0.134766/0.10791`).
+  - Guard rerun on the final image: all host checks + container guard + dispatch PASS.
+- **Next:** load the full 40-layer model with its expert stacks on one GB10, then recheck the
+  KV format/indexer quantization and the 600K memory model.
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
@@ -960,14 +974,17 @@ Record the approach that was actually implemented, even if it differs from `Agen
 - Phase 0 harness and image build are done; the projection guard and one-projection smoke pass on the Spark.
 - Upstream `main` is chosen for Phase 0; fall back to the pinned fork if `dsv41-serve` fails to build or admit a fixture. It builds and admits.
 - The DSpark head is 22 MXFP8 + 9 MXFP4 modules, not affine; the affine plan owns 21 MXFP8 and 9 MXFP4, while `main_proj` is handled by the DSpark plan. MXFP4 will be requantized to affine-4/group-64 for the native `Affine4Experts`. Affine mode refuses DSpark and non-own prefill until those emitters are wired.
-- Runtime assets: `TF_DSV41_ASSETS` expects the 600K `rope.bin` and `engram.json`; the target repo does not ship them. The local `rope.bin` is ready; `engram.json` and real native shard checks remain.
+- Runtime assets: `TF_DSV41_ASSETS` expects `rope.bin`, `engram-token-map.bin` and `aot/`
+  (the affine decode set); the target repo ships none of them. All three are built now, and the
+  600K `rope.bin` is checked. Real native Engram shard checks remain.
 - Docker is not installed on the local Windows host; the build runs on the Spark.
 - The base-image digest is `sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c`.
-- The `dsv41-serve` build and the upstream dsv41 family are verified by the Spark guard and smoke.
+- The `dsv41-serve` build, the guard/smoke checks, the layer-0 load and its HTTP forward are
+  verified on `dgx2` (image `055886260245`).
 
 ## Next actions
 
-1. Run the layer-0 `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` forward on `dgx2` against a dequantized reference.
+1. Load all 40 layers plus the expert stacks on one GB10 and measure the boot/peak memory.
 2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default.
 3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter.
 4. Run the real `engram.json`/native shard checks on the Spark.
