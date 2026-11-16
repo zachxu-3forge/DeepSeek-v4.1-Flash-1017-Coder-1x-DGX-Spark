@@ -1,0 +1,32 @@
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -164,6 +164,29 @@
+     const v2 = named.bf16Widen(std.mem.readInt(u16, b2[0..2], .little));
+     std.log.info("affine smoke {s}: y[0] ones={d:.6} alt={d:.6}", .{ name, v1, v2 });
+ 
++    // Two rows in one launch: the server's prompt prefill path (rows 1..16). Row 0 repeats
++    // the ones row; row 1 is a third deterministic row checked against the CPU dot.
++    const x3f = try gpa.alloc(f32, k);
++    defer gpa.free(x3f);
++    for (0..k) |i| x3f[i] = (@as(f32, @floatFromInt(i % 13)) - 6.0) * 0.25;
++    const cpu3 = try @import("affine_ref.zig").dotRow(w0, s0, b0, bits, group, x3f);
++    const x12 = try gpa.alloc(u8, 2 * k * 2);
++    defer gpa.free(x12);
++    const x12q = try gpa.alloc(u8, x12.len);
++    defer gpa.free(x12q);
++    @memcpy(x12[0 .. k * 2], x1);
++    for (0..k) |i| std.mem.writeInt(u16, x12[k * 2 + 2 * i ..][0..2], bf16(x3f[i]), .little);
++    try act_quant.quantizeRow(x12[0 .. k * 2], x12q[0 .. k * 2], k);
++    try act_quant.quantizeRow(x12[k * 2 ..], x12q[k * 2 ..], k);
++    var ym = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x12q, 2);
++    defer ym.deinit();
++    const bm = try ym.download(driver, gpa);
++    defer gpa.free(bm);
++    const vm0 = named.bf16Widen(std.mem.readInt(u16, bm[0..2], .little));
++    const row1_at = @as(usize, chosen.n) * 2;
++    const vm1 = named.bf16Widen(std.mem.readInt(u16, bm[row1_at..][0..2], .little));
++    std.log.info("affine row2 {s}: y0={d:.6} y1={d:.6} cpu1={d:.6} cpu3={d:.6}", .{ name, vm0, vm1, cpu1, cpu3 });
++
+     if (std.mem.eql(u8, name, module_name)) {
+         var xd = try cuda.DeviceBuffer.fromHost(driver, x1);
+         defer xd.free();
