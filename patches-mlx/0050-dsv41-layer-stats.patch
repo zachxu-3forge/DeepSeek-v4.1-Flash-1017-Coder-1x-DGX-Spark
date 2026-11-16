@@ -1,0 +1,60 @@
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -82,6 +82,7 @@
+     .{ .name = "TF_DSV41_AFFINE_SMOKE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_LOAD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_TRACE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1 (log every affine projection the emitter issues)" },
++    .{ .name = "TF_DSV41_LAYER_STATS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1 (log each layer's residual RMS/max/mean)" },
+     .{ .name = "TF_DSV41_AFFINE_MAX_GIB", .scope = .dsv41, .kind = .positive_real, .forms = "a positive GiB limit for the affine load's peak (resident packed linears + expert images)" },
+     .{ .name = "TF_DSV41_GRAPHS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AOT_GUARD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -408,7 +408,8 @@
+         // TF_DSV41_R1=1, or the eight separate R1 knobs (the knob reader's r1)
+         const r1 = try @import("serve_knobs.zig").r1(&@import("serve_knobs.zig").env);
+         if (affine and r1) return error.AffineR1Unsupported;
+-        m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
++        const layer_stats = try @import("sys").environment.read(bool, "TF_DSV41_LAYER_STATS", false);
++        m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts, .trace = layer_stats }, &m.runner, comm);
+         try @import("engine_hooks.zig").open(&m.f); // the forward's later-layer hooks and prefill state
+         m.f.layers = backbone;
+         // the rope tables cover the limit + a prefill segment (the assets' rope.bin)
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -165,8 +165,34 @@
+         return f.engramRows(r, c);
+     }
+     if (std.mem.eql(u8, step, "trace")) {
+-        const map = f.trace orelse return;
+         const t = c.args[0].arg.t;
++        if (try @import("sys").environment.read(bool, "TF_DSV41_LAYER_STATS", false)) {
++            const host = try f.gpa.alloc(u8, 2 * numel(t));
++            defer f.gpa.free(host);
++            try r.stream.synchronize();
++            try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(t), .len = host.len }, 0, host);
++            var sum: f64 = 0;
++            var sumsq: f64 = 0;
++            var maxabs: f64 = 0;
++            var bad: usize = 0;
++            const count = numel(t);
++            for (0..count) |i| {
++                const v = named.bf16Widen(std.mem.readInt(u16, host[2 * i ..][0..2], .little));
++                if (!std.math.isFinite(v)) {
++                    bad += 1;
++                    continue;
++                }
++                sum += v;
++                sumsq += @as(f64, v) * v;
++                maxabs = @max(maxabs, @abs(v));
++            }
++            const nf: f64 = @floatFromInt(count - bad);
++            const mean = if (nf > 0) sum / nf else 0;
++            const rms = if (nf > 0) @sqrt(sumsq / nf) else 0;
++            std.log.info("layer {d} residual: rms {d:.4} max {d:.4} mean {d:.4} nonfinite {d}", .{ @as(u32, @intCast(c.args[1].arg.i)), rms, maxabs, mean, bad });
++            return;
++        }
++        const map = f.trace orelse return;
+         const host = try f.gpa.alloc(u8, 2 * numel(t));
+         defer f.gpa.free(host);
+         try r.stream.synchronize();
