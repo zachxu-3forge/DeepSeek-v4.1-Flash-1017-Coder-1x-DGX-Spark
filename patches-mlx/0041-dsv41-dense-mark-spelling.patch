@@ -1,0 +1,43 @@
+--- a/zig/src/families/deepseek_v41/pack.zig
++++ b/zig/src/families/deepseek_v41/pack.zig
+@@ -195,6 +195,17 @@
+         return null;
+     }
+ 
++    /// `resolve`'s stored spelling of a canonical name, for coverage marks. The slice is in
++    /// `buf` (or the pack) and may not outlive the caller's buffer.
++    pub fn key(p: *const Pack, name: []const u8, buf: []u8) ?[]const u8 {
++        if (p.names.getKey(name)) |k| return k;
++        for (module_prefixes) |prefix| {
++            const full = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, name }) catch continue;
++            if (p.names.getKey(full)) |k| return k;
++        }
++        return null;
++    }
++
+     /// A required tensor; a missing name is logged and refused.
+     pub fn need(p: *const Pack, name: []const u8) !Info {
+         var buf: [256]u8 = undefined;
+@@ -402,6 +413,8 @@
+     var buf: [128]u8 = undefined;
+     try testing.expect(p.resolve("embed.weight", &buf) != null);
+     try testing.expect(p.resolve("layers.0.engram.q_weight", &buf) != null);
++    try testing.expectEqualStrings("language_model.embed.weight", p.key("embed.weight", &buf).?);
++    try testing.expect(p.key("embed.bias", &buf) == null);
+     try testing.expectEqual(@as(u64, 32), (try p.need("embed.weight")).nbytes);
+     try testing.expectError(error.MissingTensor, p.need("embed.bias"));
+ }
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -133,7 +133,10 @@
+     buf: [256]u8 = undefined,
+ 
+     fn mark(b: *Builder, name: []const u8) !void {
+-        try b.used.put(b.a, b.pack.names.getKey(name) orelse return error.MissingTensor, {});
++        // `name` is canonical; the MLX packs store it under a module prefix.
++        var buf: [256]u8 = undefined;
++        const stored = b.pack.key(name, &buf) orelse return error.MissingTensor;
++        try b.used.put(b.a, try b.dupe(stored), {});
+     }
+ 
+     fn dupe(b: *Builder, s: []const u8) ![]const u8 {

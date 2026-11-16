@@ -110,6 +110,10 @@ next step.
   storage format was already `.affine`; the token-map parse has no format, so it failed
   `UnsupportedArchitecture`. The check now admits a positive count below the release's 384,
   for any format (`0040`).
+- **Fixed:** the affine dense plan marked canonical names (`layers.0.attn_norm.weight`)
+  directly in the pack's name map, which stores `language_model.*`; the first layer load
+  stopped at `MissingTensor`. `Pack.key` resolves the stored spelling and the plan copies it
+  into its coverage set (`0041`).
 - **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
   `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
 
