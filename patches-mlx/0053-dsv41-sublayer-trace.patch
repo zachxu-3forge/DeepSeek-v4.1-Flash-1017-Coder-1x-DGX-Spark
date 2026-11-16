@@ -1,0 +1,47 @@
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -573,11 +573,13 @@
+                 try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .site2);
+             } else try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .boundary);
+             try e.attention(L);
++            if (e.o.trace) try e.glue("trace", &.{ try e.buf("L.part", .{}, .bf16, &.{ e.n, @as(i64, @intCast(e.cfg.hidden)) }), .{ .i = 0x1000 + @as(i64, L) } });
+             try e.prefetchF(L);
+             const D: i64 = e.cfg.hidden;
+             try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ e.n, D }), try e.buf("w.recv.attn", .{}, .bf16, &.{ e.o.world, e.n, D }) });
+             try moe.mhc(e, L, "hc_ffn", .boundary);
+             try moe.moe(e, L);
++            if (e.o.trace) try e.glue("trace", &.{ try e.buf("L.moe", .{}, if (e.o.r1) .bf16 else .f32, &.{ e.n, @as(i64, @intCast(e.cfg.hidden)) }), .{ .i = 0x2000 + @as(i64, L) } });
+             if (i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
+             // `r1` (MOE_BF16): down_combine stores the partial as bf16, the exchange takes it as is
+             if (e.o.r1)
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -167,7 +167,9 @@
+     if (std.mem.eql(u8, step, "trace")) {
+         const t = c.args[0].arg.t;
+         if (try @import("sys").environment.read(bool, "TF_DSV41_LAYER_STATS", false)) {
+-            const host = try f.gpa.alloc(u8, 2 * numel(t));
++            const count = numel(t);
++            const dt_size = @import("buffers.zig").dtSize(t.dt);
++            const host = try f.gpa.alloc(u8, @intCast(dt_size * count));
+             defer f.gpa.free(host);
+             try r.stream.synchronize();
+             try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(t), .len = host.len }, 0, host);
+@@ -175,9 +177,15 @@
+             var sumsq: f64 = 0;
+             var maxabs: f64 = 0;
+             var bad: usize = 0;
+-            const count = numel(t);
+             for (0..count) |i| {
+-                const v = named.bf16Widen(std.mem.readInt(u16, host[2 * i ..][0..2], .little));
++                const v: f32 = switch (t.dt) {
++                    .bf16 => named.bf16Widen(std.mem.readInt(u16, host[2 * i ..][0..2], .little)),
++                    .f32 => @bitCast(std.mem.readInt(u32, host[4 * i ..][0..4], .little)),
++                    else => {
++                        bad += 1;
++                        continue;
++                    },
++                };
+                 if (!std.math.isFinite(v)) {
+                     bad += 1;
+                     continue;
