@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Full 40-layer model answers on one Spark at 4K (`0e6645b555ce`); text correctness/600K pending |
+| Overall status | Full text runs coherently on one Spark (`1df195f247ca`); exact omlx diff and 600K next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:0e6645b555ce4c6b62999a231cad68a398862057387c11316fb90f2b4e31e645` (patches `0001`-`0049`) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:1df195f247ca28496c45eaf44e5f7e40a6d26b748ffa880a03281c2e05efbda5` (patches `0001`-`0054`) |
 | Last updated | 2026-11-16 |
 
 ## Phase tracker
@@ -158,6 +158,28 @@ next step.
 - **Correctness caveat:** the text is not yet the reference's. Engram tables are synthetic
   (`TF_DSV41_ENGRAM_DIR` unset) and the compressed-layer KV/indexer packing still differs
   from omlx (B4). Layer-0 projections remain the verified correctness anchor.
+
+### 2026-11-16 - Full text works: the mHC forms were missing
+
+- **Root cause:** the affine boot skipped the `forms` pass that builds the persistent bf16
+  mHC `s.L<i>.hc_{attn,ffn}.fn16` buffers from the loaded f32 `hc_*_fn` weights (it was
+  inside `if (!affine)`). Every layer's mHC pre/post read uninitialized memory, so the
+  residual stream was wrong even though all affine projections were correct.
+- **Fix:** `0054` runs the forms builder for affine too; only the EXL3-only `ex_stacks`,
+  `forms_inplace` and `l2pf` stay behind the format check.
+- **Reference:** added `scripts/mlx/reference_affine_layer.py`, which drives the recipe's
+  PyTorch reference (`engine/reference`) over the MLX affine fixture with a dequantizing
+  loader (U32 words, BF16 scales/biases, stacked experts, per-group `wo_a`).
+- **Layer 0 vs reference:** attention output correlation `0.99935` (diff RMS 0.0269), MoE
+  `0.99942` (0.0036), post streams `0.99974` (0.0016, max 0.0156). The remaining delta is
+  the activation quantization / affine GEMM vs fp32 DenseLinear, not a structural error.
+- **Full model with the native Engram tables:** `What is the capital of France?` → `Paris`;
+  the LRU bench prompt answers `Here's a Python LRU cache implementation with per-entry
+  TTL...`, matching the checkpoint's `bench.json` opening; raw completions are coherent.
+- **Engram:** native packing completed for both layers (115 GiB, `--verify` max 0, byte
+  identical); the engine logs `rows from /engram-native`.
+- **Guard:** PASS on `1df195f247ca`; the dispatch check now adds the 2 Engram linears
+  (`309 = 307 + 2`).
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
@@ -1001,8 +1023,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Diff full-text logits/tokens against omlx on a fixed prompt; the packed KV formats and indexer/compressor activation quantization (B4) are the expected divergences.
-2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default.
-3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter.
-4. Pack the real native Engram tables (~114 GiB) and rerun the full-model text check with `TF_DSV41_ENGRAM_DIR` set.
+1. Quantify the exact greedy divergence from omlx on the `bench.json` LRU prompt (the bf16 KV cache vs omlx's packed 4-bit / e4m3 formats and the affine activation quantization are the expected sources); document accepted divergence.
+2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default, then measure 600K with YaRN.
+3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter and measure acceptance.
+4. Add the device expert gather/GEMM to replace the host loop (2.2 tok/s decode on the full model).
 5. Then server/vision and qualification.

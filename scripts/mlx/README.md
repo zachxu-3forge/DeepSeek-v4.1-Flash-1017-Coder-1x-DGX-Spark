@@ -213,3 +213,27 @@ At image `0e6645b555ce` (patches `0001`-`0049`) the full 40-layer model loads in
 24 GiB available) and answers a request (0.47 s TTFT, 2.2 tok/s with host-loop experts).
 The text is not yet reference-equal: the compressed-layer KV/indexer packing (B4) and the
 synthetic Engram rows still differ.
+
+At image `1df195f247ca` (patches `0001`-`0054`) the text is coherent. The missing piece was
+the persistent bf16 mHC `fn16` form: the affine boot skipped the `forms` pass, so every
+layer's pre/post mixing read uninitialized memory. `0054` builds those forms for affine too.
+The native Engram tables are packed and used, and the full model answers `Paris` to the
+capital question and the checkpoint's `bench.json` LRU prompt opening. The remaining
+divergence from omlx is the bf16 KV cache vs its packed 4-bit/e4m3 formats and the affine
+activation quantization.
+
+## Layer reference
+
+`reference_affine_layer.py` runs the recipe's PyTorch reference (`engine/reference`) against
+the MLX affine checkpoint with a dequantizing loader: U32 words + BF16 scales/biases per
+group, stacked experts sliced per expert, and the dense `wo_a` split into its output groups.
+It needs the recipe checkout at `/recipe`, the fixture at `/model`, and writes float32
+`[T, hc, hidden]` streams and (with `--sublayers`) the attention/MoE outputs:
+
+```sh
+python3 scripts/mlx/reference_affine_layer.py 671,6102,294,8760,344 --layers 1 \
+  --keep-layer 0 --sublayers --out /out/ref_layer0.npy
+```
+
+Layer 0 on the fixture matches the engine's traced streams at correlation `0.9997`; this is
+the CPU oracle for the remaining layer and full-model comparisons.

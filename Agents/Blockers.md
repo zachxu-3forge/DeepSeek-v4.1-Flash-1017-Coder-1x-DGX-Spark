@@ -74,6 +74,10 @@ Upstream's planner accepts world 1 structurally and has world-3/world-4 tests, b
 released or qualified single-GPU DeepSeek-V4.1 path. A single-Spark run needs the rank/comm path
 ported and tested, not just a config edit.
 
+Update 2026-11-16: the single-rank path is exercised end to end on `dgx2` (image
+`1df195f247ca`): the full 40-layer model loads (83.37 GiB affine) and serves coherent chat at
+world 1. The historical refusal above is the reason the port carries the world-1 tests.
+
 ### B5. Engram storage format differs
 
 The engine's packed Engram rows are FP8, not affine: `F8_E4M3 [rows,256]` plus
@@ -94,6 +98,11 @@ conversion. Implemented in `0035`: the header may declare either row size, and r
 decode both. The converter stays as a fallback/tool; `--format native` (default) copies the
 release bytes, `--format fp8` writes the 264 B form. Real-checkpoint shard verification
 remains before the Stage 3 gate.
+
+Update 2026-11-16: both native layers are packed (58 GiB each, 115 GiB total) and verified
+byte-identical (`--verify` max 0, RMS 0). The served full model reads them from
+`TF_DSV41_ENGRAM_DIR` (`engram: rows from /engram-native`), so the synthetic rows are no
+longer used when the directory is set.
 
 ### B6. Mixed affine/MXFP8/MXFP4/unquantized modules
 
@@ -120,6 +129,16 @@ Text correctness is still blocked on B4 and on packing the real Engram tables; t
 projections remain the verified anchor. The Triton AOT set is a required boot asset
 (`$ASSETS/aot`); without it the engine admits the model but refuses requests with
 `MissingTritonVariant`.
+
+Update 2026-11-16 (2): full text is coherent on `1df195f247ca`. The missing piece was the
+persistent bf16 mHC `fn16` form: the affine boot skipped the `forms` pass, so every layer's
+pre/post mixing read uninitialized memory (`0054` builds it for affine too). Layer 0 then
+matches the recipe's PyTorch reference at correlation `0.9997` (streams diff RMS 0.0016), and
+the full model answers `/v1/chat/completions` coherently (`Paris`; the LRU bench prompt starts
+with the checkpoint's `bench.json` opening). Exact greedy equality with omlx is still not
+expected: the engine stores the SWA/compressed KV in bf16, while omlx packs it to 4-bit/e4m3
+(window 8/32, compressed 4/16, index 4/32); this is a precision/format difference, not a
+structural failure. DSpark, vision, and the 600K memory model remain.
 
 ### B7. Vision, tokenizer, chat template
 
