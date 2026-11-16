@@ -114,7 +114,6 @@ reserve against 128 GiB at each context. With 600K in the defaults it reports 12
 ```sh
 python3 scripts/mlx/make_rope_tables.py /assets/rope.bin
 ```
-
 Writes the dsv41 CUDA `rope.bin`: 16-byte header, then the plain window table and the
 YaRN compressed table, each f32 `[rows, 64]`. The default `--rows 602048` covers 600K plus a
 2,048-row prefill segment. The compressed table is **unscaled** by default, matching
@@ -125,6 +124,24 @@ the known Qwen3.6 YaRN vector; `--check FILE` validates an existing asset's head
 sampled cos/sin values, and scale (`--check FILE --mscale` for the scaled form).
 
 Locally generated: `602048` rows, `308,248,592` bytes, `--check` passes.
+
+## Boot assets
+
+`cuda_model.boot` reads three things under `TF_DSV41_ASSETS` before the runner starts:
+`rope.bin`, `engram-token-map.bin`, and `aot/aot.json` (the affine path launches no Triton
+kernels, so an empty set is enough).
+
+```sh
+mkdir -p /assets/aot
+printf '{"kernels":[]}\n' > /assets/aot/aot.json
+docker run --rm -v "$MODEL_DIR:/model:ro" -v /assets:/assets "$IMAGE" \
+  tf-dsv41-token-map --tokenizer /model/tokenizer.json --config /model/config.json \
+  --output /assets/engram-token-map.bin
+```
+
+The map builder checks the release tokenizer's compressed vocabulary count (99,092 keys)
+and writes `engram-token-map.bin.json` beside it. The engine reads the map, not the
+manifest; use the translated config the engine will boot with.
 
 ## Engram conversion
 

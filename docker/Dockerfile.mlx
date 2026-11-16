@@ -43,13 +43,14 @@ RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; \
       git apply --check "$p" && git apply "$p" || exit 1; done
 
-RUN cd /tensorfold && /opt/zig/zig build dsv41-serve \
+RUN cd /tensorfold && /opt/zig/zig build dsv41-serve dsv41-token-map \
       -Dnvcc=/usr/local/cuda/bin/nvcc \
       -Ddsv41-nvcc=/usr/local/cuda/bin/nvcc \
       -Dsm=${SM} -Doptimize=ReleaseFast \
       --prefix /opt/tensorfold -j"$(nproc)" && \
     test -x /opt/tensorfold/bin/tensorfold-dsv41 && \
     test -x /opt/tensorfold/bin/tf-dsv41 && \
+    test -x /opt/tensorfold/bin/tf-dsv41-token-map && \
     rm -rf /tensorfold /root/.cache/zig
 
 COPY scripts/mlx /opt/tf-mlx/scripts

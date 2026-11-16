@@ -86,6 +86,10 @@ next step.
   `tf_dsv41_affine_v1.quant`, matching `rope(..., inverse=True, quantize=True)`.
 - **Fixed:** `Config` parses `gate_temp`; values other than the released 1.0 are refused
   explicitly until the router kernel carries the temperature.
+- **Build:** `tf-dsv41-token-map` is now installed with the serving pair (`dsv41-token-map`
+  step, patch `0038`); boot needs `$ASSETS/engram-token-map.bin` and `$ASSETS/aot/aot.json`
+  before the runner starts. The affine path launches no Triton kernels, so the empty set is
+  sufficient.
 - **Fixed:** `make_rope_tables.py` now defaults to the original unscaled compressed table;
   `--mscale` is opt-in. Regenerated `out/assets/rope.bin` (602,048 rows, 308,248,592 B,
   mscale 1.0) and `--check` passes.

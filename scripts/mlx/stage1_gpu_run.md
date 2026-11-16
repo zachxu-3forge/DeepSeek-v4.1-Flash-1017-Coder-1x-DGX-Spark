@@ -58,6 +58,17 @@ python3 scripts/mlx/make_rope_tables.py "$WORK/assets/rope.bin"
 The default compressed table is unscaled, matching the omlx DeepSeek V4.1 reference.
 Use `--mscale` only if the target reference explicitly bakes YaRN's attention scale.
 
+The runner also needs the Engram token map and an empty Triton set (the affine path launches
+no Triton kernels):
+
+```sh
+mkdir -p "$WORK/assets/aot"
+printf '{"kernels":[]}\n' > "$WORK/assets/aot/aot.json"
+docker run --rm -v "$MODEL_DIR:/model:ro" -v "$WORK/assets:/assets" "$IMAGE" \
+  tf-dsv41-token-map --tokenizer /model/tokenizer.json --config /model/config.json \
+  --output /assets/engram-token-map.bin
+```
+
 Then pass `ASSETS_HOST="$WORK/assets"`, set `TF_DSV41_CONTEXT=600000`, and start with
 `TENSORFOLD_MEMORY_RESERVE_GIB=4..8`. Do not set the reserve to 0 on a shared box.
 
@@ -141,6 +152,23 @@ The dense set is the norms, mHC mixers, router gate/bias, `wo_a`, this rank’s 
 and head rows; the linears are the packed projections; the expert stacks are raw for the
 host-loop path. All are freed before exit; the log proves the affine load path fits
 without OOM.
+
+## 4a. Layer-0 affine load
+
+Build the one-layer fixture once (4.6 GiB), then load only that layer with the assets mounted:
+
+```sh
+python3 scripts/mlx/make_one_layer.py "$MODEL_DIR" "$WORK/model-one-layer" --layer 0
+TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_GRAPHS=0 \
+TF_DSV41_LAYERS=0-0 TF_DSV41_AFFINE_LOAD=1 \
+ASSETS_HOST="$WORK/assets" MODEL_DIR="$WORK/model-one-layer" OUT_DIR="$WORK/stage1-layer0" \
+  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model
+```
+
+Expected: `dsv41 affine dense: …`, `dsv41 affine load: …`, `l2pf and rope`, then the server's
+listening line. A boot failure names the missing or short asset (`rope.bin`,
+`engram-token-map.bin`, `aot/aot.json`). Stop with Ctrl-C. Keep `TF_DSV41_GRAPHS=0` and
+`TF_DSV41_DRAFTS=0` for the first affine run.
 
 ## 5. If a smoke line fails
 
