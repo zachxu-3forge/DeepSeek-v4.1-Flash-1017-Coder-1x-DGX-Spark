@@ -56,8 +56,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0049-dsv41-engram-wkv-shape.patch` | Carry `engram.wkv`'s hash-column/gate shape in the release block list so the affine plan packs it |
 | `0050-dsv41-layer-stats.patch` | Log each layer's traced residual RMS/max/mean under `TF_DSV41_LAYER_STATS` for divergence bisecting |
 | `0051-dsv41-smoke-2row.patch` | Smoke a two-row affine launch against the CPU dots (the server's prefill path) |
+| `0052-dsv41-trace-dump.patch` | Dump the traced head input/logits (and per-layer states) under `TF_DSV41_TRACE_DIR` |
 
-Implemented: `0001`-`0051`.
+Implemented: `0001`-`0052`.
 
 Rules:
 

@@ -1,0 +1,37 @@
+--- a/zig/src/families/deepseek_v41/block_moe.zig
++++ b/zig/src/families/deepseek_v41/block_moe.zig
+@@ -321,9 +321,12 @@
+     const D: i64 = e.cfg.hidden;
+     const V: i64 = (try @import("partition.zig").share(e.cfg.vocab, e.o.rank, e.o.world)).len;
+     const logits = try e.buf("w.logits", .{}, .f32, &.{ e.n, V });
++    const out = try e.buf("w.out", .{}, .bf16, &.{ e.n, D });
++    if (e.o.trace) try e.glue("trace", &.{ out, .{ .i = 0xfff0 } });
+     if (e.cfg.format == .affine)
+-        try e.denseLinear("head", try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), D, V, logits)
++        try e.denseLinear("head", out, D, V, logits)
+     else
+-        try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), D, V, logits);
++        try e.upstream("head", out, D, V, logits);
++    if (e.o.trace) try e.glue("trace", &.{ logits, .{ .i = 0xfff1 } });
+     try e.glue("kit_logits", &.{logits});
+ }
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -190,6 +190,17 @@
+             const mean = if (nf > 0) sum / nf else 0;
+             const rms = if (nf > 0) @sqrt(sumsq / nf) else 0;
+             std.log.info("layer {d} residual: rms {d:.4} max {d:.4} mean {d:.4} nonfinite {d}", .{ @as(u32, @intCast(c.args[1].arg.i)), rms, maxabs, mean, bad });
++            if (std.c.getenv("TF_DSV41_TRACE_DIR")) |dir0| {
++                var path: [1024]u8 = undefined;
++                const written = std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/trace_{d}.bin", .{ std.mem.span(dir0), c.args[1].arg.i }) catch return;
++                path[written.len] = 0;
++                const tpath = path[0..written.len :0];
++                const fd = std.c.open(tpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
++                if (fd >= 0) {
++                    _ = std.c.write(fd, host.ptr, host.len);
++                    _ = std.c.close(fd);
++                }
++            }
+             return;
+         }
+         const map = f.trace orelse return;
