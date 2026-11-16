@@ -58,8 +58,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0051-dsv41-smoke-2row.patch` | Smoke a two-row affine launch against the CPU dots (the server's prefill path) |
 | `0052-dsv41-trace-dump.patch` | Dump the traced head input/logits (and per-layer states) under `TF_DSV41_TRACE_DIR` |
 | `0053-dsv41-sublayer-trace.patch` | Trace the attention output and MoE output (dtype-aware dumps) for sublayer bisecting |
+| `0054-dsv41-affine-mhc-forms.patch` | Build the persistent bf16 mHC `fn16` forms for the affine path (they were only built for EXL3) |
 
-Implemented: `0001`-`0053`.
+Implemented: `0001`-`0054`.
 
 Rules:
 

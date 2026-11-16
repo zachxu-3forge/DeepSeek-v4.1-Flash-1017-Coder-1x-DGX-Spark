@@ -1,0 +1,22 @@
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -463,6 +463,10 @@
+                 const ws = &pf.state(&m.f).k4ws.plan;
+                 _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
+             }
++        }
++        // The bf16 mHC forms (`s.L<i>.hc_*.fn16`) are built from the loaded f32 `hc_*_fn`
++        // weights for both formats; the affine path has no EXL3 forms, and builds return null.
++        {
+             const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
+             for (bp.sizes.keys()) |role| {
+                 if (buffers.scopeOf(role) != .persistent) continue;
+@@ -471,6 +475,8 @@
+                 const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
+                 try m.f.upload(m.runner.addressOf(role).?, bytes);
+             }
++        }
++        if (!affine) {
+             // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
+             m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
+         }
