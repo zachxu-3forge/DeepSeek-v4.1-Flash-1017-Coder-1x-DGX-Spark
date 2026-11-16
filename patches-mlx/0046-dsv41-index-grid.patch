@@ -1,0 +1,26 @@
+--- a/zig/src/families/deepseek_v41/block_index.zig
++++ b/zig/src/families/deepseek_v41/block_index.zig
+@@ -72,7 +72,10 @@
+     const ID: i64 = e.cfg.index_dim;
+     const cbs: i64 = e.cfg.candidate_block_size;
+     const spg = try e.paging(ratio, false);
+-    try e.triton(if (e.o.index_bound and cand == null) "_scores_b" else "_scores", .{ rows, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
++    // The first positions of a KV source have no compressed keys yet: one program still runs
++    // (NK=0 writes nothing) instead of a zero grid, which CUDA refuses.
++    const kb = @max(@as(i64, 1), std.math.divCeil(i64, nk, 64) catch unreachable);
++    try e.triton(if (e.o.index_bound and cand == null) "_scores_b" else "_scores", .{ rows, kb, 1 }, &.{
+         .{ .name = "QI", .arg = try e.view(qi.t.role, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
+         .{ .name = "W", .arg = try e.view(iw.t.role, .bf16, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 2) },
+         .{ .name = "w_stride", .arg = .{ .i = IH } },
+--- a/zig/src/families/deepseek_v41/block_prefill_select.zig
++++ b/zig/src/families/deepseek_v41/block_prefill_select.zig
+@@ -42,7 +42,8 @@
+     const ID: i64 = e.cfg.index_dim;
+     const out = try e.buf("L.ix.scores", .{}, .f32, &.{ rows, nk });
+     const spg = try e.paging(ratio, false);
+-    try e.triton("_scores", .{ rows, cdiv(nk, 64), 1 }, &.{
++    // As scoreRows: no compressed keys yet is one program, not a zero grid.
++    try e.triton("_scores", .{ rows, @max(@as(i64, 1), cdiv(nk, 64)), 1 }, &.{
+         .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
+         .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
+         .{ .name = "w_stride", .arg = .{ .i = IH } },
