@@ -1,0 +1,28 @@
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -368,7 +368,10 @@
+         // The released checkpoint's modules round their input through FP8 E4M3
+         // (group 32) before the affine matmul. Quantize into runner scratch so
+         // the source tensor stays intact for reuse.
+-        const item = af.linears.getHashed(a.id) orelse return error.UnknownAffine;
++        const item = af.linears.getHashed(a.id) orelse {
++            std.log.err("affine call id 0x{x} is not resident", .{a.id});
++            return error.UnknownAffine;
++        };
+         const x = try r.tensorAddr(a.x);
+         const xq = if (item.quantize_input) blk: {
+             const q = try scratch.take(try std.math.mul(usize, rows, a.k * 2));
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -188,6 +188,11 @@
+         }
+         layer.* = .{ .index = @intCast(i), .prefix = prefix, .modules = try modules.toOwnedSlice(a) };
+     }
++    if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_TRACE", false)) {
++        for (layers) |l| for (l.modules) |m|
++            std.log.info("affine plan {s} bits {d} k {d} n {d}", .{ m.role, m.spec.bits, m.layout.k, m.layout.n });
++        for (skipped.items) |s| std.log.info("affine plan skipped {s}: {t}", .{ s.name, s.reason });
++    }
+     return .{ .arena = arena, .layers = layers, .skipped = try skipped.toOwnedSlice(a), .mixed = try mixed.toOwnedSlice(a) };
+ }
+ 

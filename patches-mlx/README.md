@@ -52,9 +52,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0045-dsv41-affine-diagnostics.patch` | Name a missing affine role and a failing Triton call (grid, args) instead of returning a bare error |
 | `0046-dsv41-index-grid.patch` | Run the indexer's `_scores` with at least one program when a KV source has no compressed keys yet |
 | `0047-dsv41-affine-trace-env.patch` | Register `TF_DSV41_AFFINE_TRACE` in the strict environment table |
-| `0048-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0048-dsv41-affine-miss-trace.patch` | Log the missing affine call id and, under the trace, the plan's packed/skipped modules |
+| `0049-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0047`. Planned: `0048`.
+Implemented: `0001`-`0048`. Planned: `0049`.
 
 Rules:
 
