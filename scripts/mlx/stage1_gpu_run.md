@@ -55,6 +55,9 @@ mkdir -p "$WORK/assets"
 python3 scripts/mlx/make_rope_tables.py "$WORK/assets/rope.bin"
 ```
 
+The default compressed table is unscaled, matching the omlx DeepSeek V4.1 reference.
+Use `--mscale` only if the target reference explicitly bakes YaRN's attention scale.
+
 Then pass `ASSETS_HOST="$WORK/assets"`, set `TF_DSV41_CONTEXT=600000`, and start with
 `TENSORFOLD_MEMORY_RESERVE_GIB=4..8`. Do not set the reserve to 0 on a shared box.
 

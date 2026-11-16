@@ -41,9 +41,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0034-dsv41-expert-host-loop.patch` | Raw routed-expert loading, the host-loop MoE correctness path (shared expert + per-expert `AffineN`), and compressor/indexer/Engram emitter coverage |
 | `0035-dsv41-engram-native.patch` | Native 4-bit Engram reader streamed from SSD (160 B rows; the FP8 264 B format remains readable) |
 | `0036-dsv41-affine-review-fixes.patch` | Resolve `language_model.*` dense names, unify `L<i>` affine roles, make prefetch/graphs/boot affine-safe, and add the load budget and deinit fixes |
-| `0037-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0037-dsv41-activation-quant.patch` | Apply the MLX checkpoint's `quantize_input` FP8 E4M3 group-32 round-trip to affine linears, experts, and `wo_a`; parse `gate_temp` |
+| `0038-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0036`. Planned: `0037`.
+Implemented: `0001`-`0037`. Planned: `0038`.
 
 Rules:
 

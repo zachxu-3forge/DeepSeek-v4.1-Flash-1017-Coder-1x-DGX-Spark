@@ -1,0 +1,417 @@
+diff --git a/zig/kernels/cuda/act_rows.cu b/zig/kernels/cuda/act_rows.cu
+index 0f5bce5..6b54e03 100644
+--- a/zig/kernels/cuda/act_rows.cu
++++ b/zig/kernels/cuda/act_rows.cu
+@@ -70,6 +70,48 @@ extern "C" __global__ void __launch_bounds__(NT) tf_gate_rows(const __nv_bfloat1
+     }
+ }
+ 
++// omlx's quantize_activation: FP8 E4M3, a power-of-two scale a 32 values, dequantized to bf16.
++__device__ __forceinline__ float tf_round_fp8(float x) {
++    const uint32_t bits = __float_as_uint(x);
++    const bool neg = (bits >> 31) != 0;
++    const float a = fminf(fabsf(x), 448.0f);
++    if (a == 0.0f || a != a) return x;
++    const int e = static_cast<int>((__float_as_uint(a) >> 23) & 0xffu) - 127;
++    const int se = e - 3 > -9 ? e - 3 : -9;
++    const float step = __int_as_float(static_cast<uint32_t>(se + 127) << 23);
++    const float q = a / step;
++    const float v = fminf(rintf(q) * step, 448.0f);
++    return neg ? -v : v;
++}
++
++// out[r, i] = bf16(round_fp8(x[r * ld + i] / scale) * scale), one scale a 32 values (k % 32 == 0).
++extern "C" __global__ void __launch_bounds__(NT) tf_quant_fp8_rows(const __nv_bfloat16* __restrict__ x, long long ld,
++                                                                   __nv_bfloat16* __restrict__ out, int k) {
++    const int64_t r = blockIdx.x;
++    const int c = blockIdx.y * blockDim.x + threadIdx.x; // 8 values, 4 threads a 32-value group
++    const bool live = 8 * c < k;
++    float v[8];
++    if (live) {
++        unpack8(*reinterpret_cast<const uint4*>(x + r * ld + 8 * c), v);
++    } else {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) v[i] = 0.f;
++    }
++    float amax = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(v[i]));
++    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++    amax = fmaxf(amax, 1e-4f);
++    const uint32_t sb = __float_as_uint(amax * (1.0f / 448.0f));
++    const int se = static_cast<int>((sb >> 23) & 0xffu) - 127 + ((sb & 0x7fffffu) != 0);
++    const float scale = __int_as_float(static_cast<uint32_t>(se + 127) << 23);
++#pragma unroll
++    for (int i = 0; i < 8; ++i)
++        v[i] = tf_round_fp8(fminf(fmaxf(v[i] / scale, -448.f), 448.f)) * scale;
++    if (live) *reinterpret_cast<uint4*>(out + r * k + 8 * c) = pack8(v);
++}
++
+ // xs[r, j] = the sum of x[r * ld + 64 j ..][0 .. 64] (k % 64 == 0), in group_sum8's order.
+ extern "C" __global__ void __launch_bounds__(NT) tf_group_sums_rows(const __nv_bfloat16* __restrict__ x, long long ld,
+                                                                     float* __restrict__ xs, int k) {
+diff --git a/zig/src/cuda/act_rows.zig b/zig/src/cuda/act_rows.zig
+index 6f5104a..4ec1bcf 100644
+--- a/zig/src/cuda/act_rows.zig
++++ b/zig/src/cuda/act_rows.zig
+@@ -27,6 +27,7 @@ pub const ActRows = struct {
+     swiglu_fn: Function,
+     gate_fn: Function,
+     sums_fn: Function,
++    quant_fp8_fn: Function,
+     dconv_fn: Function,
+     geglu_fn: Function,
+     swiglu_round_fn: Function,
+@@ -40,7 +41,7 @@ pub const ActRows = struct {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.act_rows);
+         errdefer mod.unload();
+-        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows"), .dconv_fn = try mod.function("tf_dconv_rows"), .geglu_fn = try mod.function("tf_geglu_rows"), .swiglu_round_fn = try mod.function("tf_swiglu_rows_round"), .softcap_fn = try mod.function("tf_softcap_rows"), .gate_l2_fn = try mod.function("tf_gate_l2_rows"), .swiglu_l2_fn = try mod.function("tf_swiglu_l2_rows"), .head_gate_fn = try mod.function("tf_head_gate_rows"), .gelu_erf_fn = try mod.function("tf_gelu_erf_rows") };
++        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows"), .quant_fp8_fn = try mod.function("tf_quant_fp8_rows"), .dconv_fn = try mod.function("tf_dconv_rows"), .geglu_fn = try mod.function("tf_geglu_rows"), .swiglu_round_fn = try mod.function("tf_swiglu_rows_round"), .softcap_fn = try mod.function("tf_softcap_rows"), .gate_l2_fn = try mod.function("tf_gate_l2_rows"), .swiglu_l2_fn = try mod.function("tf_swiglu_l2_rows"), .head_gate_fn = try mod.function("tf_head_gate_rows"), .gelu_erf_fn = try mod.function("tf_gelu_erf_rows") };
+     }
+ 
+     /// out = bf16(bf16(gelu_erf(gate)) * up) as PyTorch's exact GELU then the product, rows as swiglu's; xs: sums.
+@@ -161,6 +162,20 @@ pub const ActRows = struct {
+     }
+ 
+     /// xs [rows, k / 64]: x's rows (stride ld) summed over each 64 values. k % 64 == 0.
++    /// out [rows, k] = FP8 E4M3 round-trip of x with one power-of-two scale a 32 values.
++    /// The source and destination may not alias.
++    pub fn quantFp8(g: *const ActRows, s: Stream, x: u64, ld: usize, out: u64, rows: usize, k: usize) !void {
++        if (k == 0 or k % 32 != 0 or k > std.math.maxInt(i32) or !aligned(&.{ x, out }, &.{})) return error.RowShape;
++        if (rows == 0) return;
++        var a: launch_.Args = .{};
++        a.add(x);
++        a.add(@as(i64, @intCast(ld)));
++        a.add(out);
++        a.add(@as(i32, @intCast(k)));
++        const t = launch_.rowThreads(rows, threads, 128);
++        try launch_.launch(g.quant_fp8_fn, .{ .grid = grid(rows, k, t), .block = .{ .x = t } }, s, &a);
++    }
++
+     pub fn groupSums(g: *const ActRows, s: Stream, x: u64, ld: usize, xs: u64, rows: usize, k: usize) !void {
+         if (k % 64 != 0 or !aligned(&.{x}, &.{ld})) return error.RowShape;
+         if (rows == 0) return;
+diff --git a/zig/src/families/deepseek_v41/act_quant.zig b/zig/src/families/deepseek_v41/act_quant.zig
+new file mode 100644
+index 0000000..8febffe
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/act_quant.zig
+@@ -0,0 +1,92 @@
++//! omlx's activation quantization: FP8 E4M3, one power-of-two scale per 32
++//! inputs, quantized and immediately dequantized back to bf16.
++//!
++//! This is the `quantize_activation(x)` step every `QuantizedProjection` with
++//! `quantize_input` applies before its affine matmul. It is a numerical
++//! round-trip, not a packed activation format.
++
++const std = @import("std");
++const named = @import("named.zig");
++
++/// Round one positive f32 to the E4M3 grid, nearest-even, saturating at 448.
++fn roundFp8Positive(a_in: f32) f32 {
++    const a = @min(a_in, 448.0);
++    if (a == 0 or a != a) return a;
++    const bits: u32 = @bitCast(a);
++    const e: i32 = @as(i32, @intCast((bits >> 23) & 0xff)) - 127;
++    const step_exp: i32 = @max(e - 3, -9);
++    const step: f32 = @bitCast(@as(u32, @intCast(step_exp + 127)) << 23);
++    const q = a / step;
++    const floor = @floor(q);
++    const frac = q - floor;
++    const rounded = if (frac > 0.5 or (frac == 0.5 and @mod(floor, 2.0) != 0)) floor + 1 else floor;
++    return @min(rounded * step, 448.0);
++}
++
++/// The E4M3FN value nearest `x`, with the original's sign and finite saturation.
++pub fn roundFp8(x: f32) f32 {
++    if (x != x) return x;
++    const neg = (@as(u32, @bitCast(x)) & 0x8000_0000) != 0;
++    const r = roundFp8Positive(@abs(x));
++    return if (neg) -r else r;
++}
++
++/// The original's `fast_round_scale`: 2^ceil(log2(amax / 448)) from the product's
++/// IEEE bits, so the scale is a normal power of two.
++fn scaleFor(amax_in: f32) f32 {
++    const amax = @max(amax_in, 1e-4);
++    const v = amax * (1.0 / 448.0);
++    const bits: u32 = @bitCast(v);
++    const e: i32 = @as(i32, @intCast((bits >> 23) & 0xff)) - 127 + @intFromBool((bits & 0x7f_ffff) != 0);
++    return @bitCast(@as(u32, @intCast(e + 127)) << 23);
++}
++
++/// Quantize/dequantize one bf16 row of `k` values in place of the source.
++/// `k` must be a multiple of 32.
++pub fn quantizeRow(src: []const u8, dst: []u8, k: usize) !void {
++    if (k == 0 or k % 32 != 0 or src.len != k * 2 or dst.len != k * 2) return error.BadShape;
++    var g: usize = 0;
++    while (g < k) : (g += 32) {
++        var amax: f32 = 0;
++        for (0..32) |j| {
++            const at = (g + j) * 2;
++            const v = named.bf16Widen(std.mem.readInt(u16, src[at..][0..2], .little));
++            amax = @max(amax, @abs(v));
++        }
++        const scale = scaleFor(amax);
++        for (0..32) |j| {
++            const at = (g + j) * 2;
++            const v = named.bf16Widen(std.mem.readInt(u16, src[at..][0..2], .little));
++            const q = roundFp8(std.math.clamp(v / scale, -448.0, 448.0));
++            std.mem.writeInt(u16, dst[at..][0..2], named.bf16Round(q * scale), .little);
++        }
++    }
++}
++
++test "FP8 activation round-trip keeps values on the E4M3 grid" {
++    var src: [64]u8 = undefined;
++    var dst: [64]u8 = undefined;
++    const values = [_]f32{ 1.0, -1.0, 0.5, -0.5, 0.0, 1e-4, 448.0, -448.0 };
++    for (values, 0..) |v, i| {
++        std.mem.writeInt(u16, src[2 * i ..][0..2], named.bf16Round(v), .little);
++    }
++    // Fill the group so the scale is the group's max.
++    for (values.len..32) |i| {
++        std.mem.writeInt(u16, src[2 * i ..][0..2], named.bf16Round(1.0), .little);
++    }
++    try quantizeRow(src[0..64], dst[0..64], 32);
++    try std.testing.expectEqual(@as(f32, 1.0), named.bf16Widen(std.mem.readInt(u16, dst[0..2], .little)));
++    try std.testing.expectEqual(@as(f32, -1.0), named.bf16Widen(std.mem.readInt(u16, dst[2..4], .little)));
++    try std.testing.expectEqual(@as(f32, 0.5), named.bf16Widen(std.mem.readInt(u16, dst[4..6], .little)));
++    try std.testing.expectEqual(@as(f32, -0.5), named.bf16Widen(std.mem.readInt(u16, dst[6..8], .little)));
++}
++
++test "FP8 activation quantization is a no-op for a constant exact group" {
++    var src: [64]u8 = undefined;
++    var dst: [64]u8 = undefined;
++    for (0..32) |i| std.mem.writeInt(u16, src[2 * i ..][0..2], named.bf16Round(0.5), .little);
++    try quantizeRow(src[0..64], dst[0..64], 32);
++    for (0..32) |i| {
++        try std.testing.expectEqual(@as(f32, 0.5), named.bf16Widen(std.mem.readInt(u16, dst[2 * i ..][0..2], .little)));
++    }
++}
+diff --git a/zig/src/families/deepseek_v41/affine.zig b/zig/src/families/deepseek_v41/affine.zig
+index 1866ec7..f7ef355 100644
+--- a/zig/src/families/deepseek_v41/affine.zig
++++ b/zig/src/families/deepseek_v41/affine.zig
+@@ -14,6 +14,10 @@ pub const Spec = struct {
+     bits: u8,
+     group: u32 = 0,
+     mode: Mode = .affine,
++    /// omlx's `QuantizedProjection`: quantize the activation to FP8 group 32 and
++    /// dequantize it before the affine matmul. The released checkpoint sets this
++    /// on every quantized module.
++    quantize_input: bool = true,
+ 
+     pub fn check(s: Spec) !void {
+         if (std.mem.indexOfScalar(u8, &.{ 2, 3, 4, 5, 6, 8 }, s.bits) == null) return error.BadAffine;
+@@ -176,7 +180,11 @@ fn spec(o: std.json.ObjectMap, fallback: ?u8) !Spec {
+         if (v != .integer or v.integer < 0 or v.integer > 128) return error.BadAffine;
+         break :blk @as(u32, @intCast(v.integer));
+     } else 64;
+-    const s: Spec = .{ .bits = bits, .group = if (mode == .affine) group else 0, .mode = mode };
++    const quantize_input = if (o.get("quantize_input")) |v| switch (v) {
++        .bool => |b| b,
++        else => return error.BadAffine,
++    } else true;
++    const s: Spec = .{ .bits = bits, .group = if (mode == .affine) group else 0, .mode = mode, .quantize_input = quantize_input };
+     try s.check();
+     return s;
+ }
+diff --git a/zig/src/families/deepseek_v41/affine_linears.zig b/zig/src/families/deepseek_v41/affine_linears.zig
+index 56439d8..c243978 100644
+--- a/zig/src/families/deepseek_v41/affine_linears.zig
++++ b/zig/src/families/deepseek_v41/affine_linears.zig
+@@ -19,6 +19,7 @@ pub const Item = struct {
+     n: u32,
+     k: u32,
+     bits: u8,
++    quantize_input: bool,
+ };
+ 
+ pub const Set = struct {
+@@ -108,7 +109,7 @@ pub fn loadAll(
+         errdefer tiles.deinit();
+         const name = try a.dupe(u8, if (b.role.len > 0) b.role else b.name);
+         try map.put(gpa, name, made);
+-        items[made] = .{ .name = name, .tiles = tiles, .n = b.n, .k = b.k, .bits = b.spec.bits };
++        items[made] = .{ .name = name, .tiles = tiles, .n = b.n, .k = b.k, .bits = b.spec.bits, .quantize_input = b.spec.quantize_input };
+         made += 1;
+     }
+     if (made != items.len) return error.AffineSetMismatch;
+diff --git a/zig/src/families/deepseek_v41/affine_runtime.zig b/zig/src/families/deepseek_v41/affine_runtime.zig
+index 2ce1b4e..bfb42ae 100644
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -13,6 +13,7 @@ const affine_load = @import("affine_load.zig");
+ const affine_bind = @import("affine_bind.zig");
+ const affine_cuda = @import("affine_cuda.zig");
+ const affine_launch = @import("affine_launch.zig");
++const act_quant = @import("act_quant.zig");
+ const weights_load = @import("cuda_weights.zig");
+ 
+ pub const ExpertModule = struct {
+@@ -23,6 +24,7 @@ pub const ExpertModule = struct {
+     dev: affine_bind.Device,
+     layout: @import("affine.zig").Layout,
+     experts: u32,
++    quantize_input: bool,
+ };
+ 
+ pub const Affine = struct {
+@@ -104,6 +106,7 @@ pub const Affine = struct {
+                 .dev = undefined,
+                 .layout = b.affine_layout.?,
+                 .experts = if (b.dspark) dspark_experts else backbone_experts,
++                .quantize_input = b.spec.quantize_input,
+             };
+             made += 1;
+         }
+@@ -168,7 +171,10 @@ pub const Affine = struct {
+         rows: usize,
+     ) ![]u8 {
+         const item = a.linears.get(name) orelse return error.UnknownAffine;
+-        var out = try affine_launch.linear(gpa, d, stream, &a.wide, &item.tiles, x, rows);
++        const xq = try gpa.alloc(u8, x.len);
++        defer gpa.free(xq);
++        try act_quant.quantizeRow(x, xq, @intCast(item.k));
++        var out = try affine_launch.linear(gpa, d, stream, &a.wide, &item.tiles, xq, rows);
+         defer out.deinit();
+         return out.download(d, gpa);
+     }
+@@ -185,8 +191,11 @@ pub const Affine = struct {
+         rows: usize,
+     ) ![]u8 {
+         const m = a.expert(name) orelse return error.UnknownAffine;
++        const xq = try gpa.alloc(u8, x.len);
++        defer gpa.free(xq);
++        try act_quant.quantizeRow(x, xq, @intCast(m.layout.k));
+         const view = try affine_cuda.expertView(m.layout, m.experts, expert_index, m.dev.weight_len, m.dev.scales_len, m.dev.biases_len);
+-        var out = try affine_launch.expert(gpa, d, stream, &a.wide, &m.dev, view, x, rows);
++        var out = try affine_launch.expert(gpa, d, stream, &a.wide, &m.dev, view, xq, rows);
+         defer out.deinit();
+         return out.download(d, gpa);
+     }
+diff --git a/zig/src/families/deepseek_v41/block_attn.zig b/zig/src/families/deepseek_v41/block_attn.zig
+index 906a57b..45041d5 100644
+--- a/zig/src/families/deepseek_v41/block_attn.zig
++++ b/zig/src/families/deepseek_v41/block_attn.zig
+@@ -335,10 +335,15 @@ pub fn attention(e: *Emitter, L: u32) !void {
+     const g: usize = try e.rankGroups();
+     const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
+     const oa = try e.buf("L.oa", .{}, .bf16, &.{ n, @as(i64, @intCast(g)) * e.cfg.o_lora });
++    // DeepSeek-V4.1's `rope(..., inverse=True, quantize=True)`: the attention output
++    // is rounded through FP8 E4M3 (group 32) before wo_a.
++    const oq = if (e.cfg.format == .affine) try e.buf("L.oq", .{}, .bf16, &.{ n, H * hd }) else o;
++    if (e.cfg.format == .affine)
++        try e.ext("tf_dsv41_affine_v1.quant", &.{ o, oq, .{ .i = H * hd } });
+     var po: [8]Proj = undefined;
+     for (po[0..g], 0..) |*p, i| p.* = .{
+         .w = try e.fmt("L{d}.attn.wo_a.{d}", .{ L, i }),
+-        .x = try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ H * hd, 1 }, @as(i64, @intCast(i)) * gk * 2),
++        .x = try e.view(oq.t.role, .bf16, &.{ n, gk }, &.{ H * hd, 1 }, @as(i64, @intCast(i)) * gk * 2),
+         .y = oa,
+         .col = i * e.cfg.o_lora,
+         .k = @intCast(gk),
+diff --git a/zig/src/families/deepseek_v41/config.zig b/zig/src/families/deepseek_v41/config.zig
+index 033f9f6..6348b5d 100644
+--- a/zig/src/families/deepseek_v41/config.zig
++++ b/zig/src/families/deepseek_v41/config.zig
+@@ -70,6 +70,8 @@ pub const Config = struct {
+     topk: u32 = 6,
+     expert_width: u32 = 2304,
+     routed_scale: f32 = 1.5,
++    /// omlx's router logit temperature. The released 1017 config leaves it 1.0.
++    gate_temp: f32 = 1.0,
+     norm_topk: bool = true,
+     swiglu_limit: f32 = 10.0,
+     compress_ratios: Ids = Ids.of(&.{ 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0 }),
+@@ -165,8 +167,9 @@ pub const Config = struct {
+             @field(c, p[0]) = try intAs(@TypeOf(@field(c, p[0])), v);
+         };
+         const floats = .{
+-            .{ "eps", "rms_norm_eps" }, .{ "routed_scale", "routed_scaling_factor" }, .{ "swiglu_limit", "swiglu_limit" },
+-            .{ "hc_eps", "hc_eps" },    .{ "hc_post_alpha", "hc_post_alpha" },        .{ "engram_gate_clamp", "engram_gate_clamp" },
++            .{ "eps", "rms_norm_eps" },                    .{ "routed_scale", "routed_scaling_factor" }, .{ "gate_temp", "gate_temp" },
++            .{ "swiglu_limit", "swiglu_limit" },           .{ "hc_eps", "hc_eps" },                      .{ "hc_post_alpha", "hc_post_alpha" },
++            .{ "engram_gate_clamp", "engram_gate_clamp" },
+         };
+         inline for (floats) |p| if (text.get(p[1])) |v| {
+             @field(c, p[0]) = @floatCast(try float(v));
+@@ -209,8 +212,10 @@ pub const Config = struct {
+             c.engram_max_ngram > 8 or c.engram_heads == 0 or c.engram_heads > 64 / (c.engram_max_ngram - 1) or
+             c.engram_layers.len > 4 or c.engram_pad >= c.vocab or c.bos >= c.vocab or c.eos >= c.vocab or
+             c.topk == 0 or c.experts == 0 or c.head_dim == 0 or c.window == 0) return error.BadConfig;
+-        inline for (.{ c.eps, c.hc_eps, c.engram_gate_clamp, c.routed_scale, c.swiglu_limit }) |v|
++        inline for (.{ c.eps, c.hc_eps, c.engram_gate_clamp, c.routed_scale, c.swiglu_limit, c.gate_temp }) |v|
+             if (!std.math.isFinite(v) or v <= 0) return error.BadConfig;
++        // The router kernel implements the released gate_temp == 1.0 path.
++        if (c.gate_temp != 1.0) return error.UnsupportedGateTemp;
+         inline for (.{ c.rope.theta, c.rope.compress_theta, c.rope.factor, c.rope.beta_fast, c.rope.beta_slow }) |v|
+             if (!std.math.isFinite(v) or v <= 0) return error.BadConfig;
+         if (c.hidden % 128 != 0 or c.expert_width % 128 != 0 or c.vocab % 128 != 0) return error.BadConfig;
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index 46f0bc9..2328d7f 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -695,5 +695,6 @@ test {
+     _ = @import("affine_smoke.zig");
+     _ = @import("affine_budget.zig");
+     _ = @import("affine_linears.zig");
++    _ = @import("act_quant.zig");
+     _ = @import("mxfp4_requant.zig");
+ }
+diff --git a/zig/src/families/deepseek_v41/run.zig b/zig/src/families/deepseek_v41/run.zig
+index e8af968..4f76553 100644
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -365,8 +365,39 @@ pub const Runner = struct {
+         const af = r.affine orelse return error.AffineNotLoaded;
+         const sb = scratch_buf orelse return error.ScratchTooSmall;
+         var scratch: rp.Scratch = .{ .ptr = sb.ptr, .len = sb.len };
++        // The released checkpoint's modules round their input through FP8 E4M3
++        // (group 32) before the affine matmul. Quantize into runner scratch so
++        // the source tensor stays intact for reuse.
++        const item = af.linears.getHashed(a.id) orelse return error.UnknownAffine;
++        const x = try r.tensorAddr(a.x);
++        const xq = if (item.quantize_input) blk: {
++            const q = try scratch.take(try std.math.mul(usize, rows, a.k * 2));
++            try af.act.quantFp8(stream, x, a.k, q, rows, a.k);
++            break :blk q;
++        } else x;
+         const sums = if (rows <= 16) try scratch.take(try std.math.mul(usize, rows, (a.k / 64) * 4)) else 0;
+-        try af.linear(stream, sums, a.id, try r.tensorAddr(a.x), try r.tensorAddr(a.y), rows, a.k, a.n);
++        try af.linear(stream, sums, a.id, xq, try r.tensorAddr(a.y), rows, a.k, a.n);
++    }
++
++    /// `tf_dsv41_affine_v1.quant(x, y, k)`: FP8 E4M3 group-32 activation round-trip.
++    fn quantCall(r: *Runner, stream: cuda.Stream, c: *const calls.Call) !void {
++        if (c.args.len != 3) return error.BadAffineCall;
++        const xt = switch (c.args[0].arg) {
++            .t => |t| t,
++            else => return error.BadAffineCall,
++        };
++        const yt = switch (c.args[1].arg) {
++            .t => |t| t,
++            else => return error.BadAffineCall,
++        };
++        const k: usize = @intCast(switch (c.args[2].arg) {
++            .i => |v| v,
++            else => return error.BadAffineCall,
++        });
++        const rows: usize = @intCast(xt.shape[0]);
++        if (xt.dt != .bf16 or yt.dt != .bf16 or xt.shape.len != 2 or yt.shape.len != 2 or yt.shape[0] != rows or yt.shape[1] != k) return error.BadAffineCall;
++        const af = r.affine orelse return error.AffineNotLoaded;
++        try af.act.quantFp8(stream, try r.tensorAddr(xt), k, try r.tensorAddr(yt), rows, k);
+     }
+ 
+     fn issueOn(r: *Runner, stream: cuda.Stream, c: *const calls.Call, scratch_buf: ?cuda.DeviceBuffer) !void {
+@@ -375,6 +406,7 @@ pub const Runner = struct {
+             return g.run(g.ctx, r, c);
+         }
+         if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.linear")) return r.affineCall(stream, c, scratch_buf);
++        if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.quant")) return r.quantCall(stream, c);
+         var arena = std.heap.ArenaAllocator.init(r.gpa);
+         defer arena.deinit();
+         const a = arena.allocator();

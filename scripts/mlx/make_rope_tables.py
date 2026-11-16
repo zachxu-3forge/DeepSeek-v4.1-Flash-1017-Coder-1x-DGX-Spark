@@ -2,10 +2,10 @@
 """Build the dsv41 CUDA `rope.bin`: two f32 tables [rows, 64], window then compressed.
 
 The window (sliding) table is plain RoPE at `rope_theta`. The compressed table is YaRN
-over `compress_rope_theta`, blended as `_compute_yarn_parameters` does, and its cosines and
-sines carry the YaRN attention scale `0.1 ln(factor) + 1` (the same convention as the
-MiaAI Qwen3.8 recipe). Verify the frequencies against `core/rope_yarn.zig` and the target's
-MLX reference before serving 600K.
+over `compress_rope_theta`, blended as `_compute_yarn_parameters` does. DeepSeek V4.1's
+reference leaves the table unscaled; this is the default. `--mscale` bakes the MiaAI/Qwen
+YaRN attention scale `0.1 ln(factor) + 1` in for families that need it. Verify the
+frequencies against `core/rope_yarn.zig` and the target's MLX reference before serving 600K.
 
 Header: 16 bytes, `ROPE` + rows + row floats + reserved. `boot_mem.uploadRope` only skips
 those 16 bytes; the tables follow.
@@ -84,7 +84,7 @@ def build(
     original: int = 65536,
     beta_fast: float = 32.0,
     beta_slow: float = 1.0,
-    apply_mscale: bool = True,
+    apply_mscale: bool = False,
 ) -> None:
     window = table(window_freqs(theta), rows)
     scale = mscale(factor) if apply_mscale else 1.0
@@ -129,7 +129,7 @@ def self_test() -> int:
     return 0
 
 
-def check(path: str, apply_mscale: bool = True) -> int:
+def check(path: str, apply_mscale: bool = False) -> int:
     with open(path, "rb") as f:
         head = f.read(HEADER)
         if len(head) != HEADER:
@@ -170,7 +170,8 @@ def main() -> int:
     ap.add_argument("--original", type=int, default=65536)
     ap.add_argument("--beta-fast", type=float, default=32.0)
     ap.add_argument("--beta-slow", type=float, default=1.0)
-    ap.add_argument("--no-mscale", action="store_true", help="leave the compressed table unscaled (the target reference applies YaRN's attention scale itself)")
+    ap.add_argument("--mscale", action="store_true", help="bake YaRN's attention scale into the compressed table (not used by DeepSeek V4.1)")
+    ap.add_argument("--no-mscale", action="store_true", help="deprecated: the compressed table is unscaled by default")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -178,12 +179,12 @@ def main() -> int:
     if args.check:
         if args.out:
             ap.error("OUT and --check are exclusive")
-        return check(args.check, not args.no_mscale)
+        return check(args.check, args.mscale and not args.no_mscale)
     if not args.out:
         ap.error("OUT is required unless --self-test or --check is used")
     if args.rows <= 0:
         ap.error("--rows must be positive")
-    build(args.out, args.rows, args.theta, args.compress_theta, args.factor, args.original, args.beta_fast, args.beta_slow, not args.no_mscale)
+    build(args.out, args.rows, args.theta, args.compress_theta, args.factor, args.original, args.beta_fast, args.beta_slow, args.mscale and not args.no_mscale)
     return 0
 
 

@@ -18,14 +18,14 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Affine boot path wired; one-layer GPU gate next |
+| Overall status | Activation quant + unscaled RoPE applied; dgx2 layer-0 gate next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
 | Container image | `tf-dsv41-mlx:dev`, last built ID `sha256:054b5ae252d0c9f1dc8dfd6d78422a799a1bf12a4a6fc7e87b7da5f3da0b1702` (patches `0001`-`0024`; `0025`-`0032` and `0035` rebuild pending) |
-| Last updated | 2026-11-12 |
+| Last updated | 2026-11-16 |
 
 ## Phase tracker
 
@@ -65,11 +65,34 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D18 | 2026-11-11 | Measure 600K with bf16 KV first; defer dsv41 FP8 KV | Port FP8 KV immediately | dsv41 CUDA does not wire `kv8`; 600K bf16 KV is 13.05 GiB. The MiaAI FP8 cache quality (KL 0.0031, 98.7% top-1) is evidence if headroom is too small |
 | D19 | 2026-11-11 | Use a 4-8 GiB memory reserve, not 0, on a shared box; pin a KV pool only if `TF_DSV41_POOL_TOKENS`/`kv_pool` does not already pin | Copy MiaAI’s reserve 0 / PyTorch pool code | Reserve 0 risks freezing unified-memory hosts; the pool code is PyTorch-specific. Adopt the admission/refusal policy, not the code |
 | D20 | 2026-11-11 | Do not port the MiaAI patches; adopt its config/start script and measurement-table patterns | Cherry-pick `qwen3_5` patches | Those patches target TensorFold v0.6.0 Python/Triton; this base is 1.2.5 Zig/CUDA |
+| D21 | 2026-11-16 | Do not bake `mscale` into the dsv41 RoPE table | Keep the MiaAI/Qwen mscale convention | `omlx/patches/deepseek_v41/language.py` builds plain YaRN cos/sin; it has no `mscale`. The compressed table must be unscaled to match the target runtime |
+| D22 | 2026-11-16 | Apply the checkpoint's `quantize_input` FP8 E4M3 group-32 activation round-trip before affine linears, experts, and `wo_a` | Raw BF16 activations | Every target module sets `quantize_input: true`; `QuantizedProjection.__call__` quantizes and dequantizes the activation, and attention applies the same round-trip to `o` before `wo_a` |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-16 - Activation quantization and unscaled RoPE
+
+- **Phase:** 1 (text correctness; host build only, no GPU yet).
+- **Fixed:** `affine.Spec` now carries `quantize_input`; `quant.json`'s boolean is parsed
+  (default true). `act_quant.zig` implements the original `quantize_activation`: FP8 E4M3,
+  one power-of-two scale per 32 values, quantized and dequantized back to bf16.
+- **Fixed:** device affine calls use a new `tf_quant_fp8_rows` kernel in `act_rows.cu`
+  through `ActRows.quantFp8`; `Runner.affineCall` quantizes into runner scratch only when
+  the module asks for it. Host `linearHost`/`expertHost` use the same round-trip.
+- **Fixed:** affine attention applies the FP8 round-trip to `o` before `wo_a` via
+  `tf_dsv41_affine_v1.quant`, matching `rope(..., inverse=True, quantize=True)`.
+- **Fixed:** `Config` parses `gate_temp`; values other than the released 1.0 are refused
+  explicitly until the router kernel carries the temperature.
+- **Fixed:** `make_rope_tables.py` now defaults to the original unscaled compressed table;
+  `--mscale` is opt-in. Regenerated `out/assets/rope.bin` (602,048 rows, 308,248,592 B,
+  mscale 1.0) and `--check` passes.
+- **Tests:** local `test-dsv41-forward`/`test-dsv41-shared` 334 pass, 1 skip, 1 known
+  `prepared.zig` mtime failure; device-host/server compiles pass. `0001`-`0037` apply cleanly.
+- **Next:** host checkpoint/overlay checks on `dgx2`, build the image there, then the
+  layer-0 `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` run.
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
@@ -910,8 +933,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Wire the affine one-layer boot path (dense plan + affine runtime + buffers/KV) and run the layer-0 attention/MoE forward against a dequantized reference.
-2. Measure 600K with bf16 KV and a 4-8 GiB reserve; check whether `TF_DSV41_POOL_TOKENS`/`kv_pool` already pins attention.
+1. Run the layer-0 `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` forward on `dgx2` against a dequantized reference.
+2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default.
 3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter.
 4. Run the real `engram.json`/native shard checks on the Spark.
 5. Then full model, server/vision, and qualification.
