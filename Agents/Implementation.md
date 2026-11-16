@@ -114,6 +114,10 @@ next step.
   directly in the pack's name map, which stores `language_model.*`; the first layer load
   stopped at `MissingTensor`. `Pack.key` resolves the stored spelling and the plan copies it
   into its coverage set (`0041`).
+- **Fixed:** `aot-needs` now reads `TF_DSV41_AOT_CONFIG` and skips native prefill for affine;
+  it had hardcoded the release/EXL3 config, so the affine decode set could not be enumerated
+  (`0042`). The `dgx2` image carries Triton 3.7.1 + ptxas 13.3.73, the versions the recipe's
+  `triton_fill.py` requires.
 - **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
   `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
 

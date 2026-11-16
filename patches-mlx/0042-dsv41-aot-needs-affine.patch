@@ -1,0 +1,30 @@
+--- a/zig/src/families/deepseek_v41/aot_needs.zig
++++ b/zig/src/families/deepseek_v41/aot_needs.zig
+@@ -397,7 +397,8 @@
+         try log.print("aot-needs: row mode, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+         try log.flush();
+     }
+-    for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
++    // the affine path has no native prefill: prompts run as decode windows
++    if (cfg.format != .affine) for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
+     // DSpark
+     if (sv.drafts) {
+         var pa = std.heap.ArenaAllocator.init(gpa);
+@@ -571,7 +572,16 @@
+     var w: block.Widths = .{};
+     try check.parseDense(a, &w, @embedFile("fixtures/dense-k2.txt"));
+     try check.parseExperts(a, &w, @embedFile("fixtures/expert-k2.txt"));
+-    const cfg: Config = .{};
++    var cfg: Config = .{};
++    // TF_DSV41_AOT_CONFIG: the checkpoint's translated config.json. The served format (affine:
++    // CUDA projections, decode-window prompts) and its pruned expert count change the
++    // specializations; without it the release defaults are enumerated.
++    if (std.c.getenv("TF_DSV41_AOT_CONFIG")) |path| {
++        const cfg_text = try cwd.readFileAlloc(io, std.mem.span(path), gpa, .limited(1 << 24));
++        defer gpa.free(cfg_text);
++        cfg = try Config.parse(gpa, cfg_text);
++        try cfg.validateRelease();
++    }
+     // a prefill segment's x3gm instances (per-layer K2 sets): CUDA launches, no Triton variant depends on them
+     for (0..cfg.layers) |L| try w.gm.put(a, @intCast(L), .{ (1 << 4) | (1 << 6) | (1 << 8), (1 << 4) | (1 << 10) });
+     // DSpark's ingest main_proj (a DSpark block's width; its EXL3 linear is CUDA, as slot_drafts_test.zig sets it)
