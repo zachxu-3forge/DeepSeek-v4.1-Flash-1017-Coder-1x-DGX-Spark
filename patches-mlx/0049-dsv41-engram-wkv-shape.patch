@@ -1,0 +1,23 @@
+--- a/zig/src/families/deepseek_v41/names.zig
++++ b/zig/src/families/deepseek_v41/names.zig
+@@ -104,7 +104,7 @@
+         try r.push(.{ .proj = .shared_w3, .suffix = "ffn.shared_experts.w3", .k = c.hidden, .n = c.expert_width });
+     }
+     if (c.isEngram(layer)) {
+-        try r.push(.{ .proj = .engram_wkv, .suffix = "engram.wkv" });
++        try r.push(.{ .proj = .engram_wkv, .suffix = "engram.wkv", .k = c.hashCols() * c.engram_head_dim, .n = (c.engram_max_ngram + 1) * c.hidden });
+         try r.push(.{ .proj = .engram_embed, .suffix = "engram.embed" });
+     }
+     return r;
+@@ -292,6 +292,11 @@
+     try testing.expectEqual(@as(usize, 3 + 4 + 1), (try blockGroups(&c, 30, 0, 2, false)).len);
+     try testing.expectEqual(@as(usize, 3 + 4 + 1 + 3), (try blockGroups(&c, 41, 0, 2, true)).len);
+     try testing.expect((try blockGroups(&c, 14, 0, 2, true)).items()[15].proj == .engram_wkv);
++    // the release list carries Engram's projection shape (a zero shape is skipped by the affine plan)
++    for ((try releaseBlocks(&c, 14, true)).items()) |s| if (s.proj == .engram_wkv) {
++        try testing.expectEqual(@as(u32, 24 * 256), s.k);
++        try testing.expectEqual(@as(u32, 5 * 5120), s.n);
++    };
+     try testing.expectEqualStrings("layers.3.ffn.experts.17.w2", try expertName("layers.3", 17, .w2, &buf));
+ }
+ 
