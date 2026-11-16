@@ -226,7 +226,10 @@ got = {
     "mxfp8": int(m.group(3)),
     "mxfp4": int(m.group(4)),
 }
-if got != {k: plan[k] for k in got}:
+# the engine's dispatch line counts the Engram wkv linears with the affine8 set
+want = dict(plan)
+want["affine8_linear"] = plan["affine8_linear"] + plan.get("affine_engram", 0)
+if got != {k: want[k] for k in got}:
     print(f"dispatch mismatch: plan={plan} engine={got}", file=sys.stderr)
     raise SystemExit(1)
 print("dispatch counts match")
