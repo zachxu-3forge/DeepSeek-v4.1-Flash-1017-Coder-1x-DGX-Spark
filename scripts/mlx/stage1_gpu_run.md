@@ -91,10 +91,13 @@ CONTAINER=1 MODEL_DIR="$OVERLAY" OUT_DIR="$WORK/stage1-q" \
   scripts/mlx/test_stage1.sh 2>&1 | tee "$WORK/container-q.log"
 ```
 
+The harness's default `SERVE_ARGS` is `serve /model --no-drafts`; `serve` reads the CLI flag,
+not `TF_DSV41_DRAFTS`.
+
 Expected guard line:
 
 ```text
-dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; experts raw 79.10 GiB (largest packed expert 3.52 MiB); total raw 83.37 GiB, resident with packed linears 83.38 GiB
+dsv41 affine bytes: linears raw 4.03 GiB, packed 4.04 GiB; experts raw 79.10 GiB (largest packed expert 3.52 MiB); total raw 83.14 GiB, resident with packed linears 83.14 GiB
 dsv41 affine: 43 layers, ... dispatch: 307 affine8 linears, 120 expert fallbacks, 21 mxfp8, 9 mxfp4
 AffineLoadDisabled
 ```
@@ -128,19 +131,19 @@ When the GPU is idle and the sweep is clean, verify the full packed-linear set a
 dense/native half of the affine checkpoint:
 
 ```sh
-TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_LOAD=1 \
+TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_AFFINE_LOAD=1 \
 TF_DSV41_GRAPHS=0 TF_DSV41_AFFINE_MAX_GIB=118 \
 MODEL_DIR="$OVERLAY" OUT_DIR="$WORK/stage1-load" \
-  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model \
+  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model --no-drafts \
   2>&1 | tee "$WORK/affine-load.log"
 ```
 
 Expected:
 
 ```text
-dsv41 affine bytes: linears raw 4.27 GiB, packed 4.28 GiB; ...
+dsv41 affine bytes: linears raw 4.03 GiB, packed 4.04 GiB; ...
 dsv41 affine dense: N tensors, M GiB
-dsv41 affine load: 309 linears packed, 4.30 GiB; K expert stacks, E GiB
+dsv41 affine load: N linears packed, M GiB; K expert stacks, E GiB
 ```
 
 The process now continues into the runner and forward. Keep `TF_DSV41_GRAPHS=0` for the
@@ -159,16 +162,18 @@ Build the one-layer fixture once (4.6 GiB), then load only that layer with the a
 
 ```sh
 python3 scripts/mlx/make_one_layer.py "$MODEL_DIR" "$WORK/model-one-layer" --layer 0
-TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 TF_DSV41_GRAPHS=0 \
+TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_GRAPHS=0 \
 TF_DSV41_LAYERS=0-0 TF_DSV41_AFFINE_LOAD=1 \
 ASSETS_HOST="$WORK/assets" MODEL_DIR="$WORK/model-one-layer" OUT_DIR="$WORK/stage1-layer0" \
-  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model
+  scripts/mlx/run_container.sh tensorfold-dsv41 serve /model --no-drafts
 ```
 
 Expected: `dsv41 affine dense: …`, `dsv41 affine load: …`, `l2pf and rope`, then the server's
 listening line. A boot failure names the missing or short asset (`rope.bin`,
-`engram-token-map.bin`, `aot/aot.json`). Stop with Ctrl-C. Keep `TF_DSV41_GRAPHS=0` and
-`TF_DSV41_DRAFTS=0` for the first affine run.
+`engram-token-map.bin`, `aot/aot.json`). Stop with Ctrl-C. Keep `TF_DSV41_GRAPHS=0` for the
+first affine run. The server's speculator is the CLI's `--no-drafts`; `TF_DSV41_DRAFTS=0` is
+read by `tf-dsv41 generate`/`follow`, not by `serve`. Passing only the env variable leaves
+DSpark on and the affine boot refuses with `AffineDSparkUnsupported`.
 
 ## 5. If a smoke line fails
 

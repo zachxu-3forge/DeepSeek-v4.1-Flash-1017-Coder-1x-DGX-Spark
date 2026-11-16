@@ -15,7 +15,7 @@
 #   CONTAINER=1 also run the engine in the image
 #   BUILD=1     build the image before the container run
 #   EXPECT_FORWARD=1  require the one-layer forward to pass (after stage 1m)
-#   SERVE_ARGS  engine arguments (default "serve /model")
+#   SERVE_ARGS  engine arguments (default "serve /model --no-drafts")
 #   ENGRAM_SHARDS  packed Engram shards to check with test_engram.py --shard-dir
 set -uo pipefail
 
@@ -26,7 +26,7 @@ MODEL_DIR=${MODEL_DIR:-}
 CONTAINER=${CONTAINER:-0}
 EXPECT_FORWARD=${EXPECT_FORWARD:-0}
 SMOKE=${SMOKE:-0}
-SERVE_ARGS=${SERVE_ARGS:-serve /model}
+SERVE_ARGS=${SERVE_ARGS:-serve /model --no-drafts}
 IMAGE=${IMAGE:-tf-dsv41-mlx:dev}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR=${OUT_DIR:-$ROOT/out/stage1/$STAMP}
@@ -113,7 +113,7 @@ if [[ "$CONTAINER" == "1" ]]; then
   # the dispatch line comparable with plan_dispatch.json; the smoke run below loads
   # only layer 0.
   set +e
-  TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_DRAFTS=0 \
+  TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 \
     TF_DSV41_AFFINE_LOAD=${TF_DSV41_AFFINE_LOAD:-$EXPECT_FORWARD} \
     timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
     >"$OUT_DIR/engine.log" 2>&1
@@ -140,7 +140,7 @@ if [[ "$CONTAINER" == "1" ]]; then
   if [[ "$SMOKE" == "1" ]]; then
     echo "== affine smoke"
     set +e
-    TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_LAYERS=0-0 TF_DSV41_DRAFTS=0 TF_DSV41_AFFINE_SMOKE=1 \
+    TF_EXPERIMENTAL=deepseek TF_TP_WORLD=1 TF_DSV41_LAYERS=0-0 TF_DSV41_AFFINE_SMOKE=1 \
       timeout 600 "$ROOT/scripts/mlx/run_container.sh" tensorfold-dsv41 $SERVE_ARGS \
       >"$OUT_DIR/smoke.log" 2>&1
     rc_smoke=$?

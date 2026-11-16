@@ -43,9 +43,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0036-dsv41-affine-review-fixes.patch` | Resolve `language_model.*` dense names, unify `L<i>` affine roles, make prefetch/graphs/boot affine-safe, and add the load budget and deinit fixes |
 | `0037-dsv41-activation-quant.patch` | Apply the MLX checkpoint's `quantize_input` FP8 E4M3 group-32 round-trip to affine linears, experts, and `wo_a`; parse `gate_temp` |
 | `0038-dsv41-token-map-tool.patch` | Install `tf-dsv41-token-map`, the release tokenizer's Engram token-map CLI, with the serving pair |
-| `0039-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0039-dsv41-smoke-quant.patch` | Round the smoke's projection inputs through the `quantize_input` FP8 path before the linear and expert comparisons |
+| `0040-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0038`. Planned: `0039`.
+Implemented: `0001`-`0039`. Planned: `0040`.
 
 Rules:
 

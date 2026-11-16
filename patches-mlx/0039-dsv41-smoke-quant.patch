@@ -1,0 +1,50 @@
+--- a/zig/src/families/deepseek_v41/affine_smoke.zig
++++ b/zig/src/families/deepseek_v41/affine_smoke.zig
+@@ -18,6 +18,7 @@
+ const affine_exec = @import("affine_exec.zig");
+ const affine_cuda = @import("affine_cuda.zig");
+ const affine_linears = @import("affine_linears.zig");
++const act_quant = @import("act_quant.zig");
+ const Config = @import("config.zig").Config;
+ 
+ pub const module_name = "layers.0.attn.wq_a";
+@@ -141,10 +142,19 @@
+         const v: f32 = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
+         std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
+     }
++    // the released modules apply `quantize_input`: round the activation through
++    // FP8 E4M3 (group 32) exactly as the served path does (the chosen rows are
++    // exactly representable, so the reference dots stay comparable).
++    const x1q = try gpa.alloc(u8, x1.len);
++    defer gpa.free(x1q);
++    const x2q = try gpa.alloc(u8, x2.len);
++    defer gpa.free(x2q);
++    try act_quant.quantizeRow(x1, x1q, k);
++    try act_quant.quantizeRow(x2, x2q, k);
+ 
+-    var y1 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x1, 1);
++    var y1 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x1q, 1);
+     defer y1.deinit();
+-    var y2 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x2, 1);
++    var y2 = try affine_launch.linear(gpa, driver, stream, wide, &tiles, x2q, 1);
+     defer y2.deinit();
+     const b1 = try y1.download(driver, gpa);
+     defer gpa.free(b1);
+@@ -225,9 +235,15 @@
+         const v: f32 = (@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.5;
+         std.mem.writeInt(u16, x2[2 * i ..][0..2], bf16(v), .little);
+     }
+-    var y1 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x1, 1);
++    const x1q = try gpa.alloc(u8, x1.len);
++    defer gpa.free(x1q);
++    const x2q = try gpa.alloc(u8, x2.len);
++    defer gpa.free(x2q);
++    try act_quant.quantizeRow(x1, x1q, k);
++    try act_quant.quantizeRow(x2, x2q, k);
++    var y1 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x1q, 1);
+     defer y1.deinit();
+-    var y2 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x2, 1);
++    var y2 = try affine_launch.expert(gpa, driver, stream, wide, &dev, view, x2q, 1);
+     defer y2.deinit();
+     const b1 = try y1.download(driver, gpa);
+     defer gpa.free(b1);

@@ -95,8 +95,19 @@ next step.
   mscale 1.0) and `--check` passes.
 - **Tests:** local `test-dsv41-forward`/`test-dsv41-shared` 334 pass, 1 skip, 1 known
   `prepared.zig` mtime failure; device-host/server compiles pass. `0001`-`0037` apply cleanly.
-- **Next:** host checkpoint/overlay checks on `dgx2`, build the image there, then the
-  layer-0 `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` run.
+- **Verified on `dgx2` (image #1, `2b062d6e38e9`):** host checks PASS; the container guard
+  against the hardlinked overlay PASS with dispatch `307/120/21/9` and 83.14 GiB raw;
+  layer-0 projection smoke on the fixture matches `reference_layer.json` (wq_a
+  `-0.15332/2.453125` vs `-0.15351/2.45120`, shared w1 `0.084961/3.3125` vs
+  `0.084923/3.31695`, expert0 w1 `0.134766/0.10791` vs `0.134277/0.107697`), and all 10
+  CPU/GPU pairs match.
+- **Fixed:** the server's `serve` path reads `--no-drafts`; `TF_DSV41_DRAFTS` only drives
+  `tf-dsv41 generate`/`follow`. With the env alone the affine boot stops at
+  `AffineDSparkUnsupported`. The harness default is now `serve /model --no-drafts`.
+- **Found:** the engine on a raw MLX dir stops at `MissingField`; it needs the translated
+  overlay (config with `quantization_config`), as `scripts/mlx/README.md` says.
+- **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
+  `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
