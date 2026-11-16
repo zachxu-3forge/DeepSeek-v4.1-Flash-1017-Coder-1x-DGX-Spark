@@ -1,0 +1,14 @@
+--- a/zig/src/families/deepseek_v41/config.zig
++++ b/zig/src/families/deepseek_v41/config.zig
+@@ -236,8 +236,9 @@
+         try c.validate();
+         const release: Config = .{};
+         inline for (.{ "vocab", "hidden", "layers", "heads", "head_dim", "rope_dim", "q_lora", "o_lora", "o_groups", "window", "experts", "shared_experts", "topk", "expert_width", "routed_scale", "norm_topk", "swiglu_limit", "index_heads", "index_dim", "index_topk", "candidate_source", "candidate_blocks", "candidate_block_size", "hc_mult", "hc_sinkhorn_iters", "hc_post_alpha", "engram_max_ngram", "engram_vocab", "engram_heads", "engram_head_dim", "engram_pad", "engram_compressed_vocab", "mtp_layers", "dspark_block", "dspark_noise_token", "dspark_markov_rank", "dspark_experts", "dspark_topk", "bos", "eos" }) |name| {
+-            // A pruned affine pack keeps the release's geometry but may select fewer routed experts.
+-            const keep = c.format == .affine and std.mem.eql(u8, name, "experts");
++            // A pruned pack keeps the release's geometry but may select fewer routed
++            // experts; the metadata parse has no storage format, so allow it generally.
++            const keep = std.mem.eql(u8, name, "experts") and c.experts > 0 and c.experts < release.experts;
+             if (!keep and @field(c.*, name) != @field(release, name)) return error.UnsupportedArchitecture;
+         }
+         inline for (.{ "compress_ratios", "kv_sources", "index_sources", "engram_layers", "dspark_targets" }) |name| {
