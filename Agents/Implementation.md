@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Layer-0 affine forward runs on `dgx2` (image `055886260245`); full model and 600K next |
+| Overall status | Full 40-layer model answers on one Spark at 4K (`0e6645b555ce`); text correctness/600K pending |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:055886260245c480d2e9ff0744555abe11c11f736bc20319c604c903ea4c185b` (patches `0001`-`0044`) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:0e6645b555ce4c6b62999a231cad68a398862057387c11316fb90f2b4e31e645` (patches `0001`-`0049`) |
 | Last updated | 2026-11-16 |
 
 ## Phase tracker
@@ -141,6 +141,23 @@ next step.
   - Guard rerun on the final image: all host checks + container guard + dispatch PASS.
 - **Next:** load the full 40-layer model with its expert stacks on one GB10, then recheck the
   KV format/indexer quantization and the 600K memory model.
+
+### 2026-11-16 - Full model runs on one Spark
+
+- **Phase:** 2 (full model, first GPU execution).
+- **Image:** `sha256:0e6645b555ce…`, patches `0001`-`0049`.
+- **Load:** dense 573 tensors/5.19 GiB; 309 linears packed/4.28 GiB; 120 expert stacks
+  79.10 GiB; total affine 83.37 GiB raw; `loaded in 97.7s`.
+- **Memory:** 96 GiB used, 24 GiB available with the model resident (no pool).
+- **Requests:** `POST /v1/completions` HTTP 200; a 1-token prompt with 4 new tokens took
+  1.80 s (TTFT 0.466 s, 3 decode rounds, 2.2 tok/s, drafts off). Per-layer bisect: layers 0,
+  2, 20 and 39 already answered; layer 1 (Engram) answers after `0049`.
+- **Fixes on the way:** `0045`/`0048` diagnostics; `0046` `_scores` grid at zero compressed
+  keys; `0047` trace env registration; `0049` `engram.wkv` shape in `releaseBlocks` (it was
+  skipped as a zero-shape module and the first request failed `UnknownAffine`).
+- **Correctness caveat:** the text is not yet the reference's. Engram tables are synthetic
+  (`TF_DSV41_ENGRAM_DIR` unset) and the compressed-layer KV/indexer packing still differs
+  from omlx (B4). Layer-0 projections remain the verified correctness anchor.
 
 ### 2026-11-12 - Affine review fixes: names, boot, graphs, budget
 
@@ -984,8 +1001,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Load all 40 layers plus the expert stacks on one GB10 and measure the boot/peak memory.
+1. Diff full-text logits/tokens against omlx on a fixed prompt; the packed KV formats and indexer/compressor activation quantization (B4) are the expected divergences.
 2. Correct the 600K/1M KV memory model: the port's packed KV budget is ~1.0 GiB at 600K, not 13.05 GiB; verify the format match before changing the context default.
 3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter.
-4. Run the real `engram.json`/native shard checks on the Spark.
-5. Then full model, server/vision, and qualification.
+4. Pack the real native Engram tables (~114 GiB) and rerun the full-model text check with `TF_DSV41_ENGRAM_DIR` set.
+5. Then server/vision and qualification.

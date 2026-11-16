@@ -207,3 +207,9 @@ container guard PASS; the projection smoke matches the reference; the layer-0 fi
 (dense 17 tensors/2.53 GiB, 7 linears/0.10 GiB, 3 expert stacks/1.98 GiB) and answers
 `POST /v1/completions` with HTTP 200 (5-token prompt, 4 tokens, 3 decode rounds). The affine
 decode path needs the 27-variant Triton AOT set described above.
+
+At image `0e6645b555ce` (patches `0001`-`0049`) the full 40-layer model loads in 97.7 s
+(309 linears/4.28 GiB, 120 expert stacks/79.10 GiB, 83.37 GiB affine; 96 GiB resident with
+24 GiB available) and answers a request (0.47 s TTFT, 2.2 tok/s with host-loop experts).
+The text is not yet reference-equal: the compressed-layer KV/indexer packing (B4) and the
+synthetic Engram rows still differ.

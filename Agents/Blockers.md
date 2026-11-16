@@ -113,11 +113,13 @@ generate`/`follow`) and exits with `AffineDSparkUnsupported` when the speculator
 `TF_DSV41_DRAFTS=1` remains unsupported for affine. Affine prefill is still skipped: prompts run as decode windows,
 so `TF_DSV41_OWN_PREFILL` is forced off for affine.
 
-Update 2026-11-16: the affine decode path runs end to end for one layer on `dgx2`
-(`055886260245`, patches `0001`-`0044`): guard, token map, Triton AOT set, load, and HTTP
-generation pass. The remaining piece in this section is the full 40-layer expert/DSpark set.
-The Triton AOT set is now a required boot asset (`$ASSETS/aot`); without it the engine admits
-the model but refuses requests with `MissingTritonVariant`.
+Update 2026-11-16: the affine decode path runs end to end. One layer (`055886260245`) and
+then the full 40-layer model (`0e6645b555ce`) answer HTTP requests on one Spark; the full
+load is 309 linears + 120 expert stacks (83.37 GiB affine) in 97.7 s with 24 GiB available.
+Text correctness is still blocked on B4 and on packing the real Engram tables; the layer-0
+projections remain the verified anchor. The Triton AOT set is a required boot asset
+(`$ASSETS/aot`); without it the engine admits the model but refuses requests with
+`MissingTritonVariant`.
 
 ### B7. Vision, tokenizer, chat template
 

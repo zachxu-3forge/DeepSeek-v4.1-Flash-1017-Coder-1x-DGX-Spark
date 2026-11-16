@@ -54,9 +54,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0047-dsv41-affine-trace-env.patch` | Register `TF_DSV41_AFFINE_TRACE` in the strict environment table |
 | `0048-dsv41-affine-miss-trace.patch` | Log the missing affine call id and, under the trace, the plan's packed/skipped modules |
 | `0049-dsv41-engram-wkv-shape.patch` | Carry `engram.wkv`'s hash-column/gate shape in the release block list so the affine plan packs it |
-| `0050-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0049`. Planned: `0050`.
+Implemented: `0001`-`0049`. The single-rank serving path is exercised by the full-model run
+(no separate `world1` patch remains).
 
 Rules:
 
