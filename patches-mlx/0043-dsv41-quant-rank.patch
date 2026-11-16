@@ -1,0 +1,16 @@
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -394,8 +394,12 @@
+             .i => |v| v,
+             else => return error.BadAffineCall,
+         });
++        // The attention output is [rows, heads, head_dim]; the destination is [rows, k].
++        if (xt.dt != .bf16 or yt.dt != .bf16 or xt.shape.len == 0 or yt.shape.len != 2 or yt.shape[1] != k) return error.BadAffineCall;
+         const rows: usize = @intCast(xt.shape[0]);
+-        if (xt.dt != .bf16 or yt.dt != .bf16 or xt.shape.len != 2 or yt.shape.len != 2 or yt.shape[0] != rows or yt.shape[1] != k) return error.BadAffineCall;
++        var values: i64 = 1;
++        for (xt.shape) |d| values = try std.math.mul(i64, values, d);
++        if (values != @as(i64, @intCast(rows)) * @as(i64, @intCast(k)) or yt.shape[0] != rows) return error.BadAffineCall;
+         const af = r.affine orelse return error.AffineNotLoaded;
+         try af.act.quantFp8(stream, try r.tensorAddr(xt), k, try r.tensorAddr(yt), rows, k);
+     }

@@ -47,9 +47,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0040-dsv41-metadata-experts.patch` | Let the metadata parse (asset tools) admit the release's pruned 192-expert count without a storage format |
 | `0041-dsv41-dense-mark-spelling.patch` | Resolve coverage marks to the pack's module-prefixed spelling, so the affine dense plan loads `language_model.*` tensors |
 | `0042-dsv41-aot-needs-affine.patch` | Optionally read the checkpoint config in `aot-needs`, so the affine decode programs (not the EXL3 widths/prefill set) are enumerated |
-| `0043-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
+| `0043-dsv41-quant-rank.patch` | Accept the attention output's `[rows, heads, head_dim]` rank in the `wo_a` FP8 round-trip call |
+| `0044-dsv41-world1.patch` | Admit and run the single-rank serving path end to end |
 
-Implemented: `0001`-`0042`. Planned: `0043`.
+Implemented: `0001`-`0043`. Planned: `0044`.
 
 Rules:
 

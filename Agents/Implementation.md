@@ -118,6 +118,9 @@ next step.
   it had hardcoded the release/EXL3 config, so the affine decode set could not be enumerated
   (`0042`). The `dgx2` image carries Triton 3.7.1 + ptxas 13.3.73, the versions the recipe's
   `triton_fill.py` requires.
+- **Fixed:** the `wo_a` FP8 round-trip call receives the attention output as
+  `[rows, heads, head_dim]`; `quantCall` required rank 2 and returned `BadAffineCall`
+  (`0043`). It now checks the element count and the destination shape.
 - **Next:** rebuild with `0038`/`0039` on `dgx2`, generate the token map, then the layer-0
   `TF_DSV41_AFFINE_LOAD=1 TF_DSV41_LAYERS=0-0` load and forward.
 
