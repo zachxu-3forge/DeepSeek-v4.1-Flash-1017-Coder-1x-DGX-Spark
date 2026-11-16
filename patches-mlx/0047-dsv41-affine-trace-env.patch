@@ -1,0 +1,10 @@
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -81,6 +81,7 @@
+     .{ .name = "TF_DSV41_DRAFTS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_SMOKE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AFFINE_LOAD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_DSV41_AFFINE_TRACE", .scope = .dsv41, .kind = .flag, .forms = "0 or 1 (log every affine projection the emitter issues)" },
+     .{ .name = "TF_DSV41_AFFINE_MAX_GIB", .scope = .dsv41, .kind = .positive_real, .forms = "a positive GiB limit for the affine load's peak (resident packed linears + expert images)" },
+     .{ .name = "TF_DSV41_GRAPHS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_DSV41_AOT_GUARD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
