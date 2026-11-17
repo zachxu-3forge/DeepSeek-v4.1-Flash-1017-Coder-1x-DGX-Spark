@@ -1,0 +1,165 @@
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -9,6 +9,7 @@
+ const fwd = @import("forward.zig");
+ const hooks = @import("forward_hooks.zig");
+ const named = @import("named.zig");
++const affine_linears = @import("affine_linears.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -242,20 +243,13 @@
+     if (pick.shape[0] != n or pick.shape[1] != slots or wts.shape[0] != n or wts.shape[1] != slots or out.shape[0] != n or out.shape[1] != D) return error.BadGlue;
+ 
+     try r.stream.synchronize();
+-    const xb = try f.gpa.alloc(u8, n * D * 2);
+-    defer f.gpa.free(xb);
+     const pb = try f.gpa.alloc(u8, n * slots * 4);
+     defer f.gpa.free(pb);
+     const wb = try f.gpa.alloc(u8, n * slots * 4);
+     defer f.gpa.free(wb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
+     try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(pick), .len = pb.len }, 0, pb);
+     try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(wts), .len = wb.len }, 0, wb);
+ 
+-    const acc = try f.gpa.alloc(f32, n * D);
+-    defer f.gpa.free(acc);
+-    @memset(acc, 0);
+-
+     var b1: [96]u8 = undefined;
+     var b2: [96]u8 = undefined;
+     var b3: [96]u8 = undefined;
+@@ -278,40 +272,105 @@
+     const x3 = af.expert(w3n) orelse return error.UnknownAffine;
+     const x2 = af.expert(w2n) orelse return error.UnknownAffine;
+     if (x1.layout.n != I or x1.layout.k != D or x3.layout.n != I or x3.layout.k != D or x2.layout.n != D or x2.layout.k != I) return error.BadGlue;
++    const dg = D / 64;
++    const ig = I / 64;
++    if (D % 64 != 0 or I % 64 != 0) return error.BadGlue;
++    const P = n * slots;
++
++    // One activation quantization and group-sum pass, then the whole layer's expert
++    // launches without a host round trip: only g/u and y cross the bus.
++    var xq = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
++    defer xq.free();
++    var sx = try cuda.DeviceBuffer.alloc(r.d, n * dg * 4);
++    defer sx.free();
++    var g = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    defer g.free();
++    var u = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    defer u.free();
++    var actd = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    defer actd.free();
++    var sa = try cuda.DeviceBuffer.alloc(r.d, P * ig * 4);
++    defer sa.free();
++    var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
++    defer y.free();
+ 
++    try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
++    try af.act.groupSums(r.stream, xq.ptr, D, sx.ptr, n, D);
+     for (0..n) |i| {
+-        const row = xb[i * D * 2 ..][0 .. D * 2];
+-        if (has_shared) {
+-            const gate = try af.linearHost(f.gpa, r.d, r.stream, sh1, row, 1);
+-            defer f.gpa.free(gate);
+-            const up = try af.linearHost(f.gpa, r.d, r.stream, sh3, row, 1);
+-            defer f.gpa.free(up);
+-            const act = try f.gpa.alloc(u8, I * 2);
+-            defer f.gpa.free(act);
+-            try swigluRow(gate, up, act, limit);
+-            const down = try af.linearHost(f.gpa, r.d, r.stream, sh2, act, 1);
+-            defer f.gpa.free(down);
+-            for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, down[2 * d ..][0..2], .little));
++        for (0..slots) |j| {
++            const p = i * slots + j;
++            const xr = xq.ptr + i * D * 2;
++            const sr = sx.ptr + i * dg * 4;
++            if (j == topk) {
++                if (!has_shared) continue;
++                try af.linear(r.stream, sr, affine_linears.nameHash(sh1), xr, g.ptr + p * I * 2, 1, D, I);
++                try af.linear(r.stream, sr, affine_linears.nameHash(sh3), xr, u.ptr + p * I * 2, 1, D, I);
++            } else {
++                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++                if (e < 0) continue;
++                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++                if (w == 0) continue;
++                const ei: usize = @intCast(e);
++                if (ei >= x1.tiles.views.len or ei >= x3.tiles.views.len) return error.UnknownAffine;
++                try af.wide.decode(r.stream, xr, sr, x1.tiles.views[ei], g.ptr + p * I * 2, 1);
++                try af.wide.decode(r.stream, xr, sr, x3.tiles.views[ei], u.ptr + p * I * 2, 1);
++            }
+         }
+     }
++    try r.stream.synchronize();
++
++    const gb = try f.gpa.alloc(u8, P * I * 2);
++    defer f.gpa.free(gb);
++    const ub = try f.gpa.alloc(u8, P * I * 2);
++    defer f.gpa.free(ub);
++    const ab = try f.gpa.alloc(u8, P * I * 2);
++    defer f.gpa.free(ab);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = g.ptr, .len = gb.len }, 0, gb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = u.ptr, .len = ub.len }, 0, ub);
++    for (0..P) |p| try swigluRow(gb[p * I * 2 ..][0 .. I * 2], ub[p * I * 2 ..][0 .. I * 2], ab[p * I * 2 ..][0 .. I * 2], limit);
++    try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = actd.ptr, .len = ab.len }, 0, ab);
++    try af.act.groupSums(r.stream, actd.ptr, I, sa.ptr, P, I);
+ 
+     for (0..n) |i| {
+-        const row = xb[i * D * 2 ..][0 .. D * 2];
+-        for (0..topk) |j| {
+-            const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-            if (e < 0) continue;
+-            const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-            if (w == 0) continue;
+-            const y1 = try af.expertHost(f.gpa, r.d, r.stream, w1n, @intCast(e), row, 1);
+-            defer f.gpa.free(y1);
+-            const y3 = try af.expertHost(f.gpa, r.d, r.stream, w3n, @intCast(e), row, 1);
+-            defer f.gpa.free(y3);
+-            const act = try f.gpa.alloc(u8, I * 2);
+-            defer f.gpa.free(act);
+-            try swigluRow(y1, y3, act, limit);
+-            const y2 = try af.expertHost(f.gpa, r.d, r.stream, w2n, @intCast(e), act, 1);
+-            defer f.gpa.free(y2);
+-            for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, y2[2 * d ..][0..2], .little));
++        for (0..slots) |j| {
++            const p = i * slots + j;
++            const ar = actd.ptr + p * I * 2;
++            const sar = sa.ptr + p * ig * 4;
++            if (j == topk) {
++                if (!has_shared) continue;
++                try af.linear(r.stream, sar, affine_linears.nameHash(sh2), ar, y.ptr + p * D * 2, 1, I, D);
++            } else {
++                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++                if (e < 0) continue;
++                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++                if (w == 0) continue;
++                const ei: usize = @intCast(e);
++                if (ei >= x2.tiles.views.len) return error.UnknownAffine;
++                try af.wide.decode(r.stream, ar, sar, x2.tiles.views[ei], y.ptr + p * D * 2, 1);
++            }
++        }
++    }
++    try r.stream.synchronize();
++
++    const yb = try f.gpa.alloc(u8, P * D * 2);
++    defer f.gpa.free(yb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = y.ptr, .len = yb.len }, 0, yb);
++    const acc = try f.gpa.alloc(f32, n * D);
++    defer f.gpa.free(acc);
++    @memset(acc, 0);
++    for (0..n) |i| {
++        for (0..slots) |j| {
++            const p = i * slots + j;
++            if (j == topk) {
++                if (!has_shared) continue;
++                for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
++            } else {
++                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++                if (e < 0) continue;
++                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++                if (w == 0) continue;
++                for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
++            }
+         }
+     }
+ 
