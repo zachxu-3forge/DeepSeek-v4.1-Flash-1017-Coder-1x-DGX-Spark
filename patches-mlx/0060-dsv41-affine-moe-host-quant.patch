@@ -1,0 +1,55 @@
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -10,6 +10,7 @@
+ const hooks = @import("forward_hooks.zig");
+ const named = @import("named.zig");
+ const affine_linears = @import("affine_linears.zig");
++const act_quant = @import("act_quant.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -294,7 +295,13 @@
+     var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
+     defer y.free();
+ 
+-    try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
++    const xb = try f.gpa.alloc(u8, n * D * 2);
++    defer f.gpa.free(xb);
++    const xqb = try f.gpa.alloc(u8, n * D * 2);
++    defer f.gpa.free(xqb);
++    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
++    for (0..n) |i| try act_quant.quantizeRow(xb[i * D * 2 ..][0 .. D * 2], xqb[i * D * 2 ..][0 .. D * 2], @intCast(D));
++    try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = xq.ptr, .len = xqb.len }, 0, xqb);
+     try af.act.groupSums(r.stream, xq.ptr, D, sx.ptr, n, D);
+     for (0..n) |i| {
+         for (0..slots) |j| {
+@@ -359,18 +366,18 @@
+     defer f.gpa.free(acc);
+     @memset(acc, 0);
+     for (0..n) |i| {
+-        for (0..slots) |j| {
++        // the host path added the shared expert first, then the routed slots: keep that order
++        if (has_shared) {
++            const p = i * slots + topk;
++            for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
++        }
++        for (0..topk) |j| {
++            const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++            if (e < 0) continue;
++            const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++            if (w == 0) continue;
+             const p = i * slots + j;
+-            if (j == topk) {
+-                if (!has_shared) continue;
+-                for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-            } else {
+-                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-                if (e < 0) continue;
+-                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-                if (w == 0) continue;
+-                for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-            }
++            for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+         }
+     }
+ 
