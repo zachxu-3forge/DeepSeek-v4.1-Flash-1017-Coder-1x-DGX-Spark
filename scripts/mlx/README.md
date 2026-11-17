@@ -211,8 +211,7 @@ MXFP4 expert stacks become affine-3/group 64. Affine-3 is deliberate: `AffineN` 
 2/3/5/6/8-bit codes, not 4. The converter writes one `model-dspark-affine.safetensors` shard,
 updates the index and config, and hardlinks the source shards. It copies `config.json` and the
 index (never hardlinks them), so the source directory stays intact. Run the image with
-`--drafts` to use it; keep `--no-drafts` until the device expert kernel makes the multi-row
-verify pay off.
+`--drafts` to use it; `--no-drafts` is still the faster default with the current batched MoE.
 
 ## Stage 1 gate
 
@@ -244,9 +243,11 @@ activation quantization.
 
 At image `7fd2b99bf79a` (patches `0001`-`0057`) DSpark runs on the converted overlay: 331
 affine linears (4.74 GiB), 129 expert stacks (84.64 GiB), 620 dense tensors (5.51 GiB), and
-`drafts: DSpark + copies`. The 64-token LRU reply keeps the same token SHA with and without
-drafts (accepted 44/65). Drafts are slower with host-loop experts (45.8 s vs 36.0 s), so the
-default remains `--no-drafts`; the guard passes with `model-translated`.
+`drafts: DSpark + copies`. At `5bec44994cf6` (patches `0001`-`0060`) the affine experts are
+packed once at load and the MoE launches are batched, so decode is **9.9 tok/s** and TTFT
+**1.04 s** on the 64-token LRU prompt (same token SHA `7f8834716518` as the slow path). DSpark
+accepts 44/68 and reaches 8.46 tok/s, so the default remains `--no-drafts` until the verify
+path is fused. 600K no-drafts: 104 GiB used / 17 GiB available, 9.32 tok/s.
 
 ## Layer reference
 

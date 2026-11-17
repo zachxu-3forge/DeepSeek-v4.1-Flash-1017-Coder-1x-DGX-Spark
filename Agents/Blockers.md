@@ -151,11 +151,12 @@ Engine patches `0055`-`0057` make the DSpark plan/heads dense, route the DSpark 
 the affine calls, and let its `copy_cols`/`moe_host` glue use the forward glue. Boot on
 `7fd2b99bf79a`: 331 affine linears (4.74 GiB), 129 expert stacks (84.64 GiB), `drafts: DSpark +
 copies`; 32 AOT variants (47 cubins); 4K guard PASS. The capital question answers `Paris`, and
-the 64-token LRU reply has the same token SHA (`7f8834716518`) with and without drafts
-(accepted 44/65). It is slower until the target verify stops running the host expert loop per
-row (45.8 s vs 36.0 s for 64 tokens), so `--no-drafts` stays the default. A 600K boot with
-DSpark is not yet measured; the extra ~6 GiB converted weights and draft buffers need a check
-against the 22 GiB headroom. Affine prefill remains skipped.
+the 64-token LRU reply has the same token SHA (`7f8834716518`) with and without drafts. Expert
+tiles (`0058`) and the batched MoE (`0059`/`0060`) then took decode from 2.15 to **9.9 tok/s**
+with that SHA preserved; drafts reach 8.46 tok/s (accepted 44/68), so `--no-drafts` stays the
+default. At 600K on `5bec44994cf6` the no-drafts run uses **104 GiB / 17 GiB available**, loads
+in 113.2 s, answers `Paris` at 9.32 tok/s. DSpark at 600K with draft buffers is not yet
+measured. Affine prefill remains skipped.
 
 ### B7. Vision, tokenizer, chat template
 
