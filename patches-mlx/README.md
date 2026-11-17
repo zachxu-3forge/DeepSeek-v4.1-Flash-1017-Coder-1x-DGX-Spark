@@ -65,8 +65,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0058-dsv41-affine-expert-tiles.patch` | Pack every affine expert into resident `AffineN` tiles at load; the host loop launches them directly |
 | `0059-dsv41-affine-moe-batched.patch` | Batch the affine MoE: one activation quant/sums, device expert launches, and two host transfers per layer |
 | `0060-dsv41-affine-moe-host-quant.patch` | Use the host's FP8 round-trip and the original combine order in the batched MoE (bit parity with the tested path) |
+| `0061-dsv41-fused-woa.patch` | Fuse wo_a's eight block-diagonal BF16 groups into one glue kernel (removes 8 launches a layer) |
 
-Implemented: `0001`-`0060`.
+Implemented: `0001`-`0061`.
 
 Rules:
 

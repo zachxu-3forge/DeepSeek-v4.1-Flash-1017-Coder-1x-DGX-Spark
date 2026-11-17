@@ -1,0 +1,144 @@
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -79,6 +79,31 @@
+     }
+ }
+ 
++// wo_a's eight block-diagonal groups in one launch: out[r, g*ol+j] = sum_k x[r, g*gk+k] * w[g*ol+j, k].
++// One warp an output, the block's input row in shared memory; fp32 accumulation, bf16 result.
++extern "C" __global__ void __launch_bounds__(128) dsv41_woa_groups(const uint16_t* __restrict__ x, int nrows,
++                                                                  const uint16_t* __restrict__ w,
++                                                                  uint16_t* __restrict__ out,
++                                                                  int g, int gk, int ol) {
++    __shared__ uint16_t xs[4096];
++    const int per = 4;                  // outputs a block
++    const int tiles = ol / per;
++    const int grp = blockIdx.x / tiles;
++    const int tile = blockIdx.x - grp * tiles;
++    const int warp = threadIdx.x >> 5;
++    const int lane = threadIdx.x & 31;
++    const int j = tile * per + warp;
++    const int r = blockIdx.y;
++    const uint16_t* xr = x + ((long long)r * g + grp) * gk;
++    const uint16_t* wr = w + ((long long)grp * ol + j) * gk;
++    for (int k = threadIdx.x; k < gk; k += blockDim.x) xs[k] = xr[k];
++    __syncthreads();
++    float acc = 0.0f;
++    for (int k = lane; k < gk; k += 32) acc += bf(xs[k]) * bf(wr[k]);
++    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
++    if (lane == 0) out[(long long)r * g * ol + grp * ol + j] = to_bf(acc);
++}
++
+ // recv [W, n, c] -> out [n, W c] (bf16 words, any 2-byte type)
+ __global__ void __launch_bounds__(256) gather_cols_kernel(const uint16_t* __restrict__ recv, int W, int n, int c,
+                                                           uint16_t* __restrict__ out) {
+--- a/zig/src/families/deepseek_v41/kernels_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_ops.zig
+@@ -47,7 +47,7 @@
+     kv_dedup: ?[4]cuda.Function = null,
+     kv_hist: ?[2]cuda.Function = null,
+     kv_gather: cuda.Function,
+-    glue: [10]cuda.Function, // glue.syms order
++    glue: [glue.syms.len]cuda.Function, // glue.syms order
+     /// glue.cu's DSpark candidates (TF_DSV41_DRAFT_GRAPHS); null in a fatbin built before it (the host's candidates)
+     ds_cands: ?cuda.Function = null,
+     /// glue.cu's device pick (TF_DSV41_GREEDY_GPU); null in a fatbin built before it (the pairs merged on the host)
+@@ -231,8 +231,9 @@
+         "_ZN10dsv41_glue12carry_kernelEPKtxPKiiiPf",
+         "_ZN10dsv41_glue20positions_dev_kernelEPKiiPiPxS2_",
+         "_ZN10dsv41_glue16widen_f32_kernelEPKtPfx",
++        "dsv41_woa_groups",
+     };
+-    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32 };
++    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa };
+     /// DSpark's candidates (optional: resolved apart, so an older fatbin still loads)
+     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
+     /// the most candidates a rank (the kernel's shared sort)
+@@ -543,6 +544,7 @@
+     pub const dsStageRows = glue_ops.dsStageRows;
+     pub const vsChoose = glue_ops.vsChoose;
+     pub const widenF32 = glue_ops.widenF32;
++    pub const woaGroups = glue_ops.woaGroups;
+     pub const pfGo = glue_ops.pfGo;
+     pub const topPositions = glue_ops.topPositions;
+     pub const candKeys = glue_ops.candKeys;
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -38,8 +38,7 @@
+ }
+ 
+ /// y bf16 = x.to(bf16) over n elements (the MoE partial into the exchange).
+-pub fn castBf16(o: Ops, x: u64, y: u64, n: usize) !void {
+-    if (n == 0) return;
++pub fn castBf16(o: Ops, x: u64, y: u64, n: usize) !void {    if (n == 0) return;
+     var a: cuda.Args = .{};
+     a.add(x);
+     a.add(y);
+@@ -330,3 +329,17 @@
+     a.add(out);
+     try o.glueGo(.carry, cols, &a);
+ }
++
++/// wo_a's groups in one launch: x [rows, g*gk], w [g*ol, gk] -> out [rows, g*ol], bf16, fp32 sums.
++pub fn woaGroups(o: Ops, x: u64, rows: usize, w: u64, out: u64, g: usize, gk: usize, ol: usize) !void {
++    if (rows == 0 or g == 0 or gk == 0 or gk > 4096 or ol % 4 != 0) return error.Shape;
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(c_int, @intCast(rows)));
++    a.add(w);
++    a.add(out);
++    a.add(@as(c_int, @intCast(g)));
++    a.add(@as(c_int, @intCast(gk)));
++    a.add(@as(c_int, @intCast(ol)));
++    try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 4), rows, 1 }, 128, 0, null, &a);
++}
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -222,6 +222,16 @@
+         std.crypto.hash.sha2.Sha256.hash(host, &sha, .{});
+         return map.put(f.gpa, @intCast(c.args[1].arg.i), std.fmt.bytesToHex(sha, .lower));
+     }
++    if (std.mem.eql(u8, step, "woa")) {
++        const x = c.args[0].arg.t;
++        const wt = c.args[1].arg.t;
++        const out = c.args[2].arg.t;
++        if (x.dt != .bf16 or wt.dt != .bf16 or out.dt != .bf16 or x.shape.len != 2 or out.shape.len != 2) return error.BadGlue;
++        const groups: usize = @intCast(c.args[3].arg.i);
++        const gk: usize = @intCast(c.args[4].arg.i);
++        const ol: usize = @intCast(c.args[5].arg.i);
++        return k.woaGroups(try r.tensorAddr(x), @intCast(x.shape[0]), try r.tensorAddr(wt), try r.tensorAddr(out), groups, gk, ol);
++    }
+     if (std.mem.eql(u8, step, "moe_host")) return moeHost(f, r, c);
+     return glueMissing(step);
+ }
+--- a/zig/src/families/deepseek_v41/block_attn.zig
++++ b/zig/src/families/deepseek_v41/block_attn.zig
+@@ -350,9 +350,13 @@
+         .n = e.cfg.o_lora,
+     };
+     if (e.cfg.format == .affine) {
+-        const base = try e.fmt("L{d}.attn.wo_a", .{L});
+         const ol: i64 = @intCast(e.cfg.o_lora);
+-        for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, e.cfg.o_lora));
++        if (e.o.world == 1 and @as(u32, @intCast(g)) == e.cfg.o_groups) {
++            try e.glue("woa", &.{ oq, try e.weight("L{d}.attn.wo_a", .{L}, .bf16, &.{ @as(i64, @intCast(g)) * ol, gk }), oa, .{ .i = @intCast(g) }, .{ .i = gk }, .{ .i = ol } });
++        } else {
++            const base = try e.fmt("L{d}.attn.wo_a", .{L});
++            for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, e.cfg.o_lora));
++        }
+     } else try e.fused("o", po[0..g]);
+     try e.proj("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = g * e.cfg.o_lora, .n = @intCast(D) }});
+ }
+--- a/zig/src/families/deepseek_v41/dspark_emit.zig
++++ b/zig/src/families/deepseek_v41/dspark_emit.zig
+@@ -289,7 +289,9 @@
+         if (e.cfg.format == .affine) {
+             const base = try e.fmt("L{d}.attn.wo_a", .{L});
+             const ol: i64 = @intCast(cf.o_lora);
+-            for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, cf.o_lora));
++            if (e.o.world == 1 and @as(u32, @intCast(g)) == cf.o_groups) {
++                try e.glue("woa", &.{ oq, try e.weight("L{d}.attn.wo_a", .{L}, .bf16, &.{ @as(i64, @intCast(g)) * ol, gk }), oa, .{ .i = @intCast(g) }, .{ .i = gk }, .{ .i = ol } });
++            } else for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, cf.o_lora));
+         } else try e.fused("o", po[0..g]);
+         if (e.cfg.format == .affine) {
+             const p16 = try e.buf("L.part16", .{}, .bf16, &.{ n, D });
