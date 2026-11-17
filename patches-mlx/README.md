@@ -61,8 +61,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0054-dsv41-affine-mhc-forms.patch` | Build the persistent bf16 mHC `fn16` forms for the affine path (they were only built for EXL3) |
 | `0055-dsv41-affine-dspark.patch` | Serve DSpark from the affine model: dense DSpark plan/heads, affine `main_proj`/attention/head, host expert MoE |
 | `0056-dsv41-pack-prefix-has.patch` | Make `Pack.has` find prefixed (`language_model.`) tensors so the dense DSpark heads plan |
+| `0057-dsv41-dspark-forward-glue.patch` | Route DSpark's shared glue steps (`copy_cols`, `moe_host`) to the forward glue |
 
-Implemented: `0001`-`0056`.
+Implemented: `0001`-`0057`.
 
 Rules:
 

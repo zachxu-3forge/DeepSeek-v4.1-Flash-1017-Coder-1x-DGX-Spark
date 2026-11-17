@@ -1,0 +1,25 @@
+--- a/zig/src/families/deepseek_v41/dspark_gpu_device.zig
++++ b/zig/src/families/deepseek_v41/dspark_gpu_device.zig
+@@ -187,7 +187,9 @@
+         };
+         return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+     }
+-    return error.GlueNotBuilt;
++    // `copy_cols` (the affine wo_a groups), `moe_host` (the affine experts) and the forward's other
++    // steps are the forward glue's; the drafter only adds its own four above.
++    return @import("forward_glue.zig").glueFn(@ptrCast(x.f), r, c);
+ }
+ 
+ /// The host's step after the head: this rank's best k columns, every rank's lists gathered, the head hidden.
+--- a/zig/src/families/deepseek_v41/dspark_slots_device.zig
++++ b/zig/src/families/deepseek_v41/dspark_slots_device.zig
+@@ -471,7 +471,8 @@
+         };
+         return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+     }
+-    return error.GlueNotBuilt;
++    // the affine steps this pass shares with the forward (wo_a's copy_cols, the expert host loop)
++    return @import("forward_glue.zig").glueFn(@ptrCast(x.f), r, c);
+ }
+ 
+ /// The host step over the pass's rows: each rank's best k a row, lists gathered, head hidden for confidences.
