@@ -1,0 +1,17 @@
+--- a/zig/src/families/deepseek_v41/pack.zig
++++ b/zig/src/families/deepseek_v41/pack.zig
+@@ -166,7 +166,13 @@
+     }
+ 
+     pub fn has(p: *const Pack, name: []const u8) bool {
+-        return p.names.contains(name);
++        if (p.names.contains(name)) return true;
++        var buf: [256]u8 = undefined;
++        for (module_prefixes) |prefix| {
++            const full = std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, name }) catch continue;
++            if (p.names.contains(full)) return true;
++        }
++        return false;
+     }
+ 
+     /// Prefixes a checkpoint may put before a canonical module name (`layers.0...`).
