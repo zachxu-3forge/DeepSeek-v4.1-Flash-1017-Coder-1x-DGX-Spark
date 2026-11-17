@@ -92,6 +92,13 @@ next step.
 - **Results (C1, greedy, 32K):** LRU code 64 tokens **76.0 tok/s**, TTFT 0.238 s; hash-map
   prose 64 tokens **68.1 tok/s**, TTFT 0.164 s; LRU code 256 tokens **61.1 tok/s**, TTFT
   0.085 s. The published recipe numbers are 55.6 prose / 110.5 code; these are the same order.
+- **Normal recipe, 262K/C1:** the recipe's HF-cache snapshot was a symlink outside the mounted
+  cache; it was replaced with a hardlink tree of the complete 96 GiB checkpoint
+  (`cp -al /home/deploy/Models/Qwen3.8-Flash-Next/NVFP4 <snapshot>`). `PARALLEL=1
+  CONTEXT=262144 ./start.sh` then loaded in 127 s and served: LRU code 64 **74.6 tok/s**
+  (TTFT 0.163 s), prose 64 **68.3 tok/s**, LRU code 256 **61.0 tok/s**. The same server passed
+  a `get_weather("Paris")` tool call, a strict JSON-schema response, and a 64x64 red PNG
+  ("Red"). MTP acceptance on the suite: 380/576 drafted tokens (66%).
 - **Why the gap:** Qwen activates ~6B vs DeepSeek's ~16B decode, stores the whole model at
   NVFP4, verifies MTP drafts in one graph, and reads ~3.7 GB a decode step vs the affine
   port's ~11.6 GB. The affine port's 9.9 tok/s is ~6–7.7× behind on the same hardware.
