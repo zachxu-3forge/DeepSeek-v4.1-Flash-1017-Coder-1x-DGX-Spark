@@ -165,6 +165,15 @@ unchanged from the full MLX build. The engine has vision support, but the releas
 family does not serve, and the target's vision tensors are unquantized. Lower risk than B1-B5,
 but not free.
 
+Update 2026-11-17: vision is not wired. The checkpoint carries 266 `vision.*`/`aligner.*`
+tensors: a 32-block ViT (dim 1024, 16 heads, 14px patches, 2816 MLP, 2D RoPE) plus the 3x3
+aligner, all BF16. The dsv41 CUDA family has image-segment MoE plumbing (`TF_DSV41_IMAGES`) but
+no ViT/2D-RoPE/aligner implementation. The server still returns HTTP 400, "this server accepts
+text parts only; image, audio and video inputs are unsupported". A vision port needs patch
+preprocessing, the ViT + aligner kernels, image-token splicing, and its own AOT set.
+Structured output/tool calls remain blocked on the optional `libtfgrammar.so`; the build can
+add it with `zig build grammar -Dxgrammar=<v0.2.8 checkout>`.
+
 ### B8. Patch rebase is secondary
 
 The 53 patches target `fbbc971`. Portable server/API patches (`0004`, `0027`-`0032`, `0036`,

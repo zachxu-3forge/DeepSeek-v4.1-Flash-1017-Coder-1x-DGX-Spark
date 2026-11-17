@@ -35,7 +35,7 @@ needed. This file is the history.
 | 1. Affine loader and layout adapter | Done | One full layer matches dequantized reference | Layer 0 vs the recipe reference: streams corr `0.99974`, attn `0.99935`, MoE `0.99942` |
 | 2. Full model, short context | In progress | Text prompt served on one Spark; 32K stable; 600K memory measured | Text and 600K PASS; DSpark serves correctly but is slower until the device expert kernel; affine prefill pending |
 | 3. Engram | Done | Sampled lookups match reference; native 4-bit tables stream from SSD | Native 4-bit reader; both layers packed (115 GiB, `--verify` max 0); served from `TF_DSV41_ENGRAM_DIR` |
-| 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
+| 4. Server, tools, vision | In progress | Chat completions, streaming, tools, one image request | Text chat/streaming work; image request is 400 (text-only) and structured output needs `libtfgrammar.so` |
 | 5. Qualification and docs | Not started | Metrics, regression suite, reproducible run record | - |
 
 Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
@@ -101,7 +101,10 @@ next step.
   (67.7%), 1.61 tok/s; without drafts 2.15 tok/s (45.8 s vs 36.0 s for 64 tokens). The
   multi-row target verify runs the affine host expert loop per row, so drafts currently lose;
   DSpark stays opt-in (`--drafts`) until the device expert kernel lands.
-- **Guard:** PASS on `7fd2b99bf79a` (patches `0001`-`0057`) with `model-translated`.
+- **Guard:** PASS on `7fd2b99bf79a` (patches `0001`-`0057`) with `model-translated`, and again on
+  `5bec44994cf6` (patches `0001`-`0060`). The final image's 600K boot also passes.
+- **Phase 4 gaps (same image):** an image request returns HTTP 400 "text parts only"; the
+  vision tower is not ported (B7). Structured output/tool calls still need `libtfgrammar.so`.
 - **Restored:** the first conversion run hardlinked `config.json`/index and then rewrote them,
   which edited `model-translated` in place; the source metadata was restored from the original
   MLX checkpoint with `translate_config.py` plus the original index. The converter now copies
