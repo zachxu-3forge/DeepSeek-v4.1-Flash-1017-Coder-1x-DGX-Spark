@@ -1,0 +1,232 @@
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -16,12 +16,33 @@
+ const act_quant = @import("act_quant.zig");
+ const weights_load = @import("cuda_weights.zig");
+ 
++pub const Tiles = struct {
++    words: cuda.DeviceBuffer,
++    scales: cuda.DeviceBuffer,
++    biases: cuda.DeviceBuffer,
++    /// one resident `AffineN` per expert, packed once at load
++    views: []cuda.qlinear.AffineN,
++
++    pub fn bytes(t: *const Tiles) u64 {
++        return t.words.len + t.scales.len + t.biases.len;
++    }
++
++    pub fn deinit(t: *Tiles, gpa: std.mem.Allocator) void {
++        t.words.free();
++        t.scales.free();
++        t.biases.free();
++        gpa.free(t.views);
++        t.* = undefined;
++    }
++};
++
+ pub const ExpertModule = struct {
+     /// The pack's spelling, used to find the binding.
+     name: []const u8,
+     /// The emitter/runtime name.
+     role: []const u8,
+-    dev: affine_bind.Device,
++    /// The resident packed tiles (one `AffineN` an expert); the host loop launches them directly.
++    tiles: Tiles,
+     layout: @import("affine.zig").Layout,
+     experts: u32,
+     quantize_input: bool,
+@@ -32,10 +53,9 @@
+     wide: cuda.qlinear.AffineNKernels,
+     act: cuda.act_rows.ActRows,
+     linears: linears.Set,
+-    /// the routed expert stacks, raw on device; the host loop packs one expert at a time
++    /// the routed expert stacks, packed once into `AffineN` tiles
+     experts: []ExpertModule,
+     expert_map: std.StringHashMapUnmanaged(usize),
+-    expert_weights: weights_load.Weights,
+ 
+     /// Loads the affine CUDA kernels and packs every affine linear in `bindings`.
+     pub fn load(
+@@ -70,31 +90,53 @@
+         };
+         a.experts = try gpa.alloc(ExpertModule, count);
+         a.expert_map = .empty;
+-        a.expert_weights = .{ .gpa = gpa, .digest = false };
+         var made: usize = 0;
+         errdefer {
+             for (a.experts[0..made]) |*m| {
++                m.tiles.deinit(gpa);
+                 gpa.free(m.name);
+                 gpa.free(m.role);
+             }
+             gpa.free(a.experts);
+             a.expert_map.deinit(gpa);
+-            a.expert_weights.close() catch {};
+         }
+         for (bindings) |b| {
+             if (b.kind != .expert or b.mode != .affine_n_expert or b.affine_layout == null or !exec.selected(&b, layers)) continue;
+-            // Upload one stack at a time: the host images are the second copy that would
+-            // otherwise make the full model's peak exceed a 128 GB GB10.
+-            {
+-                var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
+-                defer builder.deinit();
+-                var images = try affine_load.readModule(gpa, io, pack, b.name, b.affine_layout.?);
+-                try builder.add(images.weight);
+-                try builder.add(images.scales);
+-                try builder.add(images.biases);
+-                images = undefined;
+-                try a.expert_weights.upload(d, &builder);
++            const layout = b.affine_layout.?;
++            const experts = if (b.dspark) dspark_experts else backbone_experts;
++            // Read and upload one stack at a time, pack every expert into its `AffineN` tile,
++            // then release the raw stack. The tiles are the same size as the raw bytes.
++            var builder: @import("named.zig").Builder = .{ .gpa = gpa, .io = io, .pack = pack };
++            defer builder.deinit();
++            var images = try affine_load.readModule(gpa, io, pack, b.name, layout);
++            try builder.add(images.weight);
++            try builder.add(images.scales);
++            try builder.add(images.biases);
++            images = undefined;
++            var raw: weights_load.Weights = .{ .gpa = gpa, .digest = false };
++            defer raw.close() catch {};
++            try raw.upload(d, &builder);
++            const dev = try affine_bind.bind(&raw, &b, experts);
++            const served = cuda.qlinear.servedBits(layout.bits);
++            const l = cuda.qlinear.AffineN.layout(layout.n, layout.k, served);
++            var tiles: Tiles = .{
++                .words = try cuda.DeviceBuffer.alloc(d, @as(usize, experts) * l.words),
++                .scales = try cuda.DeviceBuffer.alloc(d, @as(usize, experts) * l.scales),
++                .biases = try cuda.DeviceBuffer.alloc(d, @as(usize, experts) * l.scales),
++                .views = try gpa.alloc(cuda.qlinear.AffineN, experts),
++            };
++            errdefer tiles.deinit(gpa);
++            for (0..@as(usize, experts)) |e| {
++                const view = try affine_cuda.expertView(layout, experts, @intCast(e), dev.weight_len, dev.scales_len, dev.biases_len);
++                const w = tiles.words.ptr + e * l.words;
++                const s = tiles.scales.ptr + e * l.scales;
++                const bb = tiles.biases.ptr + e * l.scales;
++                try a.wide.packWords(stream, dev.weight + view.weight_off, layout.bits, layout.n, layout.k, w);
++                try a.wide.packTable(stream, dev.scales + view.scales_off, layout.n, layout.k, l.npad, s);
++                try a.wide.packTable(stream, dev.biases + view.biases_off, layout.n, layout.k, l.npad, bb);
++                tiles.views[e] = .{ .w = w, .s = s, .b = bb, .n = layout.n, .k = layout.k, .npad = l.npad, .bits = served };
+             }
++            try stream.synchronize();
+             const name = try gpa.dupe(u8, b.name);
+             const role = gpa.dupe(u8, if (b.role.len > 0) b.role else b.name) catch |err| {
+                 gpa.free(name);
+@@ -103,9 +145,9 @@
+             a.experts[made] = .{
+                 .name = name,
+                 .role = role,
+-                .dev = undefined,
+-                .layout = b.affine_layout.?,
+-                .experts = if (b.dspark) dspark_experts else backbone_experts,
++                .tiles = tiles,
++                .layout = layout,
++                .experts = experts,
+                 .quantize_input = b.spec.quantize_input,
+             };
+             made += 1;
+@@ -113,27 +155,16 @@
+         if (made != a.experts.len) return error.AffineExpertMismatch;
+         if (made > 0) {
+             try a.expert_map.ensureTotalCapacity(gpa, @intCast(made));
+-            for (a.experts, 0..) |*m, i| {
+-                const b = findBinding(bindings, m.name) orelse return error.AffineExpertMismatch;
+-                m.dev = try affine_bind.bind(&a.expert_weights, b, m.experts);
+-                m.dev.name = m.role;
+-                a.expert_map.putAssumeCapacity(m.role, i);
+-            }
++            for (a.experts, 0..) |*m, i| a.expert_map.putAssumeCapacity(m.role, i);
+         }
+         return a;
+     }
+ 
+-    fn findBinding(bindings: []const exec.Binding, name: []const u8) ?*const exec.Binding {
+-        for (bindings) |*b| if (std.mem.eql(u8, b.name, name)) return b;
+-        return null;
+-    }
+-
+     pub fn deinit(a: *Affine) void {
+-        // `close()` sets the whole Weights to undefined; keep its allocator first.
+-        const gpa = a.expert_weights.gpa;
++        const gpa = a.linears.arena.child_allocator;
+         a.linears.deinit();
+-        if (a.experts.len > 0) a.expert_weights.close() catch {};
+-        for (a.experts) |m| {
++        for (a.experts) |*m| {
++            m.tiles.deinit(gpa);
+             gpa.free(m.name);
+             gpa.free(m.role);
+         }
+@@ -152,7 +183,9 @@
+     }
+ 
+     pub fn expertBytes(a: *const Affine) u64 {
+-        return a.expert_weights.bytes;
++        var n: u64 = 0;
++        for (a.experts) |*m| n += m.tiles.bytes();
++        return n;
+     }
+ 
+     pub fn expert(a: *const Affine, name: []const u8) ?*const ExpertModule {
+@@ -200,8 +233,8 @@
+         const xq = try gpa.alloc(u8, x.len);
+         defer gpa.free(xq);
+         try act_quant.quantizeRow(x, xq, @intCast(m.layout.k));
+-        const view = try affine_cuda.expertView(m.layout, m.experts, expert_index, m.dev.weight_len, m.dev.scales_len, m.dev.biases_len);
+-        var out = try affine_launch.expert(gpa, d, stream, &a.wide, &m.dev, view, xq, rows);
++        if (expert_index >= m.tiles.views.len) return error.UnknownAffine;
++        var out = try affine_launch.tiled(gpa, d, stream, &a.wide, m.tiles.views[expert_index], xq, rows);
+         defer out.deinit();
+         return out.download(d, gpa);
+     }
+--- a/zig/src/families/deepseek_v41/affine_launch.zig
++++ b/zig/src/families/deepseek_v41/affine_launch.zig
+@@ -113,6 +113,46 @@
+     return .{ .buffer = out };
+ }
+ 
++/// Decode rows against a resident `AffineN` tile (a pre-packed expert), `x` bf16 `[rows, k]`.
++pub fn tiled(
++    gpa: std.mem.Allocator,
++    driver: *const cuda.Driver,
++    stream: cuda.Stream,
++    kernels: *const cuda.qlinear.AffineNKernels,
++    an: cuda.qlinear.AffineN,
++    x: []const u8,
++    rows: usize,
++) !Output {
++    if (rows == 0 or an.k == 0 or an.n == 0 or an.k % 64 != 0) return error.BadShape;
++    if (x.len != rows * an.k * 2) return error.BadShape;
++    var xb = try cuda.DeviceBuffer.fromHost(driver, x);
++    defer xb.free();
++    const k: usize = an.k;
++    const groups: usize = k / 64;
++    const sums_bytes = try std.math.mul(usize, rows, groups * 4);
++    var sums = try cuda.DeviceBuffer.alloc(driver, sums_bytes);
++    defer sums.free();
++    const host_sums = try gpa.alloc(f32, rows * groups);
++    defer gpa.free(host_sums);
++    for (0..rows) |r| {
++        for (0..groups) |g| {
++            var sum: f32 = 0;
++            for (0..64) |j| {
++                const at = (r * k + g * 64 + j) * 2;
++                sum += named.bf16Widen(std.mem.readInt(u16, x[at..][0..2], .little));
++            }
++            host_sums[r * groups + g] = sum;
++        }
++    }
++    try cuda.DeviceBuffer.upload(.{ .d = driver, .ptr = sums.ptr, .len = sums_bytes }, 0, std.mem.sliceAsBytes(host_sums));
++    var out = try cuda.DeviceBuffer.alloc(driver, rows * an.n * 2);
++    errdefer out.free();
++    try out.fill8(0, null);
++    try kernels.decode(stream, xb.ptr, sums.ptr, an, out.ptr, rows);
++    try stream.synchronize();
++    return .{ .buffer = out };
++}
++
+ /// Pack one expert from a stacked projection, then decode it.
+ pub fn expert(
+     gpa: std.mem.Allocator,
