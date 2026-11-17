@@ -77,6 +77,30 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
 
+### 2026-11-17 - Qwen3.8 Flash single-Spark speed baseline
+
+- **Purpose:** establish the token-speed target on the same GB10 before deciding whether to
+  keep optimizing the affine DeepSeek port or move the speed lane to Qwen3.8.
+- **Recipe:** `MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold`, image
+  `tensorfold-qwen38:v1.1.4-eab8582`, NVIDIA FP4 QAD checkpoint
+  (`nvidia/Qwen3.8-Flash-Next-FP4-Local`, 96 GiB) already on `dgx2`. The recipe's HF-cache
+  snapshot is a symlink outside the mounted cache, so the checkpoint was mounted directly:
+  `-v /home/deploy/Models/Qwen3.8-Flash-Next/NVFP4:/model:ro` and `serve /model`.
+- **Run:** 32K context, `--parallel 1`, `--max-tokens 4096`, `--thinking` default, drafts on,
+  fp8 KV, code/prose requests with `enable_thinking: false`; model 74.35 GiB, 31.4 GiB left,
+  loaded in 173 s.
+- **Results (C1, greedy, 32K):** LRU code 64 tokens **76.0 tok/s**, TTFT 0.238 s; hash-map
+  prose 64 tokens **68.1 tok/s**, TTFT 0.164 s; LRU code 256 tokens **61.1 tok/s**, TTFT
+  0.085 s. The published recipe numbers are 55.6 prose / 110.5 code; these are the same order.
+- **Why the gap:** Qwen activates ~6B vs DeepSeek's ~16B decode, stores the whole model at
+  NVFP4, verifies MTP drafts in one graph, and reads ~3.7 GB a decode step vs the affine
+  port's ~11.6 GB. The affine port's 9.9 tok/s is ~6–7.7× behind on the same hardware.
+- **Implication:** Qwen3.8 is the single-Spark speed lane; the affine DeepSeek port remains
+  the 600K/exact-checkpoint lane. Closing the gap on DeepSeek needs batched DSpark verify plus
+  lower bytes (wo_a MXFP8, head) and fused experts; even then, ~20–35 tok/s is the realistic
+  single-Spark target. Two Sparks is the DeepSeek speed configuration (57–92 tok/s measured
+  by the community recipes).
+
 ### 2026-11-17 - DSpark on the affine model
 
 - **Phase:** 2. DSpark drafts now run end to end on the affine checkpoint, and the output is
