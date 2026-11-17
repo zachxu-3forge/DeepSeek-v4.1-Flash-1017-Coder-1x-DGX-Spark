@@ -59,8 +59,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0052-dsv41-trace-dump.patch` | Dump the traced head input/logits (and per-layer states) under `TF_DSV41_TRACE_DIR` |
 | `0053-dsv41-sublayer-trace.patch` | Trace the attention output and MoE output (dtype-aware dumps) for sublayer bisecting |
 | `0054-dsv41-affine-mhc-forms.patch` | Build the persistent bf16 mHC `fn16` forms for the affine path (they were only built for EXL3) |
+| `0055-dsv41-affine-dspark.patch` | Serve DSpark from the affine model: dense DSpark plan/heads, affine `main_proj`/attention/head, host expert MoE |
 
-Implemented: `0001`-`0054`.
+Implemented: `0001`-`0055`.
 
 Rules:
 

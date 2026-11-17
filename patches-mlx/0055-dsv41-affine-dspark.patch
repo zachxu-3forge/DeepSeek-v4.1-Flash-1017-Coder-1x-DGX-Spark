@@ -1,0 +1,254 @@
+--- a/zig/src/families/deepseek_v41/plan.zig
++++ b/zig/src/families/deepseek_v41/plan.zig
+@@ -76,7 +76,8 @@
+ };
+ 
+ pub const Dspark = struct {
+-    main_proj: GroupPlan,
++    /// EXL3 plans hold the trellis group; an affine checkpoint's main_proj is an affine linear.
++    main_proj: ?GroupPlan,
+     natives: []NativePlan,
+     confidence: ?NativePlan,
+ };
+@@ -103,7 +104,7 @@
+         for (p.top) |v| n += v.bytes;
+         for (p.layers) |*l| n += l.bytes();
+         if (p.dspark) |d| {
+-            n += d.main_proj.part.bytes();
++            if (d.main_proj) |m| n += m.part.bytes();
+             for (d.natives) |v| n += v.bytes;
+             if (d.confidence) |c| n += c.bytes;
+         }
+@@ -270,7 +271,8 @@
+         if (b.c.mtp_layers == 0) return null;
+         var fb: [160]u8 = undefined;
+         const mp = (try b.findDspark(names.dspark_main_proj, &fb)) orelse return null;
+-        const main_proj = try b.group(.wq_a, mp, .whole, 3 * b.c.hidden, b.c.hidden);
++        // a dense (affine) plan loads main_proj through the affine runtime, not as a trellis group
++        const main_proj = if (b.o.dense) null else try b.group(.wq_a, mp, .whole, 3 * b.c.hidden, b.c.hidden);
+         const specs = try names.dsparkNatives(b.c);
+         const natives = try b.a.alloc(NativePlan, specs.len);
+         for (specs.items(), natives) |s, *v| {
+@@ -321,7 +323,9 @@
+         for (tspecs.items(), top[0..tspecs.len]) |s, *v| v.* = try b.native(s.suffix, s);
+         if (o.dense) top[tspecs.len] = try b.native("head.weight", names.denseHead(c));
+         if (!o.dense) head = try b.group(.wq_a, names.head.suffix, .col, c.hidden, c.vocab);
+-        if ((full or o.dspark) and !o.dense) ds = try b.dspark();
++        if (o.dense) {
++            if (o.dspark) ds = try b.dspark();
++        } else if (full or o.dspark) ds = try b.dspark();
+     }
+     // coverage: every stored name was planned or is knowingly left (vision, image routing, bf16 copies of groups)
+     var left: std.ArrayList([]const u8) = .empty;
+--- a/zig/src/families/deepseek_v41/named.zig
++++ b/zig/src/families/deepseek_v41/named.zig
+@@ -255,7 +255,7 @@
+     pub fn dspark(b: *Builder, p: *const plan.Plan) !void {
+         const d = p.dspark orelse return;
+         var none: ?[]f32 = null;
+-        try b.group("dspark.main_proj", d.main_proj);
++        if (d.main_proj) |m| try b.group("dspark.main_proj", m);
+         const out_names = [_][]const u8{ "dspark.main_norm", "dspark.norm", "dspark.markov.w1", "dspark.markov.w2" };
+         const outs = [_]Out{ .f32, .f32, .bf16, .bf16 };
+         for (d.natives, out_names, outs) |v, nm, o| try b.native(nm, .{ .name = nm, .out = o }, v, p.rank, p.world, null, &none);
+--- a/zig/src/families/deepseek_v41/cuda_weights.zig
++++ b/zig/src/families/deepseek_v41/cuda_weights.zig
+@@ -163,5 +163,5 @@
+         };
+     }
+     if (plan.head) |group| try admitGroup(pack, io, group);
+-    if (plan.dspark) |draft| try admitGroup(pack, io, draft.main_proj);
++    if (plan.dspark) |draft| if (draft.main_proj) |m| try admitGroup(pack, io, m);
+ }
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -245,7 +245,6 @@
+             break :blk all;
+         };
+         if (affine) {
+-            if (o.drafts) return error.AffineDSparkUnsupported;
+             const cfg_path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
+             const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 24));
+             defer gpa.free(cfg_text);
+@@ -280,12 +279,16 @@
+             });
+             if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_LOAD", false)) {
+                 // the dense/native half of the affine checkpoint: norms, mHC, router, wo_a, embed, head
++                // (DSpark's blocks and heads too when drafts are on)
++                var ds_blocks: [8]u32 = undefined;
++                const drafts = if (o.drafts) dspark_emit.blocks(&m.cfg, &ds_blocks) else &.{};
+                 const blocks = if (o.layers) |ls| ls else blk: {
+-                    const all = try a.alloc(u32, m.cfg.layers);
+-                    for (all, 0..) |*l, i| l.* = @intCast(i);
++                    const all = try a.alloc(u32, m.cfg.layers + drafts.len);
++                    for (all[0..m.cfg.layers], 0..) |*l, i| l.* = @intCast(i);
++                    @memcpy(all[m.cfg.layers..], drafts);
+                     break :blk all;
+                 };
+-                m.pl = try @import("plan.zig").build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dense = true });
++                m.pl = try @import("plan.zig").build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dense = true, .dspark = o.drafts });
+                 m.weights = .{ .gpa = gpa, .digest = false };
+                 try @import("cuda_weights.zig").load(&m.weights, &m.driver, io, &m.cfg, &m.pack, &m.pl);
+                 if (!quiet) std.log.info("dsv41 affine dense: {d} tensors, {d:.2} GiB", .{ m.weights.map.count(), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
+--- a/zig/src/families/deepseek_v41/block_moe.zig
++++ b/zig/src/families/deepseek_v41/block_moe.zig
+@@ -200,7 +200,6 @@
+         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
+     }
+     if (e.cfg.format == .affine) {
+-        if (!backbone) return error.AffineDSparkUnsupported;
+         const cw = if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts;
+         const out = try e.buf("L.moe", .{}, if (e.o.r1 and backbone) .bf16 else .f32, &.{ n, D });
+         try e.glue("moe_host", &.{ x, pick, cw, out, .{ .i = L }, .{ .i = ex.topk }, .{ .i = slots }, .{ .f = E.dec(e.cfg.swiglu_limit) } });
+--- a/zig/src/families/deepseek_v41/dspark_emit.zig
++++ b/zig/src/families/deepseek_v41/dspark_emit.zig
+@@ -12,6 +12,7 @@
+ const wide = @import("block_wide.zig");
+ const buffers = @import("buffers.zig");
+ const layout = @import("dspark_layout.zig");
++const affine_linears = @import("affine_linears.zig");
+ 
+ pub const ringRows = layout.ringRows;
+ pub const blocks = layout.blocks;
+@@ -85,11 +86,16 @@
+     }
+ 
+     /// main_proj: upstream rot_in + linear with split K (its workspace "L.ds.z"), [n, 3 D] -> [n, D].
++    /// An affine checkpoint's main_proj is one resident affine linear.
+     fn mainProj(d: *Ds, x: Arg, y: Arg) !void {
+         const e = d.e;
+-        const w = "dspark.main_proj";
+         const D: i64 = d.cfg().hidden;
+         const K: i64 = @as(i64, @intCast(d.cfg().dspark_targets.items().len)) * D;
++        if (e.cfg.format == .affine) {
++            try e.ext("tf_dsv41_affine_v1.linear", &.{ x, y, .{ .i = @intCast(affine_linears.nameHash("dspark.main_proj")) }, .{ .i = K }, .{ .i = D } });
++            return;
++        }
++        const w = "dspark.main_proj";
+         const k2: i64 = try e.w.k2(w);
+         const xh = try e.buf("L.{s}.xh", .{w}, .f16, &.{ e.n, K });
+         try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ x, try e.weight("{s}.suh", .{w}, .f16, &.{K}), xh });
+@@ -132,7 +138,7 @@
+             e.layer_ratio = 0;
+             const kv = try e.buf("L.kv", .{}, .bf16, &.{ e.n, hd });
+             const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ e.n, hd });
+-            try e.fused("x", &.{.{ .w = try e.fmt("L{d}.attn.wkv", .{L}), .x = mx, .y = kv, .k = @intCast(D), .n = @intCast(hd) }});
++            try e.proj("x", &.{.{ .w = try e.fmt("L{d}.attn.wkv", .{L}), .x = mx, .y = kv, .k = @intCast(D), .n = @intCast(hd) }});
+             if (e.kvNormStoreOn()) {
+                 try d.normStore(kv, L, false);
+             } else {
+@@ -216,7 +222,7 @@
+         const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
+         const qa = try e.buf("L.qa", .{}, .bf16, &.{ n, cf.q_lora });
+         const kv = try e.buf("L.kv", .{}, .bf16, &.{ n, hd });
+-        try e.fused("x", &.{
++        try e.proj("x", &.{
+             .{ .w = try e.fmt("L{d}.attn.wq_a", .{L}), .x = x, .y = qa, .k = @intCast(D), .n = cf.q_lora },
+             .{ .w = try e.fmt("L{d}.attn.wkv", .{L}), .x = x, .y = kv, .k = @intCast(D), .n = @intCast(hd) },
+         });
+@@ -225,7 +231,7 @@
+         try d.rms(qa, try e.weight("L{d}.attn.q_norm", .{L}, .f32, &.{cf.q_lora}), qn, cf.q_lora);
+         if (!e.kvNormStoreOn()) try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
+         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
+-        try e.fused("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = qn, .y = q, .k = cf.q_lora, .n = @intCast(H * hd) }});
++        try e.proj("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = qn, .y = q, .k = cf.q_lora, .n = @intCast(H * hd) }});
+         // table.apply(q.to(fp32)): the cast is torch's (glue), the rotation copies into bf16
+         const qf = try e.buf("L.qf", .{}, .f32, &.{ n, H, hd });
+         try e.glue("widen", &.{ q, qf });
+@@ -266,17 +272,30 @@
+         const g: usize = try e.rankGroups();
+         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
+         const oa = try e.buf("L.oa", .{}, .bf16, &.{ n, @as(i64, @intCast(g)) * cf.o_lora });
++        // DeepSeek-V4.1's `rope(..., inverse=True, quantize=True)`: the attention output
++        // is rounded through FP8 E4M3 (group 32) before wo_a.
++        const oq = if (e.cfg.format == .affine) try e.buf("L.oq", .{}, .bf16, &.{ n, H * hd }) else o;
++        if (e.cfg.format == .affine)
++            try e.ext("tf_dsv41_affine_v1.quant", &.{ o, oq, .{ .i = H * hd } });
+         var po: [8]E.Proj = undefined;
+         for (po[0..g], 0..) |*p, i| p.* = .{
+             .w = try e.fmt("L{d}.attn.wo_a.{d}", .{ L, i }),
+-            .x = try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ H * hd, 1 }, @as(i64, @intCast(i)) * gk * 2),
++            .x = try e.view(oq.t.role, .bf16, &.{ n, gk }, &.{ H * hd, 1 }, @as(i64, @intCast(i)) * gk * 2),
+             .y = oa,
+             .col = i * cf.o_lora,
+             .k = @intCast(gk),
+             .n = cf.o_lora,
+         };
+-        try e.fused("o", po[0..g]);
+-        try e.fused("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .f32, &.{ n, D }), .k = g * cf.o_lora, .n = @intCast(D) }});
++        if (e.cfg.format == .affine) {
++            const base = try e.fmt("L{d}.attn.wo_a", .{L});
++            const ol: i64 = @intCast(cf.o_lora);
++            for (0..g) |i| try e.denseGroup(base, i, po[i].x, H * hd, gk, ol, oa, i * @as(usize, cf.o_lora));
++        } else try e.fused("o", po[0..g]);
++        if (e.cfg.format == .affine) {
++            const p16 = try e.buf("L.part16", .{}, .bf16, &.{ n, D });
++            try e.proj("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = p16, .k = g * cf.o_lora, .n = @intCast(D) }});
++            try e.glue("widen", &.{ p16, try e.buf("L.part", .{}, .f32, &.{ n, D }) });
++        } else try e.fused("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .f32, &.{ n, D }), .k = g * cf.o_lora, .n = @intCast(D) }});
+     }
+ 
+     /// The final norm with DSpark's weight (mhc_cuda final), its hidden left in "L.mhc.c" for the confidence head.
+@@ -339,7 +358,10 @@
+         try d.final();
+         const V: i64 = (try @import("partition.zig").share(d.cfg().vocab, e.o.rank, e.o.world)).len;
+         const logits = try e.buf("w.ds.logits", .{}, .f32, &.{ n, V });
+-        try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ n, D }), D, V, logits);
++        if (e.cfg.format == .affine)
++            try e.denseLinear("head", try e.buf("w.out", .{}, .bf16, &.{ n, D }), D, V, logits)
++        else
++            try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ n, D }), D, V, logits);
+         try e.glue("ds_out", &.{ logits, try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D }) });
+     }
+ };
+--- a/zig/src/families/deepseek_v41/affine_plan.zig
++++ b/zig/src/families/deepseek_v41/affine_plan.zig
+@@ -186,6 +186,26 @@
+                 .layout = try spec.?.layout(kn[1], kn[0]),
+             });
+         }
++        // DSpark's main_proj is outside the release's per-block list (it belongs to the drafter's head).
++        if (dspark) {
++            const canonical = try std.fmt.allocPrint(a, "{s}.main_proj", .{prefix});
++            if (pack.spellModule(canonical, &spell_buf)) |name| {
++                if (try formats.resolve(name)) |spec| {
++                    if (spec.mode == .affine) {
++                        const k = @as(u32, @intCast(cfg.dspark_targets.items().len)) * cfg.hidden;
++                        try modules.append(a, .{
++                            .kind = .linear,
++                            .name = try a.dupe(u8, name),
++                            .role = "dspark.main_proj",
++                            .layer = layer_index,
++                            .dspark = true,
++                            .spec = spec,
++                            .layout = try spec.layout(cfg.hidden, k),
++                        });
++                    }
++                }
++            }
++        }
+         layer.* = .{ .index = @intCast(i), .prefix = prefix, .modules = try modules.toOwnedSlice(a) };
+     }
+     if (try @import("sys").environment.read(bool, "TF_DSV41_AFFINE_TRACE", false)) {
+--- a/zig/src/families/deepseek_v41/host_test.zig
++++ b/zig/src/families/deepseek_v41/host_test.zig
+@@ -184,7 +184,7 @@
+         } else try testing.expectEqual(g0.full.trellisBytes(), g0.part.trellis.bytes() + g1.part.trellis.bytes());
+     };
+     try testing.expectEqual(r0.head.?.full.trellisBytes(), r0.head.?.part.trellis.bytes() + r1.head.?.part.trellis.bytes());
+-    try testing.expectEqualStrings("mtp.1.main_proj", r0.dspark.?.main_proj.prefix);
++    try testing.expectEqualStrings("mtp.1.main_proj", r0.dspark.?.main_proj.?.prefix);
+     try testing.expect(r0.dspark.?.confidence != null);
+     try testing.expectEqual(r0.bytes(), r1.bytes());
+     // the embedding: half the vocabulary rows on each rank
+--- a/zig/src/families/deepseek_v41/world3_test.zig
++++ b/zig/src/families/deepseek_v41/world3_test.zig
+@@ -269,7 +269,7 @@
+             for (&l.experts) |*x| for (x.parts, x.prefixes) |part, prefix| try markPart(a, &seen, &f.pack, prefix, part);
+         }
+         if (p.head) |h| try markPart(a, &seen, &f.pack, h.prefix, h.part);
+-        if (p.dspark) |d| try markPart(a, &seen, &f.pack, d.main_proj.prefix, d.main_proj.part);
++        if (p.dspark) |d| if (d.main_proj) |m| try markPart(a, &seen, &f.pack, m.prefix, m.part);
+     }
+     var it = seen.iterator();
+     while (it.next()) |e| {
