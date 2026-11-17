@@ -71,11 +71,37 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D24 | 2026-11-17 | Convert DSpark's 22 MXFP8 linears to affine-8/group 64 and its 9 MXFP4 expert stacks to affine-3/group 64 in a separate `model-dspark` overlay; keep the source checkpoint untouched | Native MXFP8/MXFP4 kernels, or affine-4 experts | `AffineN` serves 2/3/5/6/8-bit codes, not 4; affine-3 is the closest supported width and reuses the tested loader/kernels. The overlay copies metadata (never hardlinks it) and hardlinks the shard payload; conversion verified at max diff ≤0.045 / RMS ≤0.014 on experts and ≤0.003 on linears |
 | D25 | 2026-11-17 | Keep DSpark off by default (`--no-drafts`) until the device expert gather/GEMM lands | Ship DSpark on because it works | The drafter is correct (same 64-token SHA as plain decode, 44/68 accepted) but the multi-row target verify still runs one row per expert launch, so 64 tokens take 8.55 s vs 7.39 s without drafts (8.46 vs 9.9 tok/s) |
 | D26 | 2026-11-17 | Pack all affine experts into resident `AffineN` tiles at load and batch the MoE launches, keeping the host FP8 activation round-trip and combine order | A native gathered-affine GEMM first | Tiles are the same size as the raw stacks and remove the per-expert repack; batching removes the per-expert syncs. Host quantization/order keeps the token SHA (`7f8834716518`) identical to the tested path. Decode went 2.15 -> 9.9 tok/s; a fused gather GEMM remains for further gains |
+| D27 | 2026-11-17 | Replace exact greedy-SHA matching for speed work with: top-1 agreement >= 99% and mean KL(reference || candidate) <= 0.005, over every generated step of the eight fixed prompts in `scripts/mlx/correctness_prompts.json`; keep a frozen greedy SHA for each qualified build so later regressions are still caught | Require the old token SHA for every speed patch | Moving the MoE to the device changes summation order and activation quantization details; exact SHA would forbid the only meaningful speed path. Top-1 plus KL still catches a wrong router, expert, or combine while allowing numerically equivalent kernels. Reference capture uses patch `0062`; `scripts/mlx/compare_logits.py` is the gate |
+| D28 | 2026-11-17 | Follow the five-step speed plan: profile, agree the correctness rule, move the MoE post-ops to the device, fuse the gathered experts, then reduce bytes; measure every step on the same 64-token LRU prompt at 32K | Continue ad-hoc kernel tuning | The `0061` profile puts ~50 ms/token in `moe_host`, so a short ordered list with gates gives a measurable path from 11.3 tok/s to the 20-30 tok/s range instead of local micro-optimizations |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-17 - Speed plan step 0/1: profile and correctness rule
+
+- **Step 0 baseline (image `3db792965274`, patch `0061`):** 64-token LRU, greedy,
+  `TF_DSV41_CONTEXT=32768`, `TF_DSV41_GRAPHS=0`, no drafts. Result **11.0 tok/s**,
+  TTFT 0.921 s, greedy SHA `06d2679eec60`; the run wrote 64 steps in 6.59 s.
+- **Per-call breakdown (64 decode steps, `TF_DSV41_PROFILE`):**
+  `glue.moe_host` 3238 ms (49.2%), affine linears 1167 ms (17.7%), `glue.woa` 947 ms
+  (14.4%), head `_plain` 761 ms (11.6%), mHC 122 ms, attention 81 ms, router 66 ms,
+  Engram rows 30 ms, exchange 37 ms. The MoE host path is the first target.
+- **Nsight Systems:** the container has `nsys` 2026.3.1, but the GB10 report collected
+  no CUPTI kernel rows (`No CUDA events collected`), even for a minimal PyTorch CUDA
+  program; the per-call event timer is therefore the reliable breakdown. The attempted
+  report is `stage1-full/nsys-0061-32k.nsys-rep`; it is not used as a gate.
+- **Step 1 rule:** `D27`. Added `scripts/mlx/capture_logits.py`,
+  `scripts/mlx/compare_logits.py`, and eight fixed prompts. Patch `0062` numbers the
+  head-logits trace (`trace_65521_<step>.bin`) so every decode step can be scored.
+- **Step 2 in progress:** patch `0063` moves the activation FP8 round-trip, clamped
+  SwiGLU and its group sums, and the shared+routed combine onto the device. The host
+  path now has one sync and two small router downloads per MoE layer instead of three
+  syncs and the g/u/y round trips. Host/device tests compile; the only failing test is
+  the pre-existing checkpoint-fingerprint case. Image build and measurement are next.
+- **Next:** build `0062`, capture the host reference logits, then build `0063`, measure
+  32K speed, and score it with `compare_logits.py`.
 
 ### 2026-11-17 - Qwen3.8 Flash single-Spark speed baseline
 

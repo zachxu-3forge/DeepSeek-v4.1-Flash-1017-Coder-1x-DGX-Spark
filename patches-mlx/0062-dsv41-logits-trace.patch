@@ -1,0 +1,36 @@
+--- a/zig/src/families/deepseek_v41/forward.zig
++++ b/zig/src/families/deepseek_v41/forward.zig
+@@ -76,6 +76,8 @@
+     drafter: ?Drafter = null,
+     /// each block's traced streams (block.Options.trace) as SHA-256 hex by layer, for the last window
+     trace: ?*std.AutoArrayHashMapUnmanaged(u32, [64]u8) = null,
++    /// TF_DSV41_TRACE_SEQ: the next head-logits trace number, so one request keeps every step's logits
++    trace_seq: u32 = 0,
+     /// the largest row bucket plan() sized the buffers for (a graphed window never has more rows)
+     planned_rows: u32 = 0,
+     graphed: ?*Graphed = null, // decode windows through CUDA graphs (TF_DSV41_GRAPHS=1); null until the knob is read
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -202,7 +202,11 @@
+             std.log.info("layer {d} residual: rms {d:.4} max {d:.4} mean {d:.4} nonfinite {d}", .{ @as(u32, @intCast(c.args[1].arg.i)), rms, maxabs, mean, bad });
+             if (std.c.getenv("TF_DSV41_TRACE_DIR")) |dir0| {
+                 var path: [1024]u8 = undefined;
+-                const written = std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/trace_{d}.bin", .{ std.mem.span(dir0), c.args[1].arg.i }) catch return;
++                const id: i64 = c.args[1].arg.i;
++                const written = if (std.c.getenv("TF_DSV41_TRACE_SEQ") != null)
++                    std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/trace_{d}_{d}.bin", .{ std.mem.span(dir0), id, f.trace_seq }) catch return
++                else
++                    std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/trace_{d}.bin", .{ std.mem.span(dir0), id }) catch return;
+                 path[written.len] = 0;
+                 const tpath = path[0..written.len :0];
+                 const fd = std.c.open(tpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+@@ -211,6 +215,9 @@
+                     _ = std.c.close(fd);
+                 }
+             }
++            // The head's logits (0xfff1) are the one trace a request writes every decode step: number
++            // them so a comparison can read a whole generated sequence, not just the last token.
++            if (c.args[1].arg.i == 0xfff1) f.trace_seq +%= 1;
+             return;
+         }
+         const map = f.trace orelse return;

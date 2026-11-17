@@ -66,8 +66,10 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0059-dsv41-affine-moe-batched.patch` | Batch the affine MoE: one activation quant/sums, device expert launches, and two host transfers per layer |
 | `0060-dsv41-affine-moe-host-quant.patch` | Use the host's FP8 round-trip and the original combine order in the batched MoE (bit parity with the tested path) |
 | `0061-dsv41-fused-woa.patch` | Fuse wo_a's eight block-diagonal BF16 groups into one glue kernel (removes 8 launches a layer) |
+| `0062-dsv41-logits-trace.patch` | Number every decode step's head-logits trace so the correctness rule can score a whole request |
+| `0063-dsv41-device-moe-post.patch` | Keep activation FP8 quantization, clamped SwiGLU, and the shared+routed combine on the device |
 
-Implemented: `0001`-`0061`.
+Implemented: `0001`-`0063`.
 
 Rules:
 

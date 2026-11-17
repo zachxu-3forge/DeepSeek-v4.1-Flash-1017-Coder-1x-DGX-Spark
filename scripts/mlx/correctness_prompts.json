@@ -1,0 +1,34 @@
+[
+  {
+    "id": "lru-cache",
+    "prompt": "Write a Python LRU cache with per-entry TTL"
+  },
+  {
+    "id": "hash-map",
+    "prompt": "Explain how a hash map works step by step, including collisions and resizing"
+  },
+  {
+    "id": "quicksort",
+    "prompt": "Write a Python quicksort with a deterministic pivot and a small test"
+  },
+  {
+    "id": "binary-search",
+    "prompt": "Write a Python binary search that returns the insertion point when the value is absent"
+  },
+  {
+    "id": "sql-join",
+    "prompt": "Write a SQL query that lists each customer and their most recent paid order"
+  },
+  {
+    "id": "raii",
+    "prompt": "Show a C++ RAII wrapper around a file descriptor and explain the move semantics"
+  },
+  {
+    "id": "debug",
+    "prompt": "A Python asyncio task raises CancelledError during shutdown. Explain likely causes and a safe fix"
+  },
+  {
+    "id": "json-schema",
+    "prompt": "Return a JSON object with name, version, and a dependencies array for a small Python package"
+  }
+]

@@ -1,0 +1,271 @@
+--- a/zig/kernels/cuda/act_rows.cu
++++ b/zig/kernels/cuda/act_rows.cu
+@@ -45,6 +45,38 @@
+     }
+ }
+ 
++// DeepSeek's routed-expert GLU: y = silu(min(g, limit)) * clamp(u, -limit, limit), bf16; xs (or null) y's sums.
++// The division is __fdiv_rn and the clamp is the host's, so the decode's bf16 row matches the host step.
++extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows_clamp(const __nv_bfloat16* __restrict__ gate, long long g_ld,
++                                                                      const __nv_bfloat16* __restrict__ up, long long u_ld,
++                                                                      __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
++                                                                      int n, float limit) {
++    const int64_t r = blockIdx.x;
++    const int c = blockIdx.y * blockDim.x + threadIdx.x; // 8 values
++    const bool live = 8 * c < n;
++    float g[8], u[8], o[8];
++    if (live) {
++        unpack8(*reinterpret_cast<const uint4*>(gate + r * g_ld + 8 * c), g);
++        unpack8(*reinterpret_cast<const uint4*>(up + r * u_ld + 8 * c), u);
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        if (!live) {
++            o[i] = 0.f;
++            continue;
++        }
++        const float a = fminf(g[i], limit);
++        const float s = __fdiv_rn(a, __fadd_rn(1.0f, expf(-a)));
++        o[i] = __fmul_rn(s, fminf(fmaxf(u[i], -limit), limit));
++    }
++    const uint4 op = pack8(o);
++    if (live) *reinterpret_cast<uint4*>(out + r * n + 8 * c) = op;
++    if (xs != nullptr) {
++        const float s = group_sum8(op, live);
++        if (live && (c & 7) == 0) xs[r * (n / 64) + c / 8] = s;
++    }
++}
++
+ // out[r, h * d + e] = bf16(o[r, h * d + e] * sigmoid(g[r * g_ld + h * g_hs + e])) (d % 64 == 0); xs (or null) its sums.
+ extern "C" __global__ void __launch_bounds__(NT) tf_gate_rows(const __nv_bfloat16* __restrict__ o,
+                                                               const __nv_bfloat16* __restrict__ g, long long g_ld,
+--- a/zig/src/cuda/act_rows.zig
++++ b/zig/src/cuda/act_rows.zig
+@@ -25,6 +25,7 @@
+ pub const ActRows = struct {
+     mod: Module,
+     swiglu_fn: Function,
++    swiglu_clamp_fn: Function,
+     gate_fn: Function,
+     sums_fn: Function,
+     quant_fp8_fn: Function,
+@@ -41,7 +42,7 @@
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.act_rows);
+         errdefer mod.unload();
+-        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows"), .quant_fp8_fn = try mod.function("tf_quant_fp8_rows"), .dconv_fn = try mod.function("tf_dconv_rows"), .geglu_fn = try mod.function("tf_geglu_rows"), .swiglu_round_fn = try mod.function("tf_swiglu_rows_round"), .softcap_fn = try mod.function("tf_softcap_rows"), .gate_l2_fn = try mod.function("tf_gate_l2_rows"), .swiglu_l2_fn = try mod.function("tf_swiglu_l2_rows"), .head_gate_fn = try mod.function("tf_head_gate_rows"), .gelu_erf_fn = try mod.function("tf_gelu_erf_rows") };
++        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .swiglu_clamp_fn = try mod.function("tf_swiglu_rows_clamp"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows"), .quant_fp8_fn = try mod.function("tf_quant_fp8_rows"), .dconv_fn = try mod.function("tf_dconv_rows"), .geglu_fn = try mod.function("tf_geglu_rows"), .swiglu_round_fn = try mod.function("tf_swiglu_rows_round"), .softcap_fn = try mod.function("tf_softcap_rows"), .gate_l2_fn = try mod.function("tf_gate_l2_rows"), .swiglu_l2_fn = try mod.function("tf_swiglu_l2_rows"), .head_gate_fn = try mod.function("tf_head_gate_rows"), .gelu_erf_fn = try mod.function("tf_gelu_erf_rows") };
+     }
+ 
+     /// out = bf16(bf16(gelu_erf(gate)) * up) as PyTorch's exact GELU then the product, rows as swiglu's; xs: sums.
+@@ -74,6 +75,23 @@
+         return g.glu(g.swiglu_fn, s, gate, g_ld, up, u_ld, out, xs, rows, n);
+     }
+ 
++    /// out [rows, n] = bf16(silu(min(gate, limit)) * clamp(up, -limit, limit)); xs (or null): out's 64-value sums.
++    pub fn swigluClamp(g: *const ActRows, s: Stream, gate: u64, g_ld: usize, up: u64, u_ld: usize, out: u64, xs: ?u64, rows: usize, n: usize, limit: f32) !void {
++        if (n % 64 != 0 or !aligned(&.{ gate, up, out }, &.{ g_ld, u_ld })) return error.RowShape;
++        if (rows == 0) return;
++        var a: launch_.Args = .{};
++        a.add(gate);
++        a.add(@as(i64, @intCast(g_ld)));
++        a.add(up);
++        a.add(@as(i64, @intCast(u_ld)));
++        a.add(out);
++        a.add(xs orelse 0);
++        a.add(@as(i32, @intCast(n)));
++        a.add(limit);
++        const t = launch_.rowThreads(rows, threads, 128);
++        try launch_.launch(g.swiglu_clamp_fn, .{ .grid = grid(rows, n, t), .block = .{ .x = t } }, s, &a);
++    }
++
+     /// swiglu in MLX's bf16 steps (tf_draft_swiglu's: exp, 1 + e, its reciprocal, the sigmoid, silu, each rounded).
+     pub fn swigluRound(g: *const ActRows, s: Stream, gate: u64, g_ld: usize, up: u64, u_ld: usize, out: u64, xs: ?u64, rows: usize, n: usize) !void {
+         return g.glu(g.swiglu_round_fn, s, gate, g_ld, up, u_ld, out, xs, rows, n);
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -104,6 +104,29 @@
+     if (lane == 0) out[(long long)r * g * ol + grp * ol + j] = to_bf(acc);
+ }
+ 
++// The affine MoE's combine: out[i, d] = shared y (slot topk) + sum_{j < topk} w[j] * y[slot j],
++// in the host path's order. One skipped slot contributes nothing; fp32 sums, then bf16 or f32 out.
++extern "C" __global__ void __launch_bounds__(256) dsv41_moe_combine(const uint16_t* __restrict__ y,
++                                                                    const int* __restrict__ pick,
++                                                                    const float* __restrict__ wts,
++                                                                    float* __restrict__ outf,
++                                                                    uint16_t* __restrict__ outb,
++                                                                    int n, int slots, int topk, int D,
++                                                                    int has_shared, int out_bf16) {
++    const int i = blockIdx.x;
++    const int d = blockIdx.y * blockDim.x + threadIdx.x;
++    if (i >= n || d >= D) return;
++    float acc = has_shared ? bf(y[((long long)i * slots + topk) * D + d]) : 0.0f;
++    for (int j = 0; j < topk; ++j) {
++        const int e = pick[i * slots + j];
++        const float w = wts[i * slots + j];
++        if (e < 0 || w == 0.0f) continue;
++        acc = __fadd_rn(acc, __fmul_rn(w, bf(y[((long long)i * slots + j) * D + d])));
++    }
++    if (out_bf16) outb[(long long)i * D + d] = to_bf(acc);
++    else outf[(long long)i * D + d] = acc;
++}
++
+ // recv [W, n, c] -> out [n, W c] (bf16 words, any 2-byte type)
+ __global__ void __launch_bounds__(256) gather_cols_kernel(const uint16_t* __restrict__ recv, int W, int n, int c,
+                                                           uint16_t* __restrict__ out) {
+--- a/zig/src/families/deepseek_v41/kernels_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_ops.zig
+@@ -232,8 +232,9 @@
+         "_ZN10dsv41_glue20positions_dev_kernelEPKiiPiPxS2_",
+         "_ZN10dsv41_glue16widen_f32_kernelEPKtPfx",
+         "dsv41_woa_groups",
++        "dsv41_moe_combine",
+     };
+-    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa };
++    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa, moe_combine };
+     /// DSpark's candidates (optional: resolved apart, so an older fatbin still loads)
+     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
+     /// the most candidates a rank (the kernel's shared sort)
+@@ -545,6 +546,7 @@
+     pub const vsChoose = glue_ops.vsChoose;
+     pub const widenF32 = glue_ops.widenF32;
+     pub const woaGroups = glue_ops.woaGroups;
++    pub const moeCombine = glue_ops.moeCombine;
+     pub const pfGo = glue_ops.pfGo;
+     pub const topPositions = glue_ops.topPositions;
+     pub const candKeys = glue_ops.candKeys;
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -343,3 +343,26 @@
+     a.add(@as(c_int, @intCast(ol)));
+     try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 4), rows, 1 }, 128, 0, null, &a);
+ }
++
++/// The affine MoE's combine: out [n, D] bf16/f32 = shared + weighted routed y [n*slots, D].
++pub fn moeCombine(o: Ops, y: u64, pick: u64, wts: u64, out: u64, out_bf16: bool, n: usize, slots: usize, topk: usize, D: usize, has_shared: bool) !void {
++    if (n == 0 or D == 0 or slots == 0 or topk > slots) return error.Shape;
++    var a: cuda.Args = .{};
++    a.add(y);
++    a.add(pick);
++    a.add(wts);
++    if (out_bf16) {
++        a.add(@as(u64, 0));
++        a.add(out);
++    } else {
++        a.add(out);
++        a.add(@as(u64, 0));
++    }
++    a.add(@as(c_int, @intCast(n)));
++    a.add(@as(c_int, @intCast(slots)));
++    a.add(@as(c_int, @intCast(topk)));
++    a.add(@as(c_int, @intCast(D)));
++    a.add(@as(c_int, @intFromBool(has_shared)));
++    a.add(@as(c_int, @intFromBool(out_bf16)));
++    try o.go(o.f.glue[@backingInt(glue.Kind.moe_combine)], .{ @intCast(n), @intCast((D + 255) / 256), 1 }, 256, 0, null, &a);
++}
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -10,7 +10,6 @@
+ const hooks = @import("forward_hooks.zig");
+ const named = @import("named.zig");
+ const affine_linears = @import("affine_linears.zig");
+-const act_quant = @import("act_quant.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -247,6 +246,7 @@
+ /// one row at a time through the resident `AffineN` kernels; the combine is on the host.
+ fn moeHost(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+     const af = r.affine orelse return error.AffineNotLoaded;
++    const k = r.kernels.others(r.stream);
+     const x = c.args[0].arg.t;
+     const pick = c.args[1].arg.t;
+     const wts = c.args[2].arg.t;
+@@ -295,8 +295,8 @@
+     if (D % 64 != 0 or I % 64 != 0) return error.BadGlue;
+     const P = n * slots;
+ 
+-    // One activation quantization and group-sum pass, then the whole layer's expert
+-    // launches without a host round trip: only g/u and y cross the bus.
++    // The activation's FP8 round-trip, the routed GLU, and the combine stay on the device. The only
++    // host round trip left is the router's pick/weights, needed to issue the per-expert launches.
+     var xq = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
+     defer xq.free();
+     var sx = try cuda.DeviceBuffer.alloc(r.d, n * dg * 4);
+@@ -312,13 +312,7 @@
+     var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
+     defer y.free();
+ 
+-    const xb = try f.gpa.alloc(u8, n * D * 2);
+-    defer f.gpa.free(xb);
+-    const xqb = try f.gpa.alloc(u8, n * D * 2);
+-    defer f.gpa.free(xqb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
+-    for (0..n) |i| try act_quant.quantizeRow(xb[i * D * 2 ..][0 .. D * 2], xqb[i * D * 2 ..][0 .. D * 2], @intCast(D));
+-    try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = xq.ptr, .len = xqb.len }, 0, xqb);
++    try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
+     try af.act.groupSums(r.stream, xq.ptr, D, sx.ptr, n, D);
+     for (0..n) |i| {
+         for (0..slots) |j| {
+@@ -341,19 +335,9 @@
+             }
+         }
+     }
+-    try r.stream.synchronize();
+ 
+-    const gb = try f.gpa.alloc(u8, P * I * 2);
+-    defer f.gpa.free(gb);
+-    const ub = try f.gpa.alloc(u8, P * I * 2);
+-    defer f.gpa.free(ub);
+-    const ab = try f.gpa.alloc(u8, P * I * 2);
+-    defer f.gpa.free(ab);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = g.ptr, .len = gb.len }, 0, gb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = u.ptr, .len = ub.len }, 0, ub);
+-    for (0..P) |p| try swigluRow(gb[p * I * 2 ..][0 .. I * 2], ub[p * I * 2 ..][0 .. I * 2], ab[p * I * 2 ..][0 .. I * 2], limit);
+-    try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = actd.ptr, .len = ab.len }, 0, ab);
+-    try af.act.groupSums(r.stream, actd.ptr, I, sa.ptr, P, I);
++    // The host's clamp and exact division, the same bf16 row and its group sums.
++    try af.act.swigluClamp(r.stream, g.ptr, I, u.ptr, I, actd.ptr, sa.ptr, P, I, limit);
+ 
+     for (0..n) |i| {
+         for (0..slots) |j| {
+@@ -374,36 +358,9 @@
+             }
+         }
+     }
+-    try r.stream.synchronize();
+-
+-    const yb = try f.gpa.alloc(u8, P * D * 2);
+-    defer f.gpa.free(yb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = y.ptr, .len = yb.len }, 0, yb);
+-    const acc = try f.gpa.alloc(f32, n * D);
+-    defer f.gpa.free(acc);
+-    @memset(acc, 0);
+-    for (0..n) |i| {
+-        // the host path added the shared expert first, then the routed slots: keep that order
+-        if (has_shared) {
+-            const p = i * slots + topk;
+-            for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-        }
+-        for (0..topk) |j| {
+-            const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-            if (e < 0) continue;
+-            const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-            if (w == 0) continue;
+-            const p = i * slots + j;
+-            for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-        }
+-    }
+ 
+-    if (out.dt == .bf16) {
+-        const half = try f.gpa.alloc(u8, n * D * 2);
+-        defer f.gpa.free(half);
+-        for (acc, 0..) |v, i| std.mem.writeInt(u16, half[2 * i ..][0..2], named.bf16Round(v), .little);
+-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = half.len }, 0, half);
+-    } else try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = std.mem.sliceAsBytes(acc).len }, 0, std.mem.sliceAsBytes(acc));
++    // Shared first, then the routed slots in order, all on the device.
++    try k.moeCombine(y.ptr, try r.tensorAddr(pick), try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
+ }
+ 
+ fn swigluRow(gate: []const u8, up: []const u8, out: []u8, limit: f32) !void {
