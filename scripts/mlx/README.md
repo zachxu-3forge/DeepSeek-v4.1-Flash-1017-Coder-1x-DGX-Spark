@@ -12,9 +12,10 @@ python3 scripts/mlx/inspect_checkpoint.py "$MODEL_DIR" --headers --json out/insp
 Expected on the published checkpoint:
 
 - 21 shards, 2,286 tensors, 211.4 GiB.
-- 460 quantized modules: 429 affine (2/6/8-bit), 22 MXFP8, 9 MXFP4. The affine plan
-  owns 307 linears, 120 2-bit expert stacks, 21 MXFP8 and 9 MXFP4; two affine Engram
-  tables and the DSpark `main_proj` MXFP8 are handled separately.
+- 460 quantized modules: 429 affine (2/6/8-bit), 22 MXFP8, 9 MXFP4. The affine plan owns
+  307 linears and 120 2-bit expert stacks; `convert_dspark_affine.py` moves the 31 DSpark
+  modules into affine, giving 331 linears and 129 expert stacks. Two affine Engram tables
+  and the DSpark `main_proj` are handled separately.
 - 378 stacked expert tensors (one tensor per projection, not per expert).
 - 16 Engram tensors.
 
@@ -196,6 +197,23 @@ table tensors are present. The `engram.json` token map/kit is still required.
 `test_engram.py --shard-dir` checks row 0 of every packed shard against the release bytes
 (native) or the decoded values (FP8).
 
+## DSpark conversion
+
+The checkpoint's DSpark blocks are MXFP8/MXFP4, not affine. To keep one kernel family, convert
+them once into a separate overlay; the source checkpoint is not modified:
+
+```sh
+python3 scripts/mlx/convert_dspark_affine.py "$MODEL_DIR" /model-dspark --verify
+```
+
+The 22 MXFP8 linears (attention, shared experts, `main_proj`) become affine-8/group 64; the 9
+MXFP4 expert stacks become affine-3/group 64. Affine-3 is deliberate: `AffineN` serves
+2/3/5/6/8-bit codes, not 4. The converter writes one `model-dspark-affine.safetensors` shard,
+updates the index and config, and hardlinks the source shards. It copies `config.json` and the
+index (never hardlinks them), so the source directory stays intact. Run the image with
+`--drafts` to use it; keep `--no-drafts` until the device expert kernel makes the multi-row
+verify pay off.
+
 ## Stage 1 gate
 
 The harness is ready: the image builds, `tensorfold-dsv41 --version` runs, and the engine
@@ -223,6 +241,12 @@ The native Engram tables are packed and used, and the full model answers `Paris`
 capital question and the checkpoint's `bench.json` LRU prompt opening. The remaining
 divergence from omlx is the bf16 KV cache vs its packed 4-bit/e4m3 formats and the affine
 activation quantization.
+
+At image `7fd2b99bf79a` (patches `0001`-`0057`) DSpark runs on the converted overlay: 331
+affine linears (4.74 GiB), 129 expert stacks (84.64 GiB), 620 dense tensors (5.51 GiB), and
+`drafts: DSpark + copies`. The 64-token LRU reply keeps the same token SHA with and without
+drafts (accepted 44/65). Drafts are slower with host-loop experts (45.8 s vs 36.0 s), so the
+default remains `--no-drafts`; the guard passes with `model-translated`.
 
 ## Layer reference
 

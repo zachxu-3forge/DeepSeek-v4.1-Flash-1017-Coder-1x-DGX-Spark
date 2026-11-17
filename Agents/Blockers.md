@@ -140,6 +140,23 @@ expected: the engine stores the SWA/compressed KV in bf16, while omlx packs it t
 (window 8/32, compressed 4/16, index 4/32); this is a precision/format difference, not a
 structural failure. DSpark, vision, and the 600K memory model remain.
 
+Update 2026-11-17: DSpark now runs from the affine model. The 31 mixed modules are converted
+once into a separate `model-dspark` overlay (`scripts/mlx/convert_dspark_affine.py`): the 22
+MXFP8 linears (including `main_proj`) become affine-8/group 64, and the 9 MXFP4 expert stacks
+become affine-3/group 64. Affine-4 was the original target, but `AffineN` serves 2/3/5/6/8-bit
+codes and has no 4-bit group kernel; affine-3 is the closest supported width. Real-checkpoint
+verification: linears max diff `0.0024` / RMS `0.0005`; experts max `0.045` / RMS `0.014`. The
+converter copies the config/index (never hardlinks them) and hardlinks the payload shards.
+Engine patches `0055`-`0057` make the DSpark plan/heads dense, route the DSpark emitter through
+the affine calls, and let its `copy_cols`/`moe_host` glue use the forward glue. Boot on
+`7fd2b99bf79a`: 331 affine linears (4.74 GiB), 129 expert stacks (84.64 GiB), `drafts: DSpark +
+copies`; 32 AOT variants (47 cubins); 4K guard PASS. The capital question answers `Paris`, and
+the 64-token LRU reply has the same token SHA (`7f8834716518`) with and without drafts
+(accepted 44/65). It is slower until the target verify stops running the host expert loop per
+row (45.8 s vs 36.0 s for 64 tokens), so `--no-drafts` stays the default. A 600K boot with
+DSpark is not yet measured; the extra ~6 GiB converted weights and draft buffers need a check
+against the 22 GiB headroom. Affine prefill remains skipped.
+
 ### B7. Vision, tokenizer, chat template
 
 Tokenizer and chat template are the same DeepSeek-V4.1 family, and the vision tower is copied

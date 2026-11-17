@@ -17,24 +17,24 @@ needed. This file is the history.
 
 | Field | Value |
 |---|---|
-| Current phase | Phase 1 - affine loader and layout adapter |
-| Overall status | Full text + 600K context measured on one Spark (`1df195f247ca`); affine prefill/DSpark/vision next |
+| Current phase | Phase 2 - full model (text, DSpark, long context) |
+| Overall status | Full text, 600K context, and affine DSpark work on one Spark (`7fd2b99bf79a`); device experts/prefill/vision next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:1df195f247ca28496c45eaf44e5f7e40a6d26b748ffa880a03281c2e05efbda5` (patches `0001`-`0054`) |
-| Last updated | 2026-11-16 |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:7fd2b99bf79a…` (patches `0001`-`0057`) |
+| Last updated | 2026-11-17 |
 
 ## Phase tracker
 
 | Phase | Status | Gate | Evidence |
 |---|---|---|---|
 | 0. Harness and admission spike | Done | Translated config + 192-expert, world-1 affine fixture loads | Image built; guard logs 307/120/21/9; smoke passes |
-| 1. Affine loader and layout adapter | In progress | One full layer matches dequantized reference | `wq_a` row 0 matches; affine dense/linear/expert loaders, host-loop MoE, and the boot path are wired; one-layer GPU gate pending |
-| 2. Full model, short context | Not started | Text prompt served on one Spark; 32K stable; 600K memory measured | - |
-| 3. Engram | In progress | Sampled lookups match reference; native 4-bit tables stream from SSD | Golden rows pass; native 160 B reader and packer tested; real-shard check pending |
+| 1. Affine loader and layout adapter | Done | One full layer matches dequantized reference | Layer 0 vs the recipe reference: streams corr `0.99974`, attn `0.99935`, MoE `0.99942` |
+| 2. Full model, short context | In progress | Text prompt served on one Spark; 32K stable; 600K memory measured | Text and 600K PASS; DSpark serves correctly but is slower until the device expert kernel; affine prefill pending |
+| 3. Engram | Done | Sampled lookups match reference; native 4-bit tables stream from SSD | Native 4-bit reader; both layers packed (115 GiB, `--verify` max 0); served from `TF_DSV41_ENGRAM_DIR` |
 | 4. Server, tools, vision | Not started | Chat completions, streaming, tools, one image request | - |
 | 5. Qualification and docs | Not started | Metrics, regression suite, reproducible run record | - |
 
@@ -68,11 +68,43 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D21 | 2026-11-16 | Do not bake `mscale` into the dsv41 RoPE table | Keep the MiaAI/Qwen mscale convention | `omlx/patches/deepseek_v41/language.py` builds plain YaRN cos/sin; it has no `mscale`. The compressed table must be unscaled to match the target runtime |
 | D22 | 2026-11-16 | Apply the checkpoint's `quantize_input` FP8 E4M3 group-32 activation round-trip before affine linears, experts, and `wo_a` | Raw BF16 activations | Every target module sets `quantize_input: true`; `QuantizedProjection.__call__` quantizes and dequantizes the activation, and attention applies the same round-trip to `o` before `wo_a` |
 | D23 | 2026-11-16 | 600K target stands; KV is ~1.58 GiB, not 13.05 GiB | Per-layer flat `layers * 584 B/token` estimate | The engine stores compressed values/scales once per KV source (reuse layers read that cache) and index keys per index source; the full 600K boot measured 99 GiB used / 22 GiB available on `dgx2`. `memory_estimate.py` now models this layout |
+| D24 | 2026-11-17 | Convert DSpark's 22 MXFP8 linears to affine-8/group 64 and its 9 MXFP4 expert stacks to affine-3/group 64 in a separate `model-dspark` overlay; keep the source checkpoint untouched | Native MXFP8/MXFP4 kernels, or affine-4 experts | `AffineN` serves 2/3/5/6/8-bit codes, not 4; affine-3 is the closest supported width and reuses the tested loader/kernels. The overlay copies metadata (never hardlinks it) and hardlinks the shard payload; conversion verified at max diff ≤0.045 / RMS ≤0.014 on experts and ≤0.003 on linears |
+| D25 | 2026-11-17 | Keep DSpark off by default (`--no-drafts`) until the device expert gather/GEMM lands | Ship DSpark on because it works | The drafter is correct (same 64-token SHA as plain decode, 44/65 accepted) but the multi-row target verify runs the affine host expert loop per row, so 64 tokens take 45.8 s vs 36.0 s without drafts |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-17 - DSpark on the affine model
+
+- **Phase:** 2. DSpark drafts now run end to end on the affine checkpoint, and the output is
+  identical to plain decode.
+- **Conversion:** `scripts/mlx/convert_dspark_affine.py` converts the 31 DSpark MXFP8/MXFP4
+  modules (22 linears incl. `main_proj`, 9 expert stacks) into a separate `model-dspark`
+  overlay: affine-8/group 64 for linears, affine-3/group 64 for experts. `AffineN` does not
+  serve 4-bit codes, so affine-3 is the closest supported width. Verification on the real
+  checkpoint: linears max diff `0.0024` / RMS `0.0005`, experts max `0.045` / RMS `0.014`.
+  Metadata files are copied, never hardlinked; the shard payload is hardlinked.
+- **Engine:** `0055` makes `plan.Dspark.main_proj` optional (the affine `main_proj` is a
+  resident affine linear), adds the DSpark blocks/heads to the dense plan, allows drafts for
+  affine, routes DSpark attention/MoE/head through the affine emitter, and lets the host MoE
+  serve DSpark layers. `0056` makes `Pack.has` find `language_model.`-prefixed tensors so the
+  dense DSpark heads plan. `0057` routes DSpark's shared glue steps (`copy_cols`, `moe_host`)
+  to the forward glue.
+- **Boot (`7fd2b99bf79a`, 4K):** 331 affine linears (4.74 GiB), 129 expert stacks (84.64 GiB),
+  620 dense tensors (5.51 GiB); `drafts: DSpark + copies`; loaded 108.9 s. The DSpark AOT set
+  is 32 variants (5 more than 4K plain), all compiled (47 cubins).
+- **Results:** `What is the capital of France?` -> `Paris`; the 64-token LRU reply carries the
+  same token SHA (`7f8834716518`) with and without drafts. Drafts: 19 rounds, accepted `44/65`
+  (67.7%), 1.61 tok/s; without drafts 2.15 tok/s (45.8 s vs 36.0 s for 64 tokens). The
+  multi-row target verify runs the affine host expert loop per row, so drafts currently lose;
+  DSpark stays opt-in (`--drafts`) until the device expert kernel lands.
+- **Guard:** PASS on `7fd2b99bf79a` (patches `0001`-`0057`) with `model-translated`.
+- **Restored:** the first conversion run hardlinked `config.json`/index and then rewrote them,
+  which edited `model-translated` in place; the source metadata was restored from the original
+  MLX checkpoint with `translate_config.py` plus the original index. The converter now copies
+  those two files before rewriting them.
 
 ### 2026-11-16 - Activation quantization and unscaled RoPE
 
@@ -1039,8 +1071,8 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Port the affine prefill (`block_prefill_attn`/`block_prefill_moe`/the prefill emitter) so long prompts do not run as 16-token decode windows; this is the remaining 600K blocker.
-2. Document the exact greedy divergence from omlx: 136-139 characters match the `bench.json` LRU reference before the parenthetical wording differs; the bf16 KV cache vs omlx's packed 4-bit/e4m3 formats and the activation quantization are the expected sources.
-3. Requantize the 9 MXFP4 DSpark experts to affine-4/group-64 and use `Affine4Experts`; then wire the DSpark affine emitter and measure acceptance.
-4. Add the device expert gather/GEMM to replace the host loop (2.2 tok/s decode on the full model).
+1. Add the device expert gather/GEMM to replace the host loop: it is now the single biggest item (2.1 tok/s decode, and the reason DSpark verify loses). Target the affine-2/3-bit codes the model actually stores, not a new format.
+2. Measure DSpark at 600K with the extra 6 GiB converted weights and draft buffers; keep `--no-drafts` the default until (1).
+3. Port the affine prefill (`block_prefill_attn`/`block_prefill_moe`/the prefill emitter) so long prompts do not run as 16-token decode windows; this is the remaining 600K *prompt* blocker.
+4. Document the exact greedy divergence from omlx: 136-139 characters match the `bench.json` LRU reference before the parenthetical wording differs; the bf16 KV cache vs omlx's packed 4-bit/e4m3 formats and the activation quantization are the expected sources.
 5. Then server/vision and qualification.

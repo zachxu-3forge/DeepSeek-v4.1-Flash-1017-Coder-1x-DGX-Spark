@@ -7,10 +7,11 @@ scale per 32 inputs, the routed experts are E2M1 nibbles with the same scales.
 The engine's affine path serves group-64 affine tiles; this script requantizes
 the DSpark modules into that form so one kernel family serves the whole model.
 
-Targets: linears (including `main_proj`) -> affine-8/group 64; experts ->
-affine-4/group 64. The converted tensors are written to one new safetensors
-shard and the model's index/config are updated to match. The source shards are
-not modified; the output directory hardlinks them.
+Targets: linears (including `main_proj`) -> affine-8/group 64; routed experts ->
+affine-3/group 64 (the affine-8 kernel family serves 2/3/5/6/8-bit codes, not 4).
+The converted tensors are written to one new safetensors shard and the model's
+index/config are updated to match. The source shards are not modified; the output
+directory hardlinks them.
 
 Example:
   python3 scripts/mlx/convert_dspark_affine.py "$MODEL_DIR" "$OUT_DIR"
@@ -106,18 +107,26 @@ def quantize_affine(values: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarr
 
 
 def pack_codes(q: np.ndarray, bits: int) -> np.ndarray:
-    """uint8 codes [rows, k] -> U32 words [rows, k*bits/32] (little-endian)."""
+    """uint8 codes [rows, k] -> U32 words [rows, k*bits/32] (little-endian, LSB first)."""
     rows, k = q.shape
     if bits == 8:
-        body = np.ascontiguousarray(q)
+        body = np.ascontiguousarray(q.astype(np.uint8))
         return body.view(np.uint32).reshape(rows, k // 4)
-    elif bits == 4:
-        # each byte: input 2j in the low nibble, 2j+1 in the high (MLX's packing)
-        body = (q[:, 0::2] & 0x0F) | ((q[:, 1::2] & 0x0F) << 4)
-        body = np.ascontiguousarray(body)
-        return body.view(np.uint32).reshape(rows, k // 8)
-    else:
-        raise ValueError(f"unsupported affine bits {bits}")
+    if k * bits % 32 != 0:
+        raise ValueError(f"{bits}-bit codes of k={k} do not fill whole words")
+    # bit j of a code is bit (i * bits + j) of the row's little-endian bit stream
+    bits_arr = ((q.astype(np.uint16)[:, :, None] >> np.arange(bits, dtype=np.uint16)) & 1).astype(np.uint8)
+    flat = bits_arr.reshape(rows, k * bits)
+    packed = np.packbits(flat, axis=1, bitorder="little")
+    return packed.view(np.uint32).reshape(rows, k * bits // 32)
+
+
+def unpack_codes(words: np.ndarray, bits: int, k: int) -> np.ndarray:
+    """U32 words [rows, k*bits/32] -> uint8 codes [rows, k]."""
+    raw = words.view(np.uint8).reshape(words.shape[0], -1)
+    flat = np.unpackbits(raw, axis=1, bitorder="little")[:, : k * bits]
+    shifts = (1 << np.arange(bits, dtype=np.uint16)).astype(np.uint16)
+    return (flat.reshape(-1, k, bits) * shifts).sum(axis=2).astype(np.uint8)
 
 
 def safetensors_header(path: str) -> tuple[dict, int]:
@@ -208,12 +217,9 @@ def verify_module(model: str, index: dict, name: str, spec: dict, dst_bits: int,
     s = np.frombuffer(tensors[prefix + ".scales"][2], dtype=np.uint16).reshape(-1, k // DST_GROUP)[:limit_rows]
     b = np.frombuffer(tensors[prefix + ".biases"][2], dtype=np.uint16).reshape(-1, k // DST_GROUP)[:limit_rows]
     if dst_bits == 8:
-        codes = q.view(np.uint8).reshape(-1, k)[:limit_rows].astype(np.float32)
+        codes = unpack_codes(q, 8, k)[:limit_rows].astype(np.float32)
     else:
-        raw = q.view(np.uint8).reshape(-1, k // 2)[:limit_rows]
-        codes = np.empty((raw.shape[0], k), dtype=np.float32)
-        codes[:, 0::2] = raw & 0x0F
-        codes[:, 1::2] = raw >> 4
+        codes = unpack_codes(q, dst_bits, k)[:limit_rows].astype(np.float32)
     sf = s.view(np.uint16).astype(np.float32)
     bf = b.view(np.uint16).astype(np.float32)
     # bf16 bits -> f32
@@ -289,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     tensors: dict[str, tuple[str, tuple, bytes]] = {}
     converted: dict[str, int] = {}
     for name, spec in sorted(todo.items(), key=lambda kv: (".experts." not in kv[0], kv[0])):
-        dst_bits = 4 if ".ffn.experts." in name else 8
+        dst_bits = 3 if ".ffn.experts." in name else 8
         print(f"converting {name} -> affine-{dst_bits}/g{DST_GROUP} ...", flush=True)
         converted[name] = dst_bits
         tensors.update(convert_module(model, index, name, spec, dst_bits))
@@ -297,13 +303,16 @@ def main(argv: list[str] | None = None) -> int:
             mx, rms = verify_module(model, index, name, spec, dst_bits, tensors)
             print(f"  verify: max |diff| {mx:.6f}, rms {rms:.6f}")
 
-    # Hardlink everything, then write the new index/config and the converted shard.
+    # Hardlink the payload shards and assets, but never the two metadata files:
+    # they are rewritten below, and a hardlink would edit the source directory.
     for entry in os.listdir(model):
         src = os.path.join(model, entry)
         dst = os.path.join(out, entry)
         if os.path.exists(dst):
             continue
-        if os.path.isdir(src):
+        if entry in ("config.json", "model.safetensors.index.json"):
+            shutil.copyfile(src, dst)
+        elif os.path.isdir(src):
             shutil.copytree(src, dst)
         else:
             os.link(src, dst)
