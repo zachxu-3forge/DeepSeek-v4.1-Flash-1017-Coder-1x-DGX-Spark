@@ -75,9 +75,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0068-dsv41-moe-graphs.patch` | Preallocate the MoE scratch and let CUDA graph capture include the device-only `moe_host` |
 | `0069-dsv41-head-gemv.patch` | Replace the fp64 `_plain` head with a bf16 CUDA GEMV writing fp32 logits |`n| `0070-dsv41-splitk-gb10.patch` | Enable the existing split-K linear kernels on GB10 |
 | `0071-dsv41-expert-split8.patch` | Deepen K slices in the one-row expert GEMV |
-| `0072-dsv41-dual-affine.patch` | Fuse `wq_a` + `wkv` onto one activation quantize/group-sum pass |
+| `0072-dsv41-dual-affine.patch` | Fuse `wq_a` + `wkv` onto one activation quantize/group-sum pass |`n| `0073-dsv41-kv-norm-store-default.patch` | Make KV norm/store fusion the world-1 affine decode default |
 
-Implemented: `0001`-`0072`.
+Implemented: `0001`-`0073`.
 
 Rules:
 

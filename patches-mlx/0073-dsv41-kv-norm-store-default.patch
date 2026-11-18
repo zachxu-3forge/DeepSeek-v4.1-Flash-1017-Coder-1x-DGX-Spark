@@ -1,0 +1,11 @@
+--- a/zig/src/families/deepseek_v41/serve_knobs.zig
++++ b/zig/src/families/deepseek_v41/serve_knobs.zig
+@@ -170,7 +170,7 @@
+ 
+ /// TF_DSV41_KV_NORM_STORE=1: KV-only RMS + SWA RoPE/FP8 store, default off.
+ pub fn kvNormStore(get: Get) !bool {
+-    return @import("sys").environment.value(bool, "TF_DSV41_KV_NORM_STORE", get("TF_DSV41_KV_NORM_STORE"), false);
++    return @import("sys").environment.value(bool, "TF_DSV41_KV_NORM_STORE", get("TF_DSV41_KV_NORM_STORE"), true);
+ }
+ 
+ /// TF_DSV41_ROUTER_GROUP_ROT=1: histogram grouping + input rotation, default off.
