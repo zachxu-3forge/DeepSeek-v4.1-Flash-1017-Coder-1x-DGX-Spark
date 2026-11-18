@@ -73,9 +73,9 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0066-dsv41-gathered-experts.patch` | Gather a layer's routed experts from the device pick in three launches; cache the MoE scratch buffers |
 | `0067-dsv41-woa-block16.patch` | Compute 16 `wo_a` outputs per block, keeping the original strided per-lane summation order |
 | `0068-dsv41-moe-graphs.patch` | Preallocate the MoE scratch and let CUDA graph capture include the device-only `moe_host` |
-| `0069-dsv41-head-gemv.patch` | Replace the fp64 `_plain` head with a bf16 CUDA GEMV writing fp32 logits |
+| `0069-dsv41-head-gemv.patch` | Replace the fp64 `_plain` head with a bf16 CUDA GEMV writing fp32 logits |`n| `0070-dsv41-splitk-gb10.patch` | Enable the existing split-K linear kernels on GB10 |
 
-Implemented: `0001`-`0069`.
+Implemented: `0001`-`0070`.
 
 Rules:
 

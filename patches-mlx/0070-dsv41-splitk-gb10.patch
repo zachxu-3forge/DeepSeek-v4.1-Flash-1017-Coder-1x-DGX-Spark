@@ -1,0 +1,11 @@
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -380,7 +380,7 @@
+         a.widen_fn = try mod.function("tf_affine8_widen");
+         a.scales_fn = try pack_mod.function(symbols.pack_scales);
+         a.pdl = gb10;
+-        a.split = if (gb10) null else try Split.init(d);
++        a.split = try Split.init(d);
+         return a;
+     }
+ 
