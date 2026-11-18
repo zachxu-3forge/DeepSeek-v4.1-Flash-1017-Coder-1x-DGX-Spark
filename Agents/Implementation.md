@@ -102,8 +102,14 @@ next step.
 - **Cause:** DSpark is limited by multi-row target cost, not host overhead or a bad chain.
   The device gather fixed the old 8.46 vs 9.9 regression; the remaining issue is that 4-route
   tree verification costs ~3 plain tokens while accepting only ~2.5-3.6 tokens.
-- **Decision:** `D33`; keep drafts off. Re-evaluate after the multi-row verify path or the
-  remaining dense/`wo_a` work lowers per-row cost.
+- **Also neutral:** `TF_DSV41_GRAPH_ROWS_MAX=8/4` (16.45/16.43 tok/s), and the fused-knob
+  bundle `GREEDY_GPU + KV_NORM_STORE + ROUTER_GROUP_ROT + PREFETCH_AHEAD + EX_STACKS +
+  FORMS_INPLACE + X3LD_EPI + GM_V3` (16.55, same as baseline). Four slots without drafts
+  aggregate **20.66 tok/s**, but drafts on four slots returned HTTP 500 on one request, so
+  that configuration is not qualified.
+- **Decision:** `D33`; keep drafts off. The verify is already only ~4 rows, so this is a
+  genuine multi-row efficiency problem, not padding. Re-evaluate after the multi-row verify
+  path or the remaining dense/`wo_a` work lowers per-row cost.
 
 ### 2026-11-18 - Graph replay and the CUDA head
 
