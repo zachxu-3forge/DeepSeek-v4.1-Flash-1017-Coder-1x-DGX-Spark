@@ -77,11 +77,33 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D30 | 2026-11-17 | Keep the `wo_a` per-output summation order and only raise the block's output count to 16; reject vectorized contiguous loads | Vectorized `uint4` loads | The vectorized version reduced `wo_a` time only slightly but changed the fp32 summation order enough to fail the rule (67.9% top-1 on the fixed set). Block-16 keeps the tested order, passes 256/256 exact steps, and reaches 15.1-15.3 tok/s |
 | D31 | 2026-11-18 | Enable CUDA graph capture for decode by preallocating the MoE scratch and auditing `moe_host` as device-only | Leave graphs off | The gathered MoE has no host read or write, so replay is safe. It gave 15.3 -> 15.6 tok/s and kept the 64-token SHA `06d2679eec60`; the first window pays capture and later windows replay |
 | D32 | 2026-11-18 | Replace the fp64 Triton `_plain` head with one bf16 CUDA GEMV writing fp32 logits | Keep `_plain`, or quantize the head to affine-8 | The head is the last layer and tolerates fp32 accumulation: 99.61% top-1 / mean KL 0.000207, all eight generated SHAs unchanged, and 15.6 -> 16.6 tok/s. Quantizing the head would also reduce bytes, but this kernel needs no weight conversion |
+| D33 | 2026-11-18 | Keep `--no-drafts` as the default after the DSpark retune | Enable DSpark because acceptance is 68% | Drafts are now break-even, not slower: 16.47 vs 16.56 tok/s on the same prompt. The target verify is ~177 ms/round (~3x a 59 ms plain token) and the draft pass is ~40 ms; 3.6 claimed tokens/round is not enough to amortize both. Device draft graphs, `SPEC_DRAFT`, timed costs, and static depths 2/3/5 all measured equal or slower. Revisit after the multi-row verify or `wo_a`/dense linears are cheaper |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-18 - DSpark retune: break-even, not slower
+
+- **Image:** `tf-dsv41-mlx:dev` = `sha256:c4943a282e75`; `model-dspark`, 32K, 64-token
+  LRU, SHA `06d2679eec60` with and without drafts.
+- **Baseline:** no drafts **16.56 tok/s**. Drafts (cost depth, device draft path)
+  **16.03 / 16.47 tok/s**; 18 rounds, accepted `45/66` (68%), TTFT 0.53-0.58 s.
+- **Round phases:** `candidates` 190 ms/round (includes the target), `window` **177 ms**,
+  `draft.pass` **40 ms**, `draft.wait` 40 ms, `draft.chain` 0.05 ms. A plain token is
+  ~59 ms, so the target verify is ~3x a plain token and the draft pass adds another 0.7x;
+  ~3.6 claimed tokens/round only reaches break-even.
+- **Knobs tried, all no better:** `TF_DSV41_DRAFT_GRAPHS=1` (self-check passed: 8 passes
+  device == host, but wait stayed 40 ms); `TF_DSV41_SPEC_DRAFT=1` (spec launch 0.25 ms,
+  pass still serial); `TF_DSV41_DRAFT_TIMED=1` (same depth); static depth 2/3/5
+  (**15.2 / 14.6 / 14.6 tok/s**). The default table prices a 16-row verify at 117 ms while
+  the measured window is 177 ms, but changing depth does not recover the gap.
+- **Cause:** DSpark is limited by multi-row target cost, not host overhead or a bad chain.
+  The device gather fixed the old 8.46 vs 9.9 regression; the remaining issue is that 4-route
+  tree verification costs ~3 plain tokens while accepting only ~2.5-3.6 tokens.
+- **Decision:** `D33`; keep drafts off. Re-evaluate after the multi-row verify path or the
+  remaining dense/`wo_a` work lowers per-row cost.
 
 ### 2026-11-18 - Graph replay and the CUDA head
 
