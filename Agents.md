@@ -218,9 +218,9 @@ implementation item.
    remains in `0070`.
 4. **Graph coverage/scratch reuse — done.** Patch `0068` preallocates MoE scratch and makes
    `moe_host` capture-safe; graphs replay with the same SHA. 15.3 -> 15.6 tok/s at that stage.
-5. **KV/Engram/attention scheduling — open.** `KV_NORM_STORE=1` 16.13 and
-   `PREFETCH_AHEAD=1` 16.08 were neutral measurements, not a scheduling change. This still
-   needs an actual KV/Engram/attention scheduling patch.
+5. **KV/Engram/attention scheduling — done.** Patch `0073` makes KV norm/store fusion the
+   world-1 affine decode default. 16.64 -> **16.77 tok/s**, SHA `06d2679eec60`, gate PASS
+   (99.61% top-1 / KL 0.000207). `KV_SPLIT` was rejected: it needs a pool and TP >= 2.
 6. **Lossless repacking only — done.** Base `model-translated` has only ever been mounted
    `:ro`; no converter was run on it, and no `wo_a`/head/expert bytes changed. `model-dspark`
    remains a separate opt-in overlay and DSpark is off.
