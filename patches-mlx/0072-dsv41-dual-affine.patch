@@ -1,0 +1,115 @@
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -382,6 +382,31 @@
+         try af.linear(stream, sums, a.id, xq, try r.tensorAddr(a.y), rows, a.k, a.n);
+     }
+ 
++    /// `tf_dsv41_affine_v1.linear2(x, y0, y1, id0, id1, k, n0, n1)`: two projections
++    /// sharing one FP8 quantization and group-sum pass.
++    fn affineCall2(r: *Runner, stream: cuda.Stream, c: *const calls.Call, scratch_buf: ?cuda.DeviceBuffer) !void {
++        if (c.args.len != 8) return error.BadAffineCall;
++        const xt = switch (c.args[0].arg) { .t => |t| t, else => return error.BadAffineCall };
++        const y0 = switch (c.args[1].arg) { .t => |t| t, else => return error.BadAffineCall };
++        const y1 = switch (c.args[2].arg) { .t => |t| t, else => return error.BadAffineCall };
++        const id0: u64 = @bitCast(switch (c.args[3].arg) { .i => |v| v, else => return error.BadAffineCall });
++        const id1: u64 = @bitCast(switch (c.args[4].arg) { .i => |v| v, else => return error.BadAffineCall });
++        const k: usize = @intCast(switch (c.args[5].arg) { .i => |v| v, else => return error.BadAffineCall });
++        const n0: usize = @intCast(switch (c.args[6].arg) { .i => |v| v, else => return error.BadAffineCall });
++        const n1: usize = @intCast(switch (c.args[7].arg) { .i => |v| v, else => return error.BadAffineCall });
++        if (xt.dt != .bf16 or y0.dt != .bf16 or y1.dt != .bf16 or xt.shape.len != 2 or y0.shape.len != 2 or y1.shape.len != 2) return error.BadAffineCall;
++        const rows: usize = @intCast(xt.shape[0]);
++        const af = r.affine orelse return error.AffineNotLoaded;
++        const sb = scratch_buf orelse return error.ScratchTooSmall;
++        var scratch: rp.Scratch = .{ .ptr = sb.ptr, .len = sb.len };
++        const x = try r.tensorAddr(xt);
++        const q = try scratch.take(try std.math.mul(usize, rows, k * 2));
++        try af.act.quantFp8(stream, x, k, q, rows, k);
++        const sums = if (rows <= 16) try scratch.take(try std.math.mul(usize, rows, (k / 64) * 4)) else 0;
++        if (rows <= 16) try af.act.groupSums(stream, q, k, sums, rows, k);
++        try af.linear2(stream, sums, q, id0, try r.tensorAddr(y0), id1, try r.tensorAddr(y1), rows, k, n0, n1);
++    }
++
+     /// `tf_dsv41_affine_v1.quant(x, y, k)`: FP8 E4M3 group-32 activation round-trip.
+     fn quantCall(r: *Runner, stream: cuda.Stream, c: *const calls.Call) !void {
+         if (c.args.len != 3) return error.BadAffineCall;
+@@ -413,6 +438,7 @@
+             return g.run(g.ctx, r, c);
+         }
+         if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.linear")) return r.affineCall(stream, c, scratch_buf);
++        if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.linear2")) return r.affineCall2(stream, c, scratch_buf);
+         if (std.mem.eql(u8, c.name, "tf_dsv41_affine_v1.quant")) return r.quantCall(stream, c);
+         var arena = std.heap.ArenaAllocator.init(r.gpa);
+         defer arena.deinit();
+--- a/zig/src/families/deepseek_v41/affine_runtime.zig
++++ b/zig/src/families/deepseek_v41/affine_runtime.zig
+@@ -263,6 +263,35 @@
+             try a.wide.decode(stream, x, sums, item.tiles.an, y, rows);
+         } else try a.wide.prompt(stream, x, item.tiles.an, y, rows);
+     }
++
++    /// Two projections from one activation/group-sum pass: `x` and `sums` are already
++    /// quantized by the caller; each projection keeps its own `AffineN` GEMV and output.
++    pub fn linear2(
++        a: *const Affine,
++        stream: cuda.Stream,
++        sums: u64,
++        x: u64,
++        id0: u64,
++        y0: u64,
++        id1: u64,
++        y1: u64,
++        rows: usize,
++        k: usize,
++        n0: usize,
++        n1: usize,
++    ) !void {
++        const it0 = a.linears.getHashed(id0) orelse return error.UnknownAffine;
++        const it1 = a.linears.getHashed(id1) orelse return error.UnknownAffine;
++        if (it0.k != k or it1.k != k or it0.n != n0 or it1.n != n1 or rows == 0 or k % 64 != 0) return error.BadShape;
++        if (rows <= 16) {
++            if (sums == 0) return error.BadShape;
++            try a.wide.decode(stream, x, sums, it0.tiles.an, y0, rows);
++            try a.wide.decode(stream, x, sums, it1.tiles.an, y1, rows);
++        } else {
++            try a.wide.prompt(stream, x, it0.tiles.an, y0, rows);
++            try a.wide.prompt(stream, x, it1.tiles.an, y1, rows);
++        }
++    }
+ };
+ 
+ test "an affine name hash is stable and fits a call's integer argument" {
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -380,10 +380,31 @@
+         if (!direct) try e.glue("copy_cols", &.{ out, p.y, .{ .i = @intCast(p.col) } });
+     }
+ 
++    /// Two affine projections from one activation pass (the same x/k, direct outputs).
++    pub fn affineProj2(e: *Emitter, a: Proj, b: Proj) !void {
++        const xt = a.x.t;
++        if (a.k != b.k) return e.affineProj(a);
++        if (xt.dt != .bf16 or xt.shape.len != 2 or xt.shape[0] != e.n or xt.shape[1] != @as(i64, @intCast(a.k)) or xt.stride[0] != @as(i64, @intCast(a.k))) return e.affineProj(a);
++        if (a.col != 0 or b.col != 0 or a.y.t.stride[0] != @as(i64, @intCast(a.n)) or b.y.t.stride[0] != @as(i64, @intCast(b.n))) {
++            try e.affineProj(a);
++            return e.affineProj(b);
++        }
++        try e.ext("tf_dsv41_affine_v1.linear2", &.{
++            a.x, a.y, b.y,
++            .{ .i = @intCast(affine_linears.nameHash(a.w)) }, .{ .i = @intCast(affine_linears.nameHash(b.w)) },
++            .{ .i = @intCast(a.k) }, .{ .i = @intCast(a.n) }, .{ .i = @intCast(b.n) },
++        });
++    }
++
+     /// The projections of a fused group: affine calls one by one, else the EXL3 fused launch.
+     pub fn proj(e: *Emitter, tag: []const u8, ps: []const Proj) !void {
+         if (e.cfg.format == .affine) {
+-            for (ps) |p| try e.affineProj(p);
++            var i: usize = 0;
++            if (ps.len >= 2) {
++                try e.affineProj2(ps[0], ps[1]);
++                i = 2;
++            }
++            while (i < ps.len) : (i += 1) try e.affineProj(ps[i]);
+             return;
+         }
+         try e.fused(tag, ps);

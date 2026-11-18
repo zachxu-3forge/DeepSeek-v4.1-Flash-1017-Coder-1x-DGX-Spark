@@ -212,13 +212,15 @@ implementation item.
    GEMV (patch `0071`): 16.64 tok/s, SHA `06d2679eec60`, 99.61% top-1 / KL 0.000207.
    The speed gain is neutral but the change is verified. `EX_STACKS + X3LD_EPI` 16.18 and
    the raw one-row GEMV 13.1/64.1% were rejected.
-3. **Dense/attention linear fusion — done.** Split-K enabled on GB10 in patch `0070`:
-   16.56 -> **16.65 tok/s**, SHA `06d2679eec60`, 99.61% top-1 / KL 0.000207. The fusion
-   bundle was neutral.
+3. **Dense/attention linear fusion — done.** Patch `0072` fuses `wq_a` + `wkv` onto one
+   activation quantize/group-sum pass with two `AffineN` GEMVs. Benchmark neutral at
+   **16.64 tok/s**, SHA `06d2679eec60`, gate PASS (99.61% top-1 / KL 0.000207). Split-K
+   remains in `0070`.
 4. **Graph coverage/scratch reuse — done.** Patch `0068` preallocates MoE scratch and makes
    `moe_host` capture-safe; graphs replay with the same SHA. 15.3 -> 15.6 tok/s at that stage.
-5. **KV/Engram/attention scheduling — done.** `KV_NORM_STORE=1` 16.13, `PREFETCH_AHEAD=1`
-   16.08; both neutral versus 16.65. No kernel change shipped.
+5. **KV/Engram/attention scheduling — open.** `KV_NORM_STORE=1` 16.13 and
+   `PREFETCH_AHEAD=1` 16.08 were neutral measurements, not a scheduling change. This still
+   needs an actual KV/Engram/attention scheduling patch.
 6. **Lossless repacking only — done.** Base `model-translated` has only ever been mounted
    `:ro`; no converter was run on it, and no `wo_a`/head/expert bytes changed. `model-dspark`
    remains a separate opt-in overlay and DSpark is off.
