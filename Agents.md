@@ -198,6 +198,30 @@ Agents/Implementation.md       # progress and actual approaches
    remains a fallback.
 4. **Context target:** 32K first, then 600K with YaRN; 1M is out.
 
+## Next non-requantizing speed steps (2026-11-18)
+
+**Hard rule:** do not requantize the base GSQ/RCO checkpoint. `model-translated` weights
+(2-bit experts, 6/8-bit attention/shared experts, bf16 `wo_a`, head, embeddings, routers) stay
+byte-identical. Any lossless repack must verify max diff 0 against the source tensor before it
+is considered. DSpark stays parked and off by default.
+
+Ordered work:
+
+1. **Grouped expert execution (in progress).**
+   - Reuse the existing `tensorfold_exl3_experts_v1.group` output (`uids`, `ucount`, `members`).
+   - Gather the selected activation rows for one expert into a contiguous `M <= 16` window.
+   - Run one existing `AffineN` GEMV per selected expert instead of one row per `(token, slot)`.
+   - Scatter outputs back to the slot rows; preserve the shared-then-routed combine order.
+   - Scope: multi-row verify and multi-slot serving first; plain `n=1` decode has six unique
+     experts, so this step does not promise a C1 gain.
+   - Gate: 256-step logits rule plus the 64-token SHA; no gain counted until both pass.
+2. **M=1 expert scheduling.** Same weights, more parallel tiles or split-K across the expert K;
+   must pass the same gate and beat 16.65 tok/s.
+3. **Dense/attention linear fusion.** Fewer launches/copies with the same packed weights.
+4. **CUDA graph coverage and scratch reuse.** No numerical changes.
+5. **KV/Engram/attention scheduling.** Separate from expert math.
+6. **Lossless repacking only.** No affine/FP8 conversion of base `wo_a`, head, or experts.
+
 ## Fallback
 
 If Phase 1 shows the affine path is not tractable in the time box, switch to the source GGUF
