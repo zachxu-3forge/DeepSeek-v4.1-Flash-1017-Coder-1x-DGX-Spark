@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 2 - full model (text, DSpark, long context) |
-| Overall status | Full text at **16.6 tok/s** (32K, no drafts), 600K context, and affine DSpark on one Spark (`c4943a282e75`, patches `0001`-`0069`); affine prefill/vision next |
+| Overall status | Full text at **16.65 tok/s** (32K, no drafts), 600K context, and affine DSpark on one Spark (`2163b61b2866`, patches `0001`-`0070`); affine prefill/vision next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:c4943a282e75` (patches `0001`-`0069`) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:2163b61b2866` (patches `0001`-`0070`) |
 | Last updated | 2026-11-17 |
 
 ## Phase tracker
