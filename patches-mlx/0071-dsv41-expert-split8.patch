@@ -1,0 +1,16 @@
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -471,7 +471,12 @@
+     pub fn gatherExperts(a: *const AffineNKernels, s: Stream, x: u64, xs: u64, q: AffineN, out: u64, pick: u64, rows: usize, slots: usize, topk: usize, x_per_token: usize, expert_words: usize, expert_scales: usize) !void {
+         if (rows == 0 or topk == 0 or topk > slots or x_per_token > slots) return error.Shape;
+         const at = try widthAt(q.bits);
+-        const sk = splitK(q.n, q.k);
++        var sk = splitK(q.n, q.k);
++        // One-row decode: use the deeper K slices the tile can divide; more independent
++        // accumulator chains for the same expert bytes and the same CTA count.
++        if (rows == 1) {
++            while (sk < 8 and (q.k / 64) % (sk * 2) == 0) sk *= 2;
++        }
+         const tiles = (q.n + 63) / 64;
+         var g: launch_.Args = .{};
+         g.add(x);

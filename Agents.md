@@ -208,9 +208,10 @@ is considered. DSpark stays parked and off by default.
 Status (2026-11-18): steps 2–6 are complete as measured decisions; step 1 remains the only
 implementation item.
 
-2. **M=1 expert scheduling — done.** `EX_STACKS=1 + X3LD_EPI=1` measured 16.18 tok/s vs
-   16.65 split-K baseline; the raw one-row GEMV measured 13.1 tok/s and 64.1% top-1. Both
-   rejected. No safe M=1 scheduling win; grouped expert (step 1) is the remaining path.
+2. **M=1 expert scheduling - done.** Implemented deeper K slices in the one-row expert
+   GEMV (patch `0071`): 16.64 tok/s, SHA `06d2679eec60`, 99.61% top-1 / KL 0.000207.
+   The speed gain is neutral but the change is verified. `EX_STACKS + X3LD_EPI` 16.18 and
+   the raw one-row GEMV 13.1/64.1% were rejected.
 3. **Dense/attention linear fusion — done.** Split-K enabled on GB10 in patch `0070`:
    16.56 -> **16.65 tok/s**, SHA `06d2679eec60`, 99.61% top-1 / KL 0.000207. The fusion
    bundle was neutral.
