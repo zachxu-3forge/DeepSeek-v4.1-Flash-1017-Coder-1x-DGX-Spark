@@ -235,6 +235,24 @@ Ordered work:
    - Scope: multi-row verify and multi-slot serving first; plain `n=1` decode has six unique
      experts, so this step does not promise a C1 gain.
    - Gate: 256-step logits rule plus the 64-token SHA; no gain counted until both pass.
+
+   Kernel patch sequence:
+   - `0074`: resolve `router_group` from the router-glue module and add MoE scratch
+     `uids[u32]`, `ucount[i32]`, `members[i32, max_picks]` to `Forward.MoeScratch`.
+   - `0075`: add an affine glue step `moe_group` that runs `router_group(pick, uids,
+     ucount, members, rows, slots, experts, 16)`; run it in `moeHost` before the gathers.
+   - `0076`: add the grouped kernels and workspace:
+     `xg[Et][16][K] bf16`, `og[Et][16][N] bf16`, `slotmap[Et][16] i32`.
+     `tf_affine_gather_rows(x, xs, members, ucount, slots, k, x_slots, xg, xs_g, slotmap)`
+     copies each expert's member rows (`member = i*32 + slot`); `tf_affineN_group_gemv(
+     xg, xs_g, w,s,b, uids, ucount, k, n, maxm, og)` runs `gemv` with `M = count`.
+     `tf_affine_group_scatter(og, slotmap, n, out)` writes each grouped row back to its
+     original `(i*slots+slot)` row. Compile first, then wire only for `rows > 1`; keep the
+     current gather path for plain `n=1` until the gate is green.
+   - `0077`: scatter the grouped outputs into the existing `g/u/y` slot buffers and keep
+     the shared-first, routed-in-slot-order combine unchanged.
+   - Gate each patch with `compile-dsv41-device-host`; gate `0077` with the 256-step logits
+     comparison and 64-token benchmark. Keep only if the gate passes.
 2. **M=1 expert scheduling.** Same weights, more parallel tiles or split-K across the expert K;
    must pass the same gate and beat 16.65 tok/s.
 3. **Dense/attention linear fusion.** Fewer launches/copies with the same packed weights.
