@@ -107,6 +107,7 @@ next step.
   FORMS_INPLACE + X3LD_EPI + GM_V3` (16.55, same as baseline). Four slots without drafts
   aggregate **20.66 tok/s**, but drafts on four slots returned HTTP 500 on one request, so
   that configuration is not qualified.
+- **Also neutral:** `wo_a` block-32 (256 threads) returned 15.88/16.55 tok/s with the same SHA; reverted. `wo_a` is bandwidth-bound, not launch-bound.
 - **Decision:** `D33`; keep drafts off. The verify is already only ~4 rows, so this is a
   genuine multi-row efficiency problem, not padding. Re-evaluate after the multi-row verify
   path or the remaining dense/`wo_a` work lowers per-row cost.
