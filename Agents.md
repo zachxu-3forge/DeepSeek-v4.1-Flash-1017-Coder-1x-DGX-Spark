@@ -205,6 +205,23 @@ Agents/Implementation.md       # progress and actual approaches
 byte-identical. Any lossless repack must verify max diff 0 against the source tensor before it
 is considered. DSpark stays parked and off by default.
 
+Status (2026-11-18): steps 2–6 are complete as measured decisions; step 1 remains the only
+implementation item.
+
+2. **M=1 expert scheduling — done.** `EX_STACKS=1 + X3LD_EPI=1` measured 16.18 tok/s vs
+   16.65 split-K baseline; the raw one-row GEMV measured 13.1 tok/s and 64.1% top-1. Both
+   rejected. No safe M=1 scheduling win; grouped expert (step 1) is the remaining path.
+3. **Dense/attention linear fusion — done.** Split-K enabled on GB10 in patch `0070`:
+   16.56 -> **16.65 tok/s**, SHA `06d2679eec60`, 99.61% top-1 / KL 0.000207. The fusion
+   bundle was neutral.
+4. **Graph coverage/scratch reuse — done.** Patch `0068` preallocates MoE scratch and makes
+   `moe_host` capture-safe; graphs replay with the same SHA. 15.3 -> 15.6 tok/s at that stage.
+5. **KV/Engram/attention scheduling — done.** `KV_NORM_STORE=1` 16.13, `PREFETCH_AHEAD=1`
+   16.08; both neutral versus 16.65. No kernel change shipped.
+6. **Lossless repacking only — done.** Base `model-translated` has only ever been mounted
+   `:ro`; no converter was run on it, and no `wo_a`/head/expert bytes changed. `model-dspark`
+   remains a separate opt-in overlay and DSpark is off.
+
 Ordered work:
 
 1. **Grouped expert execution (in progress).**
