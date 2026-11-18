@@ -1,0 +1,129 @@
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -107,6 +107,36 @@
+     }
+ }
+ 
++// The dense head: 32 vocabulary columns a block, 8 lanes an output, bf16 weights in the
++// existing [n, k] layout, fp32 accumulation, fp32 logits. (The old _plain used fp64 sums.)
++extern "C" __global__ void __launch_bounds__(256) dsv41_head_gemv(const uint16_t* __restrict__ x,
++                                                                  const uint16_t* __restrict__ w,
++                                                                  float* __restrict__ out,
++                                                                  int rows, int k, int n) {
++    __shared__ __align__(16) uint16_t xs[5120];
++    const int r = blockIdx.y;
++    const uint16_t* xrow = x + (long long)r * k;
++    for (int t = threadIdx.x; t < k; t += blockDim.x) xs[t] = xrow[t];
++    __syncthreads();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int sub = lane >> 3, sl = lane & 7;
++    const int j = blockIdx.x * 32 + warp * 4 + sub;
++    if (j >= n) return;
++    const uint16_t* wr = w + (long long)j * k;
++    float acc = 0.0f;
++    for (int base = sl * 8; base < k; base += 64) {
++        const uint4 xv = *reinterpret_cast<const uint4*>(xs + base);
++        const uint4 wv = *reinterpret_cast<const uint4*>(wr + base);
++        const uint16_t* xp = reinterpret_cast<const uint16_t*>(&xv);
++        const uint16_t* wp = reinterpret_cast<const uint16_t*>(&wv);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) acc += bf(xp[i]) * bf(wp[i]);
++    }
++#pragma unroll
++    for (int off = 4; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off, 8);
++    if (sl == 0) out[(long long)r * n + j] = acc;
++}
++
+ // The affine MoE's combine: out[i, d] = shared y (slot topk) + sum_{j < topk} w[j] * y[slot j],
+ // in the host path's order. One skipped slot contributes nothing; fp32 sums, then bf16 or f32 out.
+ extern "C" __global__ void __launch_bounds__(256) dsv41_moe_combine(const uint16_t* __restrict__ y,
+--- a/zig/src/families/deepseek_v41/kernels_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_ops.zig
+@@ -233,8 +233,9 @@
+         "_ZN10dsv41_glue16widen_f32_kernelEPKtPfx",
+         "dsv41_woa_groups",
+         "dsv41_moe_combine",
++        "dsv41_head_gemv",
+     };
+-    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa, moe_combine };
++    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa, moe_combine, head_gemv };
+     /// DSpark's candidates (optional: resolved apart, so an older fatbin still loads)
+     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
+     /// the most candidates a rank (the kernel's shared sort)
+@@ -547,6 +548,7 @@
+     pub const widenF32 = glue_ops.widenF32;
+     pub const woaGroups = glue_ops.woaGroups;
+     pub const moeCombine = glue_ops.moeCombine;
++    pub const headGemv = glue_ops.headGemv;
+     pub const pfGo = glue_ops.pfGo;
+     pub const topPositions = glue_ops.topPositions;
+     pub const candKeys = glue_ops.candKeys;
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -344,6 +344,19 @@
+     try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 16), rows, 1 }, 128, 0, null, &a);
+ }
+ 
++/// The dense head: x [rows, k] bf16, w [n, k] bf16 -> logits [rows, n] f32.
++pub fn headGemv(o: Ops, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) !void {
++    if (rows == 0 or k == 0 or k > 5120 or n == 0) return error.Shape;
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(w);
++    a.add(out);
++    a.add(@as(c_int, @intCast(rows)));
++    a.add(@as(c_int, @intCast(k)));
++    a.add(@as(c_int, @intCast(n)));
++    try o.go(o.f.glue[@backingInt(glue.Kind.head_gemv)], .{ @intCast((n + 31) / 32), @intCast(rows), 1 }, 256, 0, null, &a);
++}
++
+ /// The affine MoE's combine: out [n, D] bf16/f32 = shared + weighted routed y [n*slots, D].
+ pub fn moeCombine(o: Ops, y: u64, pick: u64, wts: u64, out: u64, out_bf16: bool, n: usize, slots: usize, topk: usize, D: usize, has_shared: bool) !void {
+     if (n == 0 or D == 0 or slots == 0 or topk > slots) return error.Shape;
+--- a/zig/src/families/deepseek_v41/block.zig
++++ b/zig/src/families/deepseek_v41/block.zig
+@@ -404,24 +404,9 @@
+         return e.upstream(w, x, k, n, y);
+     }
+ 
+-    /// One dense BF16 projection: `_plain` over a whole `[n, k]` weight role.
++    /// The dense BF16 head: one CUDA GEMV over the whole `[n, k]` role, fp32 logits.
+     pub fn denseLinear(e: *Emitter, base: []const u8, x: Arg, k: i64, n: i64, y: Arg) !void {
+-        // CUDA's grid.y is 65,535: the vocabulary-sized head is launched in aligned column
+-        // chunks. The runtime `N` stays the full row stride, so the same variant serves them.
+-        const chunk: i64 = 32768;
+-        var off: i64 = 0;
+-        while (off < n) : (off += chunk) {
+-            const len = @min(chunk, n - off);
+-            const w = if (n <= chunk) try e.weight("{s}", .{base}, .bf16, &.{ n, k }) else try e.view(.{ .weight = base }, .bf16, &.{ len, k }, &.{ k, 1 }, off * k * 2);
+-            const out = if (n <= chunk) y else try e.view(y.t.role, y.t.dt, &.{ e.n, len }, &.{ n, 1 }, y.t.offset + off * @as(i64, @intCast(@import("buffers.zig").dtSize(y.t.dt))));
+-            try e.triton("_plain", .{ e.n, len, 1 }, &.{
+-                .{ .name = "X", .arg = x },                 .{ .name = "x_rs", .arg = .{ .i = k } },
+-                .{ .name = "W", .arg = w },                 .{ .name = "w_rs", .arg = .{ .i = k } },
+-                .{ .name = "OUT", .arg = out },             .{ .name = "K", .arg = .{ .i = k } },
+-                .{ .name = "N", .arg = .{ .i = n } },       .{ .name = "BK", .arg = .{ .i = 256 } },
+-                .{ .name = "PDL", .arg = .{ .b = false } }, .{ .name = "BF16", .arg = .{ .b = true } },
+-            });
+-        }
++        try e.glue("head_gemv", &.{ x, try e.weight("{s}", .{base}, .bf16, &.{ n, k }), y, .{ .i = k }, .{ .i = n } });
+     }
+ 
+     /// One BF16 block of a dense group (`wo_a` in the affine checkpoint): `_plain` over a row view
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -238,6 +238,15 @@
+         const ol: usize = @intCast(c.args[5].arg.i);
+         return k.woaGroups(try r.tensorAddr(x), @intCast(x.shape[0]), try r.tensorAddr(wt), try r.tensorAddr(out), groups, gk, ol);
+     }
++    if (std.mem.eql(u8, step, "head_gemv")) {
++        const x = c.args[0].arg.t;
++        const wt = c.args[1].arg.t;
++        const out = c.args[2].arg.t;
++        const head_k: usize = @intCast(c.args[3].arg.i);
++        const head_n: usize = @intCast(c.args[4].arg.i);
++        if (x.dt != .bf16 or wt.dt != .bf16 or out.dt != .f32 or x.shape.len != 2 or wt.shape.len != 2 or out.shape.len != 2) return error.BadGlue;
++        return k.headGemv(try r.tensorAddr(x), try r.tensorAddr(wt), try r.tensorAddr(out), @intCast(x.shape[0]), head_k, head_n);
++    }
+     if (std.mem.eql(u8, step, "moe_host")) return moeHost(f, r, c);
+     return glueMissing(step);
+ }

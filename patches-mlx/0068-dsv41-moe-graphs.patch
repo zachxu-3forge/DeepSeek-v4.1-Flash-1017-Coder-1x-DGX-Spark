@@ -1,0 +1,50 @@
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -244,9 +244,9 @@
+ 
+ /// The affine checkpoint's MoE correctness path: shared expert and each routed expert run
+ /// one row at a time through the resident `AffineN` kernels; the combine is on the host.
+-fn ensureMoeScratch(f: *Forward, r: *run.Runner, n: usize, D: usize, I: usize, slots: usize) !*fwd.MoeScratch {
++pub fn ensureMoeScratch(f: *Forward, r: *run.Runner, n: usize, D: usize, I: usize, slots: usize) !*fwd.MoeScratch {
+     if (f.moe_scratch) |s| {
+-        if (s.rows >= n and s.slots == slots) return s;
++        if (s.rows >= n and s.slots >= slots) return s;
+         s.deinit();
+         f.gpa.destroy(s);
+         f.moe_scratch = null;
+--- a/zig/src/families/deepseek_v41/forward_graph.zig
++++ b/zig/src/families/deepseek_v41/forward_graph.zig
+@@ -35,6 +35,8 @@
+         f.graphs_read = true;
+         const s = try graphs.Settings.fromEnvOr(f.graphs_default);
+         if (s.on and f.planned_rows > 0) {
++            // Capture cannot allocate: make the affine MoE scratch before the first graph.
++            _ = try fwd_glue.ensureMoeScratch(f, f.runner, @intCast(f.planned_rows), @intCast(f.cfg.hidden), @intCast(f.cfg.expert_width), @intCast(f.cfg.topk + 1));
+             const g = try f.gpa.create(Graphed);
+             errdefer f.gpa.destroy(g);
+             try g.init(f, s);
+--- a/zig/src/families/deepseek_v41/graphs.zig
++++ b/zig/src/families/deepseek_v41/graphs.zig
+@@ -93,8 +93,6 @@
+     for (cs) |c| {
+         if (!c.glue) continue;
+         if (std.mem.eql(u8, c.name, "glue.trace")) return "glue.trace downloads the streams";
+-        // The affine MoE correctness path synchronizes, downloads and uploads on the host.
+-        if (std.mem.eql(u8, c.name, "glue.moe_host")) return "glue.moe_host reads and writes the device on the host";
+     }
+     return null;
+ }
+@@ -278,11 +276,11 @@
+ 
+ // -- host tests ---------------------------------------------------------------------------------------------------
+ 
+-test "graphs: the affine host MoE is not capture-safe" {
++test "graphs: the device MoE is capture-safe" {
+     const cs = [_]calls.Call{
+         .{ .triton = false, .glue = true, .name = "glue.moe_host", .args = &.{} },
+     };
+-    try std.testing.expectEqualStrings("glue.moe_host reads and writes the device on the host", audit(&cs).?);
++    try std.testing.expectEqual(@as(?[]const u8, null), audit(&cs));
+ }
+ 
+ test "graphs: context buckets as Python's (2,048 steps to 32K, then 1.25x rounded up to 2,048)" {

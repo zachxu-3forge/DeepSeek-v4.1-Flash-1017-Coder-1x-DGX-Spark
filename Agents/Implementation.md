@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 2 - full model (text, DSpark, long context) |
-| Overall status | Full text at **15.3 tok/s** (32K, no drafts), 600K context, and affine DSpark on one Spark (`33ab95ff7381`, patches `0001`-`0067`); affine prefill/vision next |
+| Overall status | Full text at **16.6 tok/s** (32K, no drafts), 600K context, and affine DSpark on one Spark (`c4943a282e75`, patches `0001`-`0069`); affine prefill/vision next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:33ab95ff7381` (patches `0001`-`0067`) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:c4943a282e75` (patches `0001`-`0069`) |
 | Last updated | 2026-11-17 |
 
 ## Phase tracker
@@ -75,11 +75,34 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D28 | 2026-11-17 | Follow the five-step speed plan: profile, agree the correctness rule, move the MoE post-ops to the device, fuse the gathered experts, then reduce bytes; measure every step on the same 64-token LRU prompt at 32K | Continue ad-hoc kernel tuning | The `0061` profile puts ~50 ms/token in `moe_host`, so a short ordered list with gates gives a measurable path from 11.3 tok/s to the 20-30 tok/s range instead of local micro-optimizations |
 | D29 | 2026-11-17 | Keep the gathered expert launch on the existing tiled `tf_affineN_gemv` with one row per (token, routed slot), driven by the device pick | A dedicated one-row GEMV first | Reusing the tiled kernel made the gather bit-identical to the single-expert path and removed the host sync in one change (12.1 -> 14.6 tok/s). The M=1 tile still computes 16-row MMA tiles, so a dedicated raw GEMV is the next optimization, not a prerequisite |
 | D30 | 2026-11-17 | Keep the `wo_a` per-output summation order and only raise the block's output count to 16; reject vectorized contiguous loads | Vectorized `uint4` loads | The vectorized version reduced `wo_a` time only slightly but changed the fp32 summation order enough to fail the rule (67.9% top-1 on the fixed set). Block-16 keeps the tested order, passes 256/256 exact steps, and reaches 15.1-15.3 tok/s |
+| D31 | 2026-11-18 | Enable CUDA graph capture for decode by preallocating the MoE scratch and auditing `moe_host` as device-only | Leave graphs off | The gathered MoE has no host read or write, so replay is safe. It gave 15.3 -> 15.6 tok/s and kept the 64-token SHA `06d2679eec60`; the first window pays capture and later windows replay |
+| D32 | 2026-11-18 | Replace the fp64 Triton `_plain` head with one bf16 CUDA GEMV writing fp32 logits | Keep `_plain`, or quantize the head to affine-8 | The head is the last layer and tolerates fp32 accumulation: 99.61% top-1 / mean KL 0.000207, all eight generated SHAs unchanged, and 15.6 -> 16.6 tok/s. Quantizing the head would also reduce bytes, but this kernel needs no weight conversion |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-18 - Graph replay and the CUDA head
+
+- **Image:** `tf-dsv41-mlx:dev` = `sha256:c4943a282e75` (patches `0001`-`0069`).
+- **Graphs (0068):** preallocated the affine MoE scratch before `Graphed.init`; with no
+  host read left in `moe_host`, removed it from the graph audit. `TF_DSV41_GRAPHS=1` now
+  captures (15 rows, context bucket 0) and replays. Two runs: **14.998 / 15.580 tok/s**,
+  64-token SHA `06d2679eec60`.
+- **Head (0069):** the head's fp64 `_plain` launches were 11.9 ms/token. Replaced them with
+  `dsv41_head_gemv`: 32 vocabulary columns a block, 8 lanes an output, bf16 weights in the
+  existing `[n, k]` layout, fp32 logits. Two runs with graphs on: **15.984 / 16.561 tok/s**,
+  TTFT 0.53/0.49 s, SHA `06d2679eec60`.
+- **Correctness:** 8 prompts x 32 steps, trace mode (eager, so the head kernel is isolated):
+  **99.61% top-1, mean KL 0.000207, max KL 0.003486, pass**. All eight generated SHAs match
+  the host reference; the only top-1 misses are in the LRU prompt at 96.875% with no
+  sequence change.
+- **Rejected:** a raw one-row 2-bit gathered GEMV (`0068` experiment, not committed):
+  13.1 tok/s and 64.1% top-1. The subject kernel (`AffineN` MMA) remains better than the
+  scalar one-row dot product; do not revive it without a new tiling strategy.
+- **Next:** `wo_a` (14 ms) and dense affine linears (18 ms) are now the top two costs;
+  graph replay is on. Then affine-8 head/`wo_a` byte reduction, DSpark drafts, affine prefill.
 
 ### 2026-11-17 - Speed plan steps 2-3: device MoE and gathered experts
 
