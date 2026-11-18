@@ -1,0 +1,39 @@
+--- a/zig/src/families/deepseek_v41/forward.zig
++++ b/zig/src/families/deepseek_v41/forward.zig
+@@ -47,6 +47,9 @@
+     actd: cuda.DeviceBuffer,
+     sa: cuda.DeviceBuffer,
+     y: cuda.DeviceBuffer,
++    uids: cuda.DeviceBuffer,
++    ucount: cuda.DeviceBuffer,
++    members: cuda.DeviceBuffer,
+     rows: usize = 0,
+     slots: usize = 0,
+ 
+@@ -58,6 +61,9 @@
+         s.actd.free();
+         s.sa.free();
+         s.y.free();
++        s.uids.free();
++        s.ucount.free();
++        s.members.free();
+         s.* = undefined;
+     }
+ };
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -279,7 +279,13 @@
+     errdefer sa.free();
+     var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
+     errdefer y.free();
+-    s.* = .{ .xq = xq, .sx = sx, .g = g, .u = u, .actd = actd, .sa = sa, .y = y, .rows = n, .slots = slots };
++    var uids = try cuda.DeviceBuffer.alloc(r.d, 512 * 4);
++    errdefer uids.free();
++    var ucount = try cuda.DeviceBuffer.alloc(r.d, 4);
++    errdefer ucount.free();
++    var members = try cuda.DeviceBuffer.alloc(r.d, 512 * 16 * 4);
++    errdefer members.free();
++    s.* = .{ .xq = xq, .sx = sx, .g = g, .u = u, .actd = actd, .sa = sa, .y = y, .uids = uids, .ucount = ucount, .members = members, .rows = n, .slots = slots };
+     f.moe_scratch = s;
+     return s;
+ }
