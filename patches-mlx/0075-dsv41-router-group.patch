@@ -1,0 +1,51 @@
+--- a/zig/src/families/deepseek_v41/kernels_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_ops.zig
+@@ -26,6 +26,8 @@
+     topk: cuda.Function,
+     /// topk_b.cu's row-bounded twin (tf_dsv41_topk_b_v1.topk)
+     topk_b: cuda.Function,
++    /// router_glue.cu's group_rows over the affine pick
++    router_group: cuda.Function,
+     mhc: [2][mhc.instances.len]cuda.Function, // [tail][instance]
+     mhc_coef: cuda.Function,
+     mhc_pf: [mhc_pf.instances.len]cuda.Function,
+@@ -78,6 +80,7 @@
+         if (!try fitShared(f.topk, topk.symbol, topk.smem(topk.MAXEPT), optin)) return error.SharedMemoryTooSmall;
+         f.topk_b = try m_topk_b.function(topk.symbol_b);
+         if (!try fitShared(f.topk_b, topk.symbol_b, topk.smem(topk.MAXEPT), optin)) return error.SharedMemoryTooSmall;
++        f.router_group = try m_rg.function("router_group");
+         inline for (.{ false, true }, 0..) |tail, ti| inline for (0..mhc.instances.len) |i| {
+             f.mhc[ti][i] = try m_mhc.function(mhc.symbol(i, tail));
+         };
+@@ -289,6 +292,21 @@
+         try cuda.launch.launch(f, .{ .grid = .{ .x = dim(grid[0]), .y = dim(grid[1]), .z = dim(grid[2]) }, .block = .{ .x = dim(block) }, .shared = shared, .cluster = cluster }, o.s, a);
+     }
+ 
++    /// router_glue.cu's group_rows: fill uids/ucount/members for the affine pick, device only.
++    pub fn routerGroup(o: Ops, pick: u64, uids: u64, ucount: u64, members: u64, rows: usize, slots: usize, experts: usize, maxm: usize) !void {
++        if (rows == 0 or slots == 0 or experts == 0 or maxm == 0) return error.Shape;
++        var a: cuda.Args = .{};
++        a.add(pick);
++        a.add(uids);
++        a.add(ucount);
++        a.add(members);
++        a.add(@as(c_int, @intCast(rows)));
++        a.add(@as(c_int, @intCast(slots)));
++        a.add(@as(c_int, @intCast(experts)));
++        a.add(@as(c_int, @intCast(maxm)));
++        try o.go(o.f.router_group, .{ 1, 1, 1 }, 1024, 0, null, &a);
++    }
++
+     /// dsv41_attn_run_cuda: `rows` slots table given, `has_hi` window ends given, `kw` Triton k width, `split` R1 CTAs.
+     pub fn attention(o: Ops, a: attn.Args, kw: u32, rows: bool, has_hi: bool, split: u32) !void {
+         const i = try attn.instance(a, kw, rows, has_hi);
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -357,6 +357,7 @@
+ 
+     try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq, n, D);
+     try af.act.groupSums(r.stream, xq, D, sx, n, D);
++    try k.routerGroup(pick_dev, s.uids.ptr, s.ucount.ptr, s.members.ptr, n, slots, x1.experts, 16);
+     if (has_shared) for (0..n) |i| {
+         const p = i * slots + topk;
+         const xr = xq + i * D * 2;
