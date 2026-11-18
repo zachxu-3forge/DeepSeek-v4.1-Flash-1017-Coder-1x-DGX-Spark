@@ -18,13 +18,13 @@ needed. This file is the history.
 | Field | Value |
 |---|---|
 | Current phase | Phase 2 - full model (text, DSpark, long context) |
-| Overall status | Full text at 9.9 tok/s, 600K context, and affine DSpark on one Spark (`5bec44994cf6`); affine prefill/vision next |
+| Overall status | Full text at **15.3 tok/s** (32K, no drafts), 600K context, and affine DSpark on one Spark (`33ab95ff7381`, patches `0001`-`0067`); affine prefill/vision next |
 | Base engine | Upstream `main` at `26e1b074b1512d645698eba269ccfb8ebc974c10` for Phase 0; fork fallback |
 | CUDA base image | `nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c` |
 | TensorFold ref | `26e1b074b1512d645698eba269ccfb8ebc974c10` |
 | Zig version | 0.17.0 |
 | Model revision | `mbrown-uno/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-MLX` at `c2afc6bb446f612ec0791e03834cdf4f8cb05583` (recorded 2026-11-09) |
-| Container image | `tf-dsv41-mlx:dev` at `sha256:5bec44994cf6…` (patches `0001`-`0060`) |
+| Container image | `tf-dsv41-mlx:dev` at `sha256:33ab95ff7381` (patches `0001`-`0067`) |
 | Last updated | 2026-11-17 |
 
 ## Phase tracker
@@ -73,11 +73,38 @@ Status values: `Not started`, `In progress`, `Blocked`, `Done`, `Dropped`.
 | D26 | 2026-11-17 | Pack all affine experts into resident `AffineN` tiles at load and batch the MoE launches, keeping the host FP8 activation round-trip and combine order | A native gathered-affine GEMM first | Tiles are the same size as the raw stacks and remove the per-expert repack; batching removes the per-expert syncs. Host quantization/order keeps the token SHA (`7f8834716518`) identical to the tested path. Decode went 2.15 -> 9.9 tok/s; a fused gather GEMM remains for further gains |
 | D27 | 2026-11-17 | Replace exact greedy-SHA matching for speed work with: top-1 agreement >= 99% and mean KL(reference || candidate) <= 0.005, over every generated step of the eight fixed prompts in `scripts/mlx/correctness_prompts.json`; keep a frozen greedy SHA for each qualified build so later regressions are still caught | Require the old token SHA for every speed patch | Moving the MoE to the device changes summation order and activation quantization details; exact SHA would forbid the only meaningful speed path. Top-1 plus KL still catches a wrong router, expert, or combine while allowing numerically equivalent kernels. Reference capture uses patch `0062`; `scripts/mlx/compare_logits.py` is the gate |
 | D28 | 2026-11-17 | Follow the five-step speed plan: profile, agree the correctness rule, move the MoE post-ops to the device, fuse the gathered experts, then reduce bytes; measure every step on the same 64-token LRU prompt at 32K | Continue ad-hoc kernel tuning | The `0061` profile puts ~50 ms/token in `moe_host`, so a short ordered list with gates gives a measurable path from 11.3 tok/s to the 20-30 tok/s range instead of local micro-optimizations |
+| D29 | 2026-11-17 | Keep the gathered expert launch on the existing tiled `tf_affineN_gemv` with one row per (token, routed slot), driven by the device pick | A dedicated one-row GEMV first | Reusing the tiled kernel made the gather bit-identical to the single-expert path and removed the host sync in one change (12.1 -> 14.6 tok/s). The M=1 tile still computes 16-row MMA tiles, so a dedicated raw GEMV is the next optimization, not a prerequisite |
+| D30 | 2026-11-17 | Keep the `wo_a` per-output summation order and only raise the block's output count to 16; reject vectorized contiguous loads | Vectorized `uint4` loads | The vectorized version reduced `wo_a` time only slightly but changed the fp32 summation order enough to fail the rule (67.9% top-1 on the fixed set). Block-16 keeps the tested order, passes 256/256 exact steps, and reaches 15.1-15.3 tok/s |
 
 ## Work log
 
 Newest entries first. Each entry: date, phase, what was done, command, result, artifacts,
 next step.
+
+### 2026-11-17 - Speed plan steps 2-3: device MoE and gathered experts
+
+- **Image:** `tf-dsv41-mlx:dev` = `sha256:33ab95ff7381` (patches `0001`-`0067`).
+- **Device MoE post-ops (0063/0065):** FP8 activation quantization, clamped SwiGLU with
+  in-kernel group sums, and the shared+routed combine run on the device. The fast CUDA `expf`
+  differed from the host's glibc `expf` on one prompt; the kernel now recomputes exp in double
+  only when the fp32 product is within 32 ULPs of a bf16 midpoint. All eight prompts then
+  matched the frozen host reference **256/256 steps, KL 0**.
+- **Gathered experts (0066):** the routed layer reads `pick` on the device and runs gate, up,
+  and down as three launches over the resident `AffineN` tiles; gate/up and down matched the
+  single-expert path at `maxdiff=0` in the layer-0 probe. The MoE scratch buffers are cached
+  across layers, removing six allocations per layer. `moe_host` fell from 50.6 ms/token
+  (0061) to 23.9 ms/token.
+- **`wo_a` block-16 (0067):** 16 outputs per block with the original strided per-lane
+  accumulation. Exact. A vectorized contiguous-load version was rejected: 67.9% top-1.
+- **Result (64-token LRU, 32K, greedy, no drafts):** **15.1-15.3 tok/s**, TTFT 0.54-0.56 s,
+  frozen SHA `06d2679eec60`; two consecutive runs were 15.12 and 15.30 tok/s.
+- **Gate status:** step 2's top-1/KL gate passes and its 15-18 tok/s lower bound is reached.
+  Step 3's 20+ tok/s gate is not reached: the gathered kernel still executes the 16-row MMA
+  tile for one row, and `affine.linear` (18.1 ms), `wo_a` (~14 ms), and the head `_plain`
+  (11.9 ms) remain. Step 4 (quantized `wo_a`/head) is not started. Graph capture still needs
+  the `moe_host` audit removed and scratch preallocated before capture.
+- **Next:** dedicated one-row 2-bit GEMV or a bound expert-row batcher; then quantize the head
+  and `wo_a`; then enable CUDA graphs and re-run the 600K/guard qualification.
 
 ### 2026-11-17 - Speed plan step 0/1: profile and correctness rule
 

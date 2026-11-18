@@ -68,8 +68,12 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0061-dsv41-fused-woa.patch` | Fuse wo_a's eight block-diagonal BF16 groups into one glue kernel (removes 8 launches a layer) |
 | `0062-dsv41-logits-trace.patch` | Number every decode step's head-logits trace so the correctness rule can score a whole request |
 | `0063-dsv41-device-moe-post.patch` | Keep activation FP8 quantization, clamped SwiGLU, and the shared+routed combine on the device |
+| `0064-dsv41-moe-host-controls.patch` | Temporary per-post-op host fallbacks used to bisect the one-prompt SwiGLU mismatch |
+| `0065-swiglu-near-midpoint.patch` | Recompute SwiGLU's exp in double only when the fp32 product is within 32 ULPs of a bf16 midpoint (exact host parity) |
+| `0066-dsv41-gathered-experts.patch` | Gather a layer's routed experts from the device pick in three launches; cache the MoE scratch buffers |
+| `0067-dsv41-woa-block16.patch` | Compute 16 `wo_a` outputs per block, keeping the original strided per-lane summation order |
 
-Implemented: `0001`-`0063`.
+Implemented: `0001`-`0067`.
 
 Rules:
 

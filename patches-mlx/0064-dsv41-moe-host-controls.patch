@@ -1,0 +1,106 @@
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -10,6 +10,7 @@
+ const hooks = @import("forward_hooks.zig");
+ const named = @import("named.zig");
+ const affine_linears = @import("affine_linears.zig");
++const act_quant = @import("act_quant.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -294,6 +295,10 @@
+     const ig = I / 64;
+     if (D % 64 != 0 or I % 64 != 0) return error.BadGlue;
+     const P = n * slots;
++    // Comparison controls: put exactly one post-op back on the host (default: all device).
++    const host_quant = std.c.getenv("TF_DSV41_MOE_HOST_QUANT") != null;
++    const host_swiglu = std.c.getenv("TF_DSV41_MOE_HOST_SWIGLU") != null;
++    const host_combine = std.c.getenv("TF_DSV41_MOE_HOST_COMBINE") != null;
+ 
+     // The activation's FP8 round-trip, the routed GLU, and the combine stay on the device. The only
+     // host round trip left is the router's pick/weights, needed to issue the per-expert launches.
+@@ -312,7 +317,15 @@
+     var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
+     defer y.free();
+ 
+-    try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
++    if (host_quant) {
++        const xb = try f.gpa.alloc(u8, n * D * 2);
++        defer f.gpa.free(xb);
++        const xqb = try f.gpa.alloc(u8, n * D * 2);
++        defer f.gpa.free(xqb);
++        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
++        for (0..n) |i| try act_quant.quantizeRow(xb[i * D * 2 ..][0 .. D * 2], xqb[i * D * 2 ..][0 .. D * 2], @intCast(D));
++        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = xq.ptr, .len = xqb.len }, 0, xqb);
++    } else try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
+     try af.act.groupSums(r.stream, xq.ptr, D, sx.ptr, n, D);
+     for (0..n) |i| {
+         for (0..slots) |j| {
+@@ -336,8 +349,23 @@
+         }
+     }
+ 
+-    // The host's clamp and exact division, the same bf16 row and its group sums.
+-    try af.act.swigluClamp(r.stream, g.ptr, I, u.ptr, I, actd.ptr, sa.ptr, P, I, limit);
++    if (host_swiglu) {
++        try r.stream.synchronize();
++        const gb = try f.gpa.alloc(u8, P * I * 2);
++        defer f.gpa.free(gb);
++        const ub = try f.gpa.alloc(u8, P * I * 2);
++        defer f.gpa.free(ub);
++        const ab = try f.gpa.alloc(u8, P * I * 2);
++        defer f.gpa.free(ab);
++        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = g.ptr, .len = gb.len }, 0, gb);
++        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = u.ptr, .len = ub.len }, 0, ub);
++        for (0..P) |p| try swigluRow(gb[p * I * 2 ..][0 .. I * 2], ub[p * I * 2 ..][0 .. I * 2], ab[p * I * 2 ..][0 .. I * 2], limit);
++        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = actd.ptr, .len = ab.len }, 0, ab);
++        try af.act.groupSums(r.stream, actd.ptr, I, sa.ptr, P, I);
++    } else {
++        // The host's clamp and exact division, the same bf16 row and its group sums.
++        try af.act.swigluClamp(r.stream, g.ptr, I, u.ptr, I, actd.ptr, sa.ptr, P, I, limit);
++    }
+ 
+     for (0..n) |i| {
+         for (0..slots) |j| {
+@@ -359,8 +387,39 @@
+         }
+     }
+ 
+-    // Shared first, then the routed slots in order, all on the device.
+-    try k.moeCombine(y.ptr, try r.tensorAddr(pick), try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
++    if (host_combine) {
++        try r.stream.synchronize();
++        const yb = try f.gpa.alloc(u8, P * D * 2);
++        defer f.gpa.free(yb);
++        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = y.ptr, .len = yb.len }, 0, yb);
++        const acc = try f.gpa.alloc(f32, n * D);
++        defer f.gpa.free(acc);
++        @memset(acc, 0);
++        for (0..n) |i| {
++            // the host path added the shared expert first, then the routed slots: keep that order
++            if (has_shared) {
++                const p = i * slots + topk;
++                for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
++            }
++            for (0..topk) |j| {
++                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
++                if (e < 0) continue;
++                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
++                if (w == 0) continue;
++                const p = i * slots + j;
++                for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
++            }
++        }
++        if (out.dt == .bf16) {
++            const half = try f.gpa.alloc(u8, n * D * 2);
++            defer f.gpa.free(half);
++            for (acc, 0..) |v, i| std.mem.writeInt(u16, half[2 * i ..][0..2], named.bf16Round(v), .little);
++            try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = half.len }, 0, half);
++        } else try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = std.mem.sliceAsBytes(acc).len }, 0, std.mem.sliceAsBytes(acc));
++    } else {
++        // Shared first, then the routed slots in order, all on the device.
++        try k.moeCombine(y.ptr, try r.tensorAddr(pick), try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
++    }
+ }
+ 
+ fn swigluRow(gate: []const u8, up: []const u8, out: []u8, limit: f32) !void {

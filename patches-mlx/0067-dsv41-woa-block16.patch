@@ -1,0 +1,57 @@
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -85,23 +85,26 @@
+                                                                   const uint16_t* __restrict__ w,
+                                                                   uint16_t* __restrict__ out,
+                                                                   int g, int gk, int ol) {
+-    __shared__ uint16_t xs[4096];
+-    const int per = 4;                  // outputs a block
++    __shared__ __align__(16) uint16_t xs[4096];
++    const int per = 16;                 // outputs a block
+     const int tiles = ol / per;
+     const int grp = blockIdx.x / tiles;
+     const int tile = blockIdx.x - grp * tiles;
+     const int warp = threadIdx.x >> 5;
+     const int lane = threadIdx.x & 31;
+-    const int j = tile * per + warp;
+     const int r = blockIdx.y;
+     const uint16_t* xr = x + ((long long)r * g + grp) * gk;
+-    const uint16_t* wr = w + ((long long)grp * ol + j) * gk;
+     for (int k = threadIdx.x; k < gk; k += blockDim.x) xs[k] = xr[k];
+     __syncthreads();
+-    float acc = 0.0f;
+-    for (int k = lane; k < gk; k += 32) acc += bf(xs[k]) * bf(wr[k]);
+-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+-    if (lane == 0) out[(long long)r * g * ol + grp * ol + j] = to_bf(acc);
++#pragma unroll
++    for (int q = 0; q < 4; ++q) {
++        const int j = tile * per + warp * 4 + q;
++        const uint16_t* wr = w + ((long long)grp * ol + j) * gk;
++        float acc = 0.0f;
++        for (int k = lane; k < gk; k += 32) acc += bf(xs[k]) * bf(wr[k]);
++        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
++        if (lane == 0) out[(long long)r * g * ol + grp * ol + j] = to_bf(acc);
++    }
+ }
+ 
+ // The affine MoE's combine: out[i, d] = shared y (slot topk) + sum_{j < topk} w[j] * y[slot j],
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -332,7 +332,7 @@
+ 
+ /// wo_a's groups in one launch: x [rows, g*gk], w [g*ol, gk] -> out [rows, g*ol], bf16, fp32 sums.
+ pub fn woaGroups(o: Ops, x: u64, rows: usize, w: u64, out: u64, g: usize, gk: usize, ol: usize) !void {
+-    if (rows == 0 or g == 0 or gk == 0 or gk > 4096 or ol % 4 != 0) return error.Shape;
++    if (rows == 0 or g == 0 or gk == 0 or gk > 4096 or gk % 8 != 0 or ol % 16 != 0) return error.Shape;
+     var a: cuda.Args = .{};
+     a.add(x);
+     a.add(@as(c_int, @intCast(rows)));
+@@ -341,7 +341,7 @@
+     a.add(@as(c_int, @intCast(g)));
+     a.add(@as(c_int, @intCast(gk)));
+     a.add(@as(c_int, @intCast(ol)));
+-    try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 4), rows, 1 }, 128, 0, null, &a);
++    try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 16), rows, 1 }, 128, 0, null, &a);
+ }
+ 
+ /// The affine MoE's combine: out [n, D] bf16/f32 = shared + weighted routed y [n*slots, D].

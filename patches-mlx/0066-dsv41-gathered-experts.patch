@@ -1,0 +1,397 @@
+--- a/zig/kernels/cuda/affine8.cu
++++ b/zig/kernels/cuda/affine8.cu
+@@ -316,6 +316,34 @@
+ TF_AFFINE_NARROW(6)
+ #undef TF_AFFINE_NARROW
+ 
++// A layer's routed experts in one launch: blockIdx.y is one (row, slot) pair, whose expert id
++// comes from `pick` on the device. Each pair runs the same M=1 tiled GEMV as `tf_affineN_gemv`,
++// with its expert's tile bases; `slots` is pick's row stride and `topk` the routed slots.
++#define TF_AFFINE_EXPERT_GATHER(B)                                                                                                  \
++    extern "C" __global__ void __launch_bounds__(128) tf_affine##B##_experts(                                                       \
++        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const uint32_t* __restrict__ w,                         \
++        const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases,                                        \
++        __nv_bfloat16* __restrict__ out, const int* __restrict__ pick, int slots, int topk, int x_slots, int k, int ldx,           \
++        int n, int npad, int sk, int tiles, long long expert_words, long long expert_scales) {                                     \
++        const int p = blockIdx.y, i = p / topk, j = p - i * topk;                                                                  \
++        const int e = pick[i * slots + j];                                                                                         \
++        if (e < 0) return;                                                                                                         \
++        tf_affine8::Part P;                                                                                                        \
++        P.w = w + static_cast<size_t>(e) * expert_words;                                                                           \
++        P.scales = scales + static_cast<size_t>(e) * expert_scales;                                                               \
++        P.biases = biases + static_cast<size_t>(e) * expert_scales;                                                               \
++        P.out = out + static_cast<size_t>(i * slots + j) * n;                                                                      \
++        P.n = n; P.npad = npad; P.sk = sk; P.tiles = tiles;                                                                        \
++        const int xr = x_slots ? i * slots + j : i;                                                                                \
++        tf_affine8::gemv<64, 64, 6, B>(x + static_cast<size_t>(xr) * ldx, xs + static_cast<size_t>(xr) * (k / 64), P, 1, k, ldx);  \
++    }
++TF_AFFINE_EXPERT_GATHER(2)
++TF_AFFINE_EXPERT_GATHER(3)
++TF_AFFINE_EXPERT_GATHER(5)
++TF_AFFINE_EXPERT_GATHER(6)
++TF_AFFINE_EXPERT_GATHER(8)
++#undef TF_AFFINE_EXPERT_GATHER
++
+ // MLX words of 2, 3, 5 or 6 bits -> narrow tiles: a lane's pairs' first codes in low halves, second in high.
+ extern "C" __global__ void tf_affinen_pack(const uint32_t* __restrict__ w, int bits, int n, int kw, int kg, uint32_t* __restrict__ out,
+                                            long long total) {
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -349,6 +349,7 @@
+     gemv_fns: [tile_widths.len]Function,
+     split_fns: [tile_widths.len]Function,
+     prefill_fns: [tile_widths.len]Function,
++    gather_fns: [tile_widths.len]Function, // one launch over a layer's routed experts
+     pack4_fn: Function, // MLX codes of 2 to 4 bits into the affine-4 tiles
+     pack8_fn: Function, // MLX codes of 5 to 8 bits into the 8-bit tiles
+     packn_fn: Function, // MLX codes of 2, 3, 5 or 6 bits into tiles of that width
+@@ -361,14 +362,16 @@
+     /// From loaded affine8, affine_prefill and affine4_pack modules; GB10 decodes without the split form.
+     pub fn resolve(d: *const Driver, mod: Module, prefill_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !AffineNKernels {
+         var a: AffineNKernels = undefined;
+-        for (tile_widths, &a.gemv_fns, &a.split_fns, &a.prefill_fns, &a.gemv_blocks) |bits, *g, *sp, *pf, *blocks| {
++        for (tile_widths, &a.gemv_fns, &a.split_fns, &a.prefill_fns, &a.gather_fns, &a.gemv_blocks) |bits, *g, *sp, *pf, *ga, *blocks| {
+             var name: [32]u8 = undefined;
+             g.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_gemv", .{bits}, 0));
+             sp.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_split", .{bits}, 0));
+             pf.* = try prefill_mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_prefill", .{bits}, 0));
++            ga.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_experts", .{bits}, 0));
+             try g.allowDynamicShared(gemvSmem(bits));
+             try sp.allowDynamicShared(splitSmem(bits));
+             try pf.allowDynamicShared(prefillSmem(bits));
++            try ga.allowDynamicShared(gemvSmem(bits));
+             blocks.* = @max(1, try g.occupancy(128, gemvSmem(bits))) * sms;
+         }
+         a.pack4_fn = try mod.function("tf_affine8_pack4");
+@@ -462,6 +465,34 @@
+         try launch_.launch(a.gemv_fns[at], cfg, s, &g);
+     }
+ 
++    /// One layer's routed experts from a device pick: x (rows, k), out (rows*slots, n), one entry a
++    /// (token, routed slot); `pick` is [rows, slots] int32. `x_per_token` is 0 when every slot reads
++    /// the token row (gate/up), or `slots` when each slot reads its own `p = i*slots+j` row (down).
++    pub fn gatherExperts(a: *const AffineNKernels, s: Stream, x: u64, xs: u64, q: AffineN, out: u64, pick: u64, rows: usize, slots: usize, topk: usize, x_per_token: usize, expert_words: usize, expert_scales: usize) !void {
++        if (rows == 0 or topk == 0 or topk > slots or x_per_token > slots) return error.Shape;
++        const at = try widthAt(q.bits);
++        const sk = splitK(q.n, q.k);
++        const tiles = (q.n + 63) / 64;
++        var g: launch_.Args = .{};
++        g.add(x);
++        g.add(xs);
++        g.add(q.w);
++        g.add(q.s);
++        g.add(q.b);
++        g.add(out);
++        g.add(pick);
++        for ([_]usize{ slots, topk, x_per_token, q.k, q.k, q.n, q.npad, sk, tiles }) |v| g.add(int(v));
++        g.add(@as(c_longlong, @intCast(expert_words)));
++        g.add(@as(c_longlong, @intCast(expert_scales)));
++        const cfg: launch_.Config = .{
++            .grid = .{ .x = @intCast(@min(tiles, a.gemv_blocks[at])), .y = @intCast(rows * topk) },
++            .block = .{ .x = 128 },
++            .shared = gemvSmem(q.bits),
++            .pdl = a.pdl,
++        };
++        try launch_.launch(a.gather_fns[at], cfg, s, &g);
++    }
++
+     /// Prompt rows x (rows, k) -> out (rows, n), bf16: Affine4Kernels.prompt's blocks and bands over AffineN's tiles.
+     pub fn prompt(a: *const AffineNKernels, s: Stream, x: u64, q: AffineN, out: u64, rows: usize) !void {
+         const at = try widthAt(q.bits);
+--- a/zig/src/families/deepseek_v41/forward.zig
++++ b/zig/src/families/deepseek_v41/forward.zig
+@@ -37,6 +37,31 @@
+     ced: ft.Stash = .{},
+ };
+ 
++/// The affine MoE's device scratch: reused by every layer and every window, so a decode
++/// step allocates only when a wider row bucket arrives.
++pub const MoeScratch = struct {
++    xq: cuda.DeviceBuffer,
++    sx: cuda.DeviceBuffer,
++    g: cuda.DeviceBuffer,
++    u: cuda.DeviceBuffer,
++    actd: cuda.DeviceBuffer,
++    sa: cuda.DeviceBuffer,
++    y: cuda.DeviceBuffer,
++    rows: usize = 0,
++    slots: usize = 0,
++
++    pub fn deinit(s: *MoeScratch) void {
++        s.xq.free();
++        s.sx.free();
++        s.g.free();
++        s.u.free();
++        s.actd.free();
++        s.sa.free();
++        s.y.free();
++        s.* = undefined;
++    }
++};
++
+ pub const Forward = struct {
+     gpa: std.mem.Allocator,
+     cfg: *const Config,
+@@ -60,6 +85,8 @@
+     rows_stage: [eh.max_layers]hs.Stage = @splat(.{}), // Engram's own pinned staging, one a layer (copies may overlap)
+     /// a bf16 [rows, hidden] send buffer for the exchanges whose partial is not bf16 already (embedding, MoE)
+     send: ?cuda.DeviceBuffer = null,
++    /// the affine MoE's cached device scratch (g/u/actd/y and their group sums)
++    moe_scratch: ?*MoeScratch = null,
+     /// the window's token ids (the embedding step reads them; window() copies them into ids_own)
+     ids: []const u32 = &.{},
+     /// TF_DSV41_IMAGES=native (vision_rows.zig): every rank keeps image positions out of Engram; rank 0's image rows
+@@ -171,6 +198,10 @@
+         if (f.dev_ids) |*b| b.free();
+         if (f.send) |*b| b.free();
+         if (f.gathered) |*b| b.free();
++        if (f.moe_scratch) |s| {
++            s.deinit();
++            f.gpa.destroy(s);
++        }
+         if (f.prefill_state != null) hooks.set.prefill.?.deinit(f);
+         f.calib_marks.deinit(f.gpa);
+         if (f.gate) |x| hooks.set.gate.?.close(x);
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -10,7 +10,6 @@
+ const hooks = @import("forward_hooks.zig");
+ const named = @import("named.zig");
+ const affine_linears = @import("affine_linears.zig");
+-const act_quant = @import("act_quant.zig");
+ const Error = fwd.Error;
+ const Forward = fwd.Forward;
+ 
+@@ -245,6 +244,37 @@
+ 
+ /// The affine checkpoint's MoE correctness path: shared expert and each routed expert run
+ /// one row at a time through the resident `AffineN` kernels; the combine is on the host.
++fn ensureMoeScratch(f: *Forward, r: *run.Runner, n: usize, D: usize, I: usize, slots: usize) !*fwd.MoeScratch {
++    if (f.moe_scratch) |s| {
++        if (s.rows >= n and s.slots == slots) return s;
++        s.deinit();
++        f.gpa.destroy(s);
++        f.moe_scratch = null;
++    }
++    const s = try f.gpa.create(fwd.MoeScratch);
++    errdefer f.gpa.destroy(s);
++    const dg = D / 64;
++    const ig = I / 64;
++    const P = n * slots;
++    var xq = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
++    errdefer xq.free();
++    var sx = try cuda.DeviceBuffer.alloc(r.d, n * dg * 4);
++    errdefer sx.free();
++    var g = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer g.free();
++    var u = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer u.free();
++    var actd = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer actd.free();
++    var sa = try cuda.DeviceBuffer.alloc(r.d, P * ig * 4);
++    errdefer sa.free();
++    var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
++    errdefer y.free();
++    s.* = .{ .xq = xq, .sx = sx, .g = g, .u = u, .actd = actd, .sa = sa, .y = y, .rows = n, .slots = slots };
++    f.moe_scratch = s;
++    return s;
++}
++
+ fn moeHost(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+     const af = r.affine orelse return error.AffineNotLoaded;
+     const k = r.kernels.others(r.stream);
+@@ -261,14 +291,6 @@
+     if (x.dt != .bf16 or (out.dt != .f32 and out.dt != .bf16)) return error.BadGlue;
+     if (pick.shape[0] != n or pick.shape[1] != slots or wts.shape[0] != n or wts.shape[1] != slots or out.shape[0] != n or out.shape[1] != D) return error.BadGlue;
+ 
+-    try r.stream.synchronize();
+-    const pb = try f.gpa.alloc(u8, n * slots * 4);
+-    defer f.gpa.free(pb);
+-    const wb = try f.gpa.alloc(u8, n * slots * 4);
+-    defer f.gpa.free(wb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(pick), .len = pb.len }, 0, pb);
+-    try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(wts), .len = wb.len }, 0, wb);
+-
+     var b1: [96]u8 = undefined;
+     var b2: [96]u8 = undefined;
+     var b3: [96]u8 = undefined;
+@@ -294,132 +316,55 @@
+     const dg = D / 64;
+     const ig = I / 64;
+     if (D % 64 != 0 or I % 64 != 0) return error.BadGlue;
+-    const P = n * slots;
+-    // Comparison controls: put exactly one post-op back on the host (default: all device).
+-    const host_quant = std.c.getenv("TF_DSV41_MOE_HOST_QUANT") != null;
+-    const host_swiglu = std.c.getenv("TF_DSV41_MOE_HOST_SWIGLU") != null;
+-    const host_combine = std.c.getenv("TF_DSV41_MOE_HOST_COMBINE") != null;
+-
+-    // The activation's FP8 round-trip, the routed GLU, and the combine stay on the device. The only
+-    // host round trip left is the router's pick/weights, needed to issue the per-expert launches.
+-    var xq = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
+-    defer xq.free();
+-    var sx = try cuda.DeviceBuffer.alloc(r.d, n * dg * 4);
+-    defer sx.free();
+-    var g = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
+-    defer g.free();
+-    var u = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
+-    defer u.free();
+-    var actd = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
+-    defer actd.free();
+-    var sa = try cuda.DeviceBuffer.alloc(r.d, P * ig * 4);
+-    defer sa.free();
+-    var y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
+-    defer y.free();
+-
+-    if (host_quant) {
+-        const xb = try f.gpa.alloc(u8, n * D * 2);
+-        defer f.gpa.free(xb);
+-        const xqb = try f.gpa.alloc(u8, n * D * 2);
+-        defer f.gpa.free(xqb);
+-        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(x), .len = xb.len }, 0, xb);
+-        for (0..n) |i| try act_quant.quantizeRow(xb[i * D * 2 ..][0 .. D * 2], xqb[i * D * 2 ..][0 .. D * 2], @intCast(D));
+-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = xq.ptr, .len = xqb.len }, 0, xqb);
+-    } else try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq.ptr, n, D);
+-    try af.act.groupSums(r.stream, xq.ptr, D, sx.ptr, n, D);
+-    for (0..n) |i| {
+-        for (0..slots) |j| {
+-            const p = i * slots + j;
+-            const xr = xq.ptr + i * D * 2;
+-            const sr = sx.ptr + i * dg * 4;
+-            if (j == topk) {
+-                if (!has_shared) continue;
+-                try af.linear(r.stream, sr, affine_linears.nameHash(sh1), xr, g.ptr + p * I * 2, 1, D, I);
+-                try af.linear(r.stream, sr, affine_linears.nameHash(sh3), xr, u.ptr + p * I * 2, 1, D, I);
+-            } else {
+-                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-                if (e < 0) continue;
+-                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-                if (w == 0) continue;
+-                const ei: usize = @intCast(e);
+-                if (ei >= x1.tiles.views.len or ei >= x3.tiles.views.len) return error.UnknownAffine;
+-                try af.wide.decode(r.stream, xr, sr, x1.tiles.views[ei], g.ptr + p * I * 2, 1);
+-                try af.wide.decode(r.stream, xr, sr, x3.tiles.views[ei], u.ptr + p * I * 2, 1);
+-            }
+-        }
+-    }
+ 
+-    if (host_swiglu) {
+-        try r.stream.synchronize();
+-        const gb = try f.gpa.alloc(u8, P * I * 2);
+-        defer f.gpa.free(gb);
+-        const ub = try f.gpa.alloc(u8, P * I * 2);
+-        defer f.gpa.free(ub);
+-        const ab = try f.gpa.alloc(u8, P * I * 2);
+-        defer f.gpa.free(ab);
+-        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = g.ptr, .len = gb.len }, 0, gb);
+-        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = u.ptr, .len = ub.len }, 0, ub);
+-        for (0..P) |p| try swigluRow(gb[p * I * 2 ..][0 .. I * 2], ub[p * I * 2 ..][0 .. I * 2], ab[p * I * 2 ..][0 .. I * 2], limit);
+-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = actd.ptr, .len = ab.len }, 0, ab);
+-        try af.act.groupSums(r.stream, actd.ptr, I, sa.ptr, P, I);
+-    } else {
+-        // The host's clamp and exact division, the same bf16 row and its group sums.
+-        try af.act.swigluClamp(r.stream, g.ptr, I, u.ptr, I, actd.ptr, sa.ptr, P, I, limit);
+-    }
+-
+-    for (0..n) |i| {
+-        for (0..slots) |j| {
+-            const p = i * slots + j;
+-            const ar = actd.ptr + p * I * 2;
+-            const sar = sa.ptr + p * ig * 4;
+-            if (j == topk) {
+-                if (!has_shared) continue;
+-                try af.linear(r.stream, sar, affine_linears.nameHash(sh2), ar, y.ptr + p * D * 2, 1, I, D);
+-            } else {
+-                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-                if (e < 0) continue;
+-                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-                if (w == 0) continue;
+-                const ei: usize = @intCast(e);
+-                if (ei >= x2.tiles.views.len) return error.UnknownAffine;
+-                try af.wide.decode(r.stream, ar, sar, x2.tiles.views[ei], y.ptr + p * D * 2, 1);
+-            }
+-        }
+-    }
++    const t1 = x1.tiles;
++    const t3 = x3.tiles;
++    const t2 = x2.tiles;
++    if (t1.views.len == 0 or t3.views.len == 0 or t2.views.len == 0) return error.UnknownAffine;
++    const q1 = t1.views[0];
++    const q3 = t3.views[0];
++    const q2 = t2.views[0];
++    const l1 = cuda.qlinear.AffineN.layout(q1.n, q1.k, q1.bits);
++    const l3 = cuda.qlinear.AffineN.layout(q3.n, q3.k, q3.bits);
++    const l2 = cuda.qlinear.AffineN.layout(q2.n, q2.k, q2.bits);
++    const pick_dev = try r.tensorAddr(pick);
++
++    // One scratch set for every layer and window: the activation's FP8 round-trip, the routed
++    // GLU, the experts, and the combine all stay on the device.
++    const s = try ensureMoeScratch(f, r, n, D, I, slots);
++    const xq = s.xq.ptr;
++    const sx = s.sx.ptr;
++    const g = s.g.ptr;
++    const u = s.u.ptr;
++    const actd = s.actd.ptr;
++    const sa = s.sa.ptr;
++    const y = s.y.ptr;
++
++    try af.act.quantFp8(r.stream, try r.tensorAddr(x), D, xq, n, D);
++    try af.act.groupSums(r.stream, xq, D, sx, n, D);
++    if (has_shared) for (0..n) |i| {
++        const p = i * slots + topk;
++        const xr = xq + i * D * 2;
++        const sr = sx + i * dg * 4;
++        try af.linear(r.stream, sr, affine_linears.nameHash(sh1), xr, g + p * I * 2, 1, D, I);
++        try af.linear(r.stream, sr, affine_linears.nameHash(sh3), xr, u + p * I * 2, 1, D, I);
++    };
++    try af.wide.gatherExperts(r.stream, xq, sx, q1, g, pick_dev, n, slots, topk, 0, l1.words / 4, l1.scales / 2);
++    try af.wide.gatherExperts(r.stream, xq, sx, q3, u, pick_dev, n, slots, topk, 0, l3.words / 4, l3.scales / 2);
++
++    // The host's clamp, exact division, and near-midpoint double-exp fallback in one kernel.
++    try af.act.swigluClamp(r.stream, g, I, u, I, actd, sa, n * slots, I, limit);
++
++    if (has_shared) for (0..n) |i| {
++        const p = i * slots + topk;
++        const ar = actd + p * I * 2;
++        const sar = sa + p * ig * 4;
++        try af.linear(r.stream, sar, affine_linears.nameHash(sh2), ar, y + p * D * 2, 1, I, D);
++    };
++    try af.wide.gatherExperts(r.stream, actd, sa, q2, y, pick_dev, n, slots, topk, slots, l2.words / 4, l2.scales / 2);
+ 
+-    if (host_combine) {
+-        try r.stream.synchronize();
+-        const yb = try f.gpa.alloc(u8, P * D * 2);
+-        defer f.gpa.free(yb);
+-        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = y.ptr, .len = yb.len }, 0, yb);
+-        const acc = try f.gpa.alloc(f32, n * D);
+-        defer f.gpa.free(acc);
+-        @memset(acc, 0);
+-        for (0..n) |i| {
+-            // the host path added the shared expert first, then the routed slots: keep that order
+-            if (has_shared) {
+-                const p = i * slots + topk;
+-                for (0..D) |d| acc[i * D + d] += named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-            }
+-            for (0..topk) |j| {
+-                const e = std.mem.readInt(i32, pb[(i * slots + j) * 4 ..][0..4], .little);
+-                if (e < 0) continue;
+-                const w: f32 = @bitCast(std.mem.readInt(u32, wb[(i * slots + j) * 4 ..][0..4], .little));
+-                if (w == 0) continue;
+-                const p = i * slots + j;
+-                for (0..D) |d| acc[i * D + d] += w * named.bf16Widen(std.mem.readInt(u16, yb[2 * (p * D + d) ..][0..2], .little));
+-            }
+-        }
+-        if (out.dt == .bf16) {
+-            const half = try f.gpa.alloc(u8, n * D * 2);
+-            defer f.gpa.free(half);
+-            for (acc, 0..) |v, i| std.mem.writeInt(u16, half[2 * i ..][0..2], named.bf16Round(v), .little);
+-            try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = half.len }, 0, half);
+-        } else try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = try r.tensorAddr(out), .len = std.mem.sliceAsBytes(acc).len }, 0, std.mem.sliceAsBytes(acc));
+-    } else {
+-        // Shared first, then the routed slots in order, all on the device.
+-        try k.moeCombine(y.ptr, try r.tensorAddr(pick), try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
+-    }
++    // Shared first, then the routed slots in order.
++    try k.moeCombine(y, pick_dev, try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
+ }
+ 
+ fn swigluRow(gate: []const u8, up: []const u8, out: []u8, limit: f32) !void {

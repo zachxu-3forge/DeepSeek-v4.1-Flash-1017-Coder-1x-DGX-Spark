@@ -1,0 +1,43 @@
+--- a/zig/kernels/cuda/act_rows.cu
++++ b/zig/kernels/cuda/act_rows.cu
+@@ -45,8 +45,27 @@
+     }
+ }
+ 
++// The fp32 product is this close to a bf16 midpoint (in fp32 ULPs): CUDA expf's last bit
++// could choose the other bf16, so the clamped GLU recomputes exp in double there.
++__device__ __forceinline__ bool tf_near_bf16_mid(float y) {
++    const uint32_t bits = __float_as_uint(y);
++    if ((bits & 0x7f800000u) == 0x7f800000u) return false;
++    const uint32_t low = bits & 0xffffu;
++    const uint32_t d = low >= 0x8000u ? low - 0x8000u : 0x8000u - low;
++    const uint32_t wrap = 0x10000u - d;
++    return d < 32u || wrap < 32u;
++}
++
++__device__ __forceinline__ float tf_swiglu_one(float g, float u, float limit, bool exact) {
++    const float a = fminf(g, limit);
++    const float ef = exact ? static_cast<float>(exp(static_cast<double>(-a))) : expf(-a);
++    const float s = __fdiv_rn(a, __fadd_rn(1.0f, ef));
++    return __fmul_rn(s, fminf(fmaxf(u, -limit), limit));
++}
++
+ // DeepSeek's routed-expert GLU: y = silu(min(g, limit)) * clamp(u, -limit, limit), bf16; xs (or null) y's sums.
+-// The division is __fdiv_rn and the clamp is the host's, so the decode's bf16 row matches the host step.
++// The division is __fdiv_rn and the clamp is the host's; a near-midpoint product takes the
++// double-exp path so the bf16 row is the host's even where CUDA expf is one bit off glibc.
+ extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows_clamp(const __nv_bfloat16* __restrict__ gate, long long g_ld,
+                                                                       const __nv_bfloat16* __restrict__ up, long long u_ld,
+                                                                       __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
+@@ -65,9 +84,8 @@
+             o[i] = 0.f;
+             continue;
+         }
+-        const float a = fminf(g[i], limit);
+-        const float s = __fdiv_rn(a, __fadd_rn(1.0f, expf(-a)));
+-        o[i] = __fmul_rn(s, fminf(fmaxf(u[i], -limit), limit));
++        o[i] = tf_swiglu_one(g[i], u[i], limit, false);
++        if (tf_near_bf16_mid(o[i])) o[i] = tf_swiglu_one(g[i], u[i], limit, true);
+     }
+     const uint4 op = pack8(o);
+     if (live) *reinterpret_cast<uint4*>(out + r * n + 8 * c) = op;
