@@ -76,8 +76,11 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0069-dsv41-head-gemv.patch` | Replace the fp64 `_plain` head with a bf16 CUDA GEMV writing fp32 logits |`n| `0070-dsv41-splitk-gb10.patch` | Enable the existing split-K linear kernels on GB10 |
 | `0071-dsv41-expert-split8.patch` | Deepen K slices in the one-row expert GEMV |
 | `0072-dsv41-dual-affine.patch` | Fuse `wq_a` + `wkv` onto one activation quantize/group-sum pass |`n| `0073-dsv41-kv-norm-store-default.patch` | Make KV norm/store fusion the world-1 affine decode default |
+| `0074-dsv41-grouped-scratch.patch` | Add grouped-expert routing scratch buffers |
+| `0075-dsv41-router-group.patch` | Launch router grouping in the affine MoE path |
+| `0076-dsv41-grouped-experts.patch` | Add row gather, grouped 2-bit GEMV and scatter for rows > 1 |
 
-Implemented: `0001`-`0073`.
+Implemented: `0001`-`0076`.
 
 Rules:
 
