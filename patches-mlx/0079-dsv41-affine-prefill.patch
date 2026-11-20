@@ -1,0 +1,363 @@
+--- a/zig/src/families/deepseek_v41/block_prefill.zig
++++ b/zig/src/families/deepseek_v41/block_prefill.zig
+@@ -121,6 +121,14 @@
+     pub fn matmul(s: *Seg, w: []const u8, form: Form, x: Arg, k: i64, n: i64, y: Out) !void {
+         const e = s.e;
+         const m = e.n;
++        // The affine checkpoint's linears are packed `AffineN` tiles: the same call the decode
++        // path makes, with the prompt GEMM the runtime picks past 16 rows. `col` is the group
++        // column an output view starts at (wo_a's groups write one range each).
++        if (e.cfg.format == .affine) {
++            const col: i64 = if (y.stride > 0) @mod(@divTrunc(y.offset, size(y.dt)), y.stride) else 0;
++            const yt = try e.view(y.role, y.dt, &.{ m, n }, &.{ y.stride, 1 }, y.offset);
++            return e.affineProj(.{ .w = w, .x = x, .k = @intCast(k), .n = @intCast(n), .y = yt, .col = @intCast(col) });
++        }
+         const k2: i64 = try e.w.k2(w);
+         const tw = 4 * k2;
+         const nb = @divExact(n, 128);
+--- a/zig/src/families/deepseek_v41/block_prefill_attn.zig
++++ b/zig/src/families/deepseek_v41/block_prefill_attn.zig
+@@ -206,16 +206,25 @@
+     try ropeAt(e, q, H, hd, positions);
+     if (indexer) {
+         try ropeAt(e, qi, IH, ID, positions);
+-        // the head weights: `_plain`'s fp64 sums, cast to bf16 then fp32 by torch
+-        const w64 = try e.buf("L.ix_w64", .{}, .f64, &.{ n, IH });
+-        try e.triton("_plain", .{ n, IH, 1 }, &.{
+-            .{ .name = "X", .arg = x },                                                        .{ .name = "x_rs", .arg = .{ .i = D } },
+-            .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_wp", .{L}, .f32, &.{ IH, D }) }, .{ .name = "w_rs", .arg = .{ .i = D } },
+-            .{ .name = "OUT", .arg = w64 },                                                    .{ .name = "K", .arg = .{ .i = D } },
+-            .{ .name = "N", .arg = .{ .i = IH } },                                             .{ .name = "BK", .arg = .{ .i = 256 } },
+-            .{ .name = "PDL", .arg = .{ .b = false } },                                        .{ .name = "BF16", .arg = .{ .b = false } },
+-        });
+-        try e.glue("ix_w", &.{ w64, try e.buf("L.ix_w", .{}, .f32, &.{ n, IH }) });
++        const wp = try e.fmt("L{d}.attn.ix_wp", .{L});
++        if (e.cfg.format == .affine) {
++            // the affine checkpoint quantizes the indexer's weights_proj: its packed linear writes
++            // bf16 rows, then the projector's fp32 widen (the release's own path)
++            const iwb = try e.buf("L.ix_wb", .{}, .bf16, &.{ n, IH });
++            try e.upstreamOrAffine(wp, x, D, IH, iwb);
++            try e.glue("proj", &.{ iwb, try e.buf("L.ix_w", .{}, .f32, &.{ n, IH }) });
++        } else {
++            // the head weights: `_plain`'s fp64 sums, cast to bf16 then fp32 by torch
++            const w64 = try e.buf("L.ix_w64", .{}, .f64, &.{ n, IH });
++            try e.triton("_plain", .{ n, IH, 1 }, &.{
++                .{ .name = "X", .arg = x },                                                        .{ .name = "x_rs", .arg = .{ .i = D } },
++                .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_wp", .{L}, .f32, &.{ IH, D }) }, .{ .name = "w_rs", .arg = .{ .i = D } },
++                .{ .name = "OUT", .arg = w64 },                                                    .{ .name = "K", .arg = .{ .i = D } },
++                .{ .name = "N", .arg = .{ .i = IH } },                                             .{ .name = "BK", .arg = .{ .i = 256 } },
++                .{ .name = "PDL", .arg = .{ .b = false } },                                        .{ .name = "BF16", .arg = .{ .b = false } },
++            });
++            try e.glue("ix_w", &.{ w64, try e.buf("L.ix_w", .{}, .f32, &.{ n, IH }) });
++        }
+     }
+     // the CSA2 steps a segment at a time, into the group-major core output
+     const groups: i64 = try e.rankGroups();
+@@ -236,6 +245,25 @@
+     const z: Out = .{ .role = .{ .buf = "L.z" }, .dt = .bf16, .stride = groups * ol };
+     const k = s.pieces();
+     if (k == 1) {
++        if (e.cfg.format == .affine) {
++            // wo_a is the checkpoint's dense bf16 tensor (not an AffineN tile): the attention
++            // output's FP8 round-trip, then one dense block a group (block_attn's denseGroup).
++            const base = try e.fmt("L{d}.attn.wo_a", .{L});
++            const oq = try e.buf("L.oq", .{}, .bf16, &.{ groups, n, gk });
++            var g: i64 = 0;
++            while (g < groups) : (g += 1) {
++                const xg = try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2);
++                const qg = try e.view(oq.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2);
++                try e.ext("tf_dsv41_affine_v1.quant", &.{ xg, qg, .{ .i = gk } });
++            }
++            try e.glue("woa_gm", &.{
++                oq,
++                try e.weight("{s}", .{base}, .bf16, &.{ groups * ol, gk }),
++                try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }),
++                .{ .i = groups }, .{ .i = gk }, .{ .i = ol },
++            });
++            return s.proj(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }), groups * ol, D, try e.buf("L.part", .{}, .bf16, &.{ n, D }));
++        }
+         var g: i64 = 0;
+         while (g < groups) : (g += 1) {
+             var zg = z;
+@@ -254,11 +282,26 @@
+         const r = pieceAt(n, k, p);
+         const m = r[1] - r[0];
+         e.n = m;
+-        var g: i64 = 0;
+-        while (g < groups) : (g += 1) {
+-            var zg = z;
+-            zg.offset = g * ol * 2 + r[0] * groups * ol * 2;
+-            try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ m, gk }, &.{ gk, 1 }, (g * n + r[0]) * gk * 2), gk, ol, zg);
++        if (e.cfg.format == .affine) {
++            const base = try e.fmt("L{d}.attn.wo_a", .{L});
++            const oq = try e.buf("L.oq.p", .{}, .bf16, &.{ m, gk });
++            const zr = try rowsOf(e, zall, .bf16, r[0], m, groups * ol);
++            var g: i64 = 0;
++            while (g < groups) : (g += 1) {
++                try e.ext("tf_dsv41_affine_v1.quant", &.{
++                    try e.view(o.t.role, .bf16, &.{ m, gk }, &.{ gk, 1 }, (g * n + r[0]) * gk * 2),
++                    oq,
++                    .{ .i = gk },
++                });
++                try e.denseGroup(base, @intCast(g), oq, gk, gk, ol, zr, @intCast(g * ol));
++            }
++        } else {
++            var g: i64 = 0;
++            while (g < groups) : (g += 1) {
++                var zg = z;
++                zg.offset = g * ol * 2 + r[0] * groups * ol * 2;
++                try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ m, gk }, &.{ gk, 1 }, (g * n + r[0]) * gk * 2), gk, ol, zg);
++            }
+         }
+         try s.matmul(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try rowsOf(e, zall, .bf16, r[0], m, groups * ol), groups * ol, D, .{ .role = part.t.role, .dt = .bf16, .stride = D, .offset = r[0] * D * 2 });
+         e.n = n;
+--- a/zig/src/families/deepseek_v41/block_prefill_moe.zig
++++ b/zig/src/families/deepseek_v41/block_prefill_moe.zig
+@@ -90,6 +90,23 @@
+             last.args = more;
+         } else if (e.o.r1_sig) try e.appendLast(&.{.{ .list = &.{} }});
+     }
++    // The affine checkpoints route as the decode path does: the resident expert tiles and
++    // the host MoE, a decode window's worth of rows a call (its 16-row kernels).
++    if (e.cfg.format == .affine) {
++        const lim: f64 = E.dec(e.cfg.swiglu_limit);
++        var r0: i64 = 0;
++        while (r0 < n) : (r0 += 16) {
++            const m = @min(16, n - r0);
++            try e.glue("moe_host", &.{
++                try rowsOf(e, x, .bf16, r0, m, D),
++                try rowsOf(e, pick, .i32, r0, m, slots),
++                try rowsOf(e, wts, .f32, r0, m, slots),
++                try rowsOf(e, part, part.t.dt, r0, m, D),
++                .{ .i = L }, .{ .i = topk }, .{ .i = slots }, .{ .f = lim },
++            });
++        }
++        return;
++    }
+     // the kit's fp16 weights, the shared slot masked, the routed slots' contiguous copies
+     const rs: i64 = if (n == 1) slots else topk;
+     const pk = try e.view(.{ .buf = "L.gm.pick" }, .i32, &.{ n, topk }, &.{ rs, 1 }, 0);
+--- a/zig/src/families/deepseek_v41/block_prefill_mhc.zig
++++ b/zig/src/families/deepseek_v41/block_prefill_mhc.zig
+@@ -195,14 +195,19 @@
+     const c = try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D });
+     try s.siteTriton(x, x, try gathered(e, ""), prev, prev[0], null, part, c, null, 2, false);
+     try s.finish(null, prev, try e.weight("norm", .{}, .f32, &.{D}), part, c, 0);
+-    // the head: the decode path's linear (prefill_mm.fast off), upstream's 128 rows a launch
++    // the head: the decode path's linear (prefill_mm.fast off), upstream's 128 rows a launch;
++    // the affine checkpoint's head is dense bf16 and takes the whole segment's GEMV
+     const V: i64 = (try @import("partition.zig").share(e.cfg.vocab, e.o.rank, e.o.world)).len;
+-    var a: i64 = 0;
+-    while (a < n) : (a += 128) {
+-        const m = @min(n - a, 128);
+-        e.n = m;
+-        defer e.n = n;
+-        try e.upstream("head", try e.view(.{ .buf = "w.out" }, .bf16, &.{ m, D }, &.{ D, 1 }, a * D * 2), D, V, try e.view(.{ .buf = "w.logits" }, .f32, &.{ m, V }, &.{ V, 1 }, a * V * 4));
++    if (e.cfg.format == .affine) {
++        try e.denseLinear("head", try e.buf("w.out", .{}, .bf16, &.{ n, D }), D, V, try e.buf("w.logits", .{}, .f32, &.{ n, V }));
++    } else {
++        var a: i64 = 0;
++        while (a < n) : (a += 128) {
++            const m = @min(n - a, 128);
++            e.n = m;
++            defer e.n = n;
++            try e.upstream("head", try e.view(.{ .buf = "w.out" }, .bf16, &.{ m, D }, &.{ D, 1 }, a * D * 2), D, V, try e.view(.{ .buf = "w.logits" }, .f32, &.{ m, V }, &.{ V, 1 }, a * V * 4));
++        }
+     }
+     try e.glue("kit_logits", &.{try e.buf("w.logits", .{}, .f32, &.{ n, V })});
+ }
+--- a/zig/src/families/deepseek_v41/aot_needs.zig
++++ b/zig/src/families/deepseek_v41/aot_needs.zig
+@@ -397,8 +397,10 @@
+         try log.print("aot-needs: row mode, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+         try log.flush();
+     }
+-    // the affine path has no native prefill: prompts run as decode windows
+-    if (cfg.format != .affine) for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
++    // Prompt programs: the same emitter with either the EXL3 linears or the affine checkpoint's
++    // resident packed linears. The affine path plans them even when the served runtime leaves
++    // TF_DSV41_AFFINE_PREFILL off: an unused variant costs only its compile.
++    for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
+     // DSpark
+     if (sv.drafts) {
+         var pa = std.heap.ArenaAllocator.init(gpa);
+@@ -451,7 +453,9 @@
+         const f = try n.program(try prefillAt(&full, pa.allocator(), s + P));
+         if (!(try seen.getOrPut(a, f)).found_existing) try starts.append(a, s);
+     }
++    const full_only = cfg.format == .affine; // affine prompt programs: whole segments (the tail is decode windows)
+     for (starts.items) |s0| {
++        if (full_only) break;
+         var rows: i64 = 1;
+         while (rows <= P and s0 + rows <= sv.o.limit) : (rows += 1) {
+             var pa = std.heap.ArenaAllocator.init(gpa);
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -235,8 +235,10 @@
+         }
+         try @import("block_admission.zig").serving(&m.cfg, world);
+         const affine = m.cfg.format == .affine;
+-        // Affine prefill is not ported; prompts run as decode windows until it is.
+-        const own_prefill = o.own_prefill and !affine;
++        // Affine prefill is opt-in while it is gated: its prompt programs are planned only when
++        // TF_DSV41_AFFINE_PREFILL=1, and the served runtime must make the same choice.
++        const affine_prefill = if (std.c.getenv("TF_DSV41_AFFINE_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        const own_prefill = o.own_prefill and (!affine or affine_prefill);
+         if (own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
+         m.pack = try Pack.open(gpa, io, pack_dir);
+         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+@@ -516,7 +518,7 @@
+             m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks, .checkpoint = if (so.disk != null) try prepared.packIdentity(io, &m.pack, if (cache) |*c| c else null) else null });
+         }
+         tr.step("engram host and sessions", cuda.usage(false));
+-        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = own_prefill, .sessions = m.sessions };
++        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = own_prefill, .prefill_full_only = affine and own_prefill, .sessions = m.sessions };
+         // TF_DSV41_PROMPT_TAIL: the prompt's last token as the first decode row
+         m.gt.prompt_tail = try @import("serve_knobs.zig").promptTail(&@import("serve_knobs.zig").env);
+         // TF_DSV41_PREFILL=replay (ced.zig): own prefill over [0, n - 1), decoder replay, last token as verify row
+--- a/zig/src/families/deepseek_v41/target.zig
++++ b/zig/src/families/deepseek_v41/target.zig
+@@ -25,6 +25,9 @@
+     max_rows: u32 = 16,
+     /// the prompt through the forward's own prefill (2,048-row segments) instead of `prefill_rows`-row decode windows
+     own_prefill: bool = false,
++    /// with `own_prefill`: native prefill only for whole segments (the affine path's planned prompt
++    /// programs); a shorter tail runs as `prefill_rows`-row decode windows
++    prefill_full_only: bool = false,
+     /// with `own_prefill`: where the prompt's last token runs (`.verify`: first decode window; `.prefill`: last row)
+     prompt_tail: pk.PromptTail = .prefill,
+     /// the session store over the paged pool (null: every prompt from an empty slot, nothing kept)
+@@ -87,7 +90,7 @@
+         errdefer if (t.sessions != null) t.abandon(slot);
+         const at: usize = if (t.sessions) |ss| @intCast(try ss.resume_(ids, max_new)) else 0;
+         const rest = ids[at..];
+-        if (t.own_prefill and t.prompt_tail == .verify) {
++        if (t.own_prefill and t.prompt_tail == .verify and !t.prefill_full_only) {
+             // the rows before the last token prefill; the last token is the pending row of the first verify window
+             const sp = pk.promptSplit(rest.len, .verify);
+             pf.state(t.f).taps_rows = 0; // a one-token prompt prefills nothing: no stale taps handed over
+@@ -110,9 +113,30 @@
+             return one[0];
+         }
+         if (t.own_prefill) {
+-            // the keyed choice after the prompt: the last segment's last row
+-            try t.f.prefill(rest);
+             const seg: usize = @import("forward_prefill.zig").segmentRows(t.f);
++            // affine native prefill is planned for whole segments only: anything shorter runs as the
++            // decode windows the served path used before (the keyed choice comes from the last row)
++            const full: usize = if (t.prefill_full_only) rest.len / seg * seg else rest.len;
++            if (full > 0) try t.f.prefill(rest[0..full]);
++            if (full < rest.len) {
++                var at_ = full;
++                var choice: [1]u32 = .{0};
++                while (at_ < rest.len) {
++                    const n = @min(@min(t.prefill_rows, t.max_rows), rest.len - at_);
++                    try t.f.window(rest[at_ .. at_ + n]);
++                    if (at_ + n == rest.len) {
++                        if (keyed) |s| choice[0] = try t.pickOne(@intCast(n - 1), s, draw) else {
++                            var rows: [64]u32 = undefined;
++                            try t.f.greedy(rows[0..n]);
++                            choice[0] = rows[n - 1];
++                        }
++                    }
++                    try t.f.keep(@intCast(n - 1));
++                    at_ += n;
++                }
++                return choice[0];
++            }
++            // the keyed choice after the prompt: the last segment's last row
+             const last = if (rest.len % seg == 0) seg else rest.len % seg;
+             if (keyed) |s| return t.pickOne(@intCast(last - 1), s, draw);
+             const picks = try t.f.gpa.alloc(u32, last);
+--- a/zig/src/families/deepseek_v41/run.zig
++++ b/zig/src/families/deepseek_v41/run.zig
+@@ -189,7 +189,10 @@
+         if (numel == 0) return 0;
+         const off: u64 = @intCast(t.offset);
+         return switch (t.role) {
+-            .weight => |w| (r.weights.get(w) orelse return error.MissingWeight).ptr + off,
++            .weight => |w| (r.weights.get(w) orelse {
++                std.log.err("missing weight {s}", .{w});
++                return error.MissingWeight;
++            }).ptr + off,
+             .buf => |b| (r.addrs.get(b) orelse return error.Unbound) + off,
+             .empty => error.EmptyRole,
+         };
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -228,18 +228,17 @@
+         std.crypto.hash.sha2.Sha256.hash(host, &sha, .{});
+         return map.put(f.gpa, @intCast(c.args[1].arg.i), std.fmt.bytesToHex(sha, .lower));
+     }
+-    if (std.mem.eql(u8, step, "woa")) {
++    if (std.mem.eql(u8, step, "woa") or std.mem.eql(u8, step, "woa_gm")) {
+         const x = c.args[0].arg.t;
+         const wt = c.args[1].arg.t;
+         const out = c.args[2].arg.t;
+-        if (x.dt != .bf16 or wt.dt != .bf16 or out.dt != .bf16 or x.shape.len != 2 or out.shape.len != 2) return error.BadGlue;
++        if (x.dt != .bf16 or wt.dt != .bf16 or out.dt != .bf16 or out.shape.len != 2) return error.BadGlue;
+         const groups: usize = @intCast(c.args[3].arg.i);
+         const gk: usize = @intCast(c.args[4].arg.i);
+         const ol: usize = @intCast(c.args[5].arg.i);
+-        return k.woaGroups(try r.tensorAddr(x), @intCast(x.shape[0]), try r.tensorAddr(wt), try r.tensorAddr(out), groups, gk, ol);
++        return k.woaGroups(try r.tensorAddr(x), @intCast(out.shape[0]), try r.tensorAddr(wt), try r.tensorAddr(out), groups, gk, ol, std.mem.eql(u8, step, "woa_gm"));
+     }
+-    if (std.mem.eql(u8, step, "head_gemv")) {
+-        const x = c.args[0].arg.t;
++    if (std.mem.eql(u8, step, "head_gemv")) {        const x = c.args[0].arg.t;
+         const wt = c.args[1].arg.t;
+         const out = c.args[2].arg.t;
+         const head_k: usize = @intCast(c.args[3].arg.i);
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -330,8 +330,8 @@
+     try o.glueGo(.carry, cols, &a);
+ }
+ 
+-/// wo_a's groups in one launch: x [rows, g*gk], w [g*ol, gk] -> out [rows, g*ol], bf16, fp32 sums.
+-pub fn woaGroups(o: Ops, x: u64, rows: usize, w: u64, out: u64, g: usize, gk: usize, ol: usize) !void {
++/// wo_a's groups in one launch: x [rows, g*gk] (or group-major [g, rows, gk]), w [g*ol, gk] -> out [rows, g*ol].
++pub fn woaGroups(o: Ops, x: u64, rows: usize, w: u64, out: u64, g: usize, gk: usize, ol: usize, gm: bool) !void {
+     if (rows == 0 or g == 0 or gk == 0 or gk > 4096 or gk % 8 != 0 or ol % 16 != 0) return error.Shape;
+     var a: cuda.Args = .{};
+     a.add(x);
+@@ -341,6 +341,7 @@
+     a.add(@as(c_int, @intCast(g)));
+     a.add(@as(c_int, @intCast(gk)));
+     a.add(@as(c_int, @intCast(ol)));
++    a.add(@as(c_int, if (gm) 1 else 0));
+     try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 32), rows, 1 }, 256, 0, null, &a);
+ }
+ 
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -84,7 +84,7 @@
+ extern "C" __global__ void __launch_bounds__(256) dsv41_woa_groups(const uint16_t* __restrict__ x, int nrows,
+                                                                   const uint16_t* __restrict__ w,
+                                                                   uint16_t* __restrict__ out,
+-                                                                  int g, int gk, int ol) {
++                                                                  int g, int gk, int ol, int gm) {
+     __shared__ __align__(16) uint16_t xs[4096];
+     const int per = 32;                 // outputs a block
+     const int tiles = ol / per;
+@@ -93,7 +93,8 @@
+     const int warp = threadIdx.x >> 5;
+     const int lane = threadIdx.x & 31;
+     const int r = blockIdx.y;
+-    const uint16_t* xr = x + ((long long)r * g + grp) * gk;
++    // row-major [n, g, gk] for decode rows, group-major [g, n, gk] for a prefill segment
++    const uint16_t* xr = x + ((long long)(gm ? grp * nrows + r : r * g + grp)) * gk;
+     for (int k = threadIdx.x; k < gk; k += blockDim.x) xs[k] = xr[k];
+     __syncthreads();
+ #pragma unroll
+--- a/zig/kernels/cuda/affine8.cu
++++ b/zig/kernels/cuda/affine8.cu
+@@ -444,7 +444,7 @@
+         const __nv_bfloat16* srcx = x + (size_t)src * k;
+         __nv_bfloat16* dstx = xg + ((size_t)e * maxm + r) * k;
+         for (int t = threadIdx.x; t < k; t += blockDim.x) dstx[t] = srcx[t];
+-        for (int t = threadIdx.x; t < k / 64; t += blockDim.x)
++        if (xs) for (int t = threadIdx.x; t < k / 64; t += blockDim.x)
+             xsg[((size_t)e * maxm + r) * (k / 64) + t] = xs[(size_t)src * (k / 64) + t];
+         if (threadIdx.x == 0) slotmap[e * maxm + r] = i * slots + slot;
+     }

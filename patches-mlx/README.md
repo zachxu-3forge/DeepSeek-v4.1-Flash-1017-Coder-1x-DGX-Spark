@@ -77,7 +77,7 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0071-dsv41-expert-split8.patch` | Deepen K slices in the one-row expert GEMV |
 | `0072-dsv41-dual-affine.patch` | Fuse `wq_a` + `wkv` onto one activation quantize/group-sum pass |`n| `0073-dsv41-kv-norm-store-default.patch` | Make KV norm/store fusion the world-1 affine decode default |
 
-Implemented: `0001`-`0078`.
+Implemented: `0001`-`0079`.
 
 Rules:
 
@@ -87,3 +87,4 @@ Rules:
 - Record the upstream commit and the patch set in `Agents/Implementation.md`.
 
 | `0078-dsv41-grouped-shared-head64.patch` | Grouped 2-bit experts, shared w1/w3 dual linear, and head 64-output block |
+| `0079-dsv41-affine-prefill.patch` | Affine native prefill for whole 2,048-row segments: packed linears as prompt GEMMs, dense `wo_a` group launch, and decode-window tails (`TF_DSV41_AFFINE_PREFILL=1`) |

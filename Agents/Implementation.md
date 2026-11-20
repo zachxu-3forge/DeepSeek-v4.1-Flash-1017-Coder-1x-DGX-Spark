@@ -1202,6 +1202,36 @@ Record the approach that was actually implemented, even if it differs from `Agen
 | 2026-11-09 | Real config translation | `translate_config.py --check` on published config/index | Pass | 460 modules: 429 affine, 22 MXFP8, 9 MXFP4; all pieces present |
 | 2026-11-09 | Real index inspection | `inspect_checkpoint.py` on published config/index | Pass | 21 shards, 2286 tensors, 211.4 GiB; 378 stacked expert tensors; 16 Engram tensors |
 
+## Affine prefill (2026-11-20)
+
+Patch `0079` adds the affine checkpoint's native prompt path, opt-in with
+`TF_DSV41_AFFINE_PREFILL=1`. Whole 2,048-row segments run through the prefill emitter with:
+
+- packed `AffineN` linears as the prompt GEMM (`rows > 16`, the existing `affine_prefill` kernels);
+- the checkpoint's dense bf16 `wo_a` through one group-major `wo_a` launch per layer;
+- the quantized indexer `weights_proj` as an affine linear plus the fp32 widen;
+- the dense bf16 head GEMV;
+- a `decode`-path MoE over 16-row chunks (the per-expert prompt GEMM is the next step).
+
+The last partial segment stays on the existing 16-row decode windows, so short prompts are
+unchanged.
+
+Measured on the final `dev` image (`9daaf4cae60a`, patches `0001`-`0079`):
+
+| Case | TTFT / speed | Token SHA |
+| --- | --- | --- |
+| 3,245-token prompt, default (`AFFINE_PREFILL` off) | 89.4 s | `9c4c8939cde0` |
+| 3,245-token prompt, native prefill | **85.3 s** (+4.6%) | `9c4c8939cde0` |
+| 64-token C1 | 16.66 tok/s, TTFT 0.42 s | `06d2679eec60` |
+| 4-slot aggregate | 21.99 tok/s | — |
+| 256-step logits gate | 99.61% top-1, mean KL 0.000207 | PASS |
+
+The AOT set gained the prompt `_fused` variants (`aot.json` now 82 kernels); the stable
+`/assets` mount was updated and a final boot with the default mount path passed.
+
+The remaining prefill cost is the MoE's per-16-row host path; a grouped prompt expert GEMM is
+the next speed item. TP=2 still needs a second Spark.
+
 ## Open issues and deviations
 
 - Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
@@ -1224,7 +1254,7 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Next actions
 
-1. Port the affine prefill (`block_prefill_attn`/`block_prefill_moe`/the prefill emitter) so long prompts do not run as 16-token decode windows; this is the remaining 600K *prompt* blocker. The batched MoE already gives 16-row windows a usable path.
+1. Affine native prefill is implemented and verified (`0079`, 85.3 s vs 89.4 s on a 3,245-token prompt, exact SHA). Next: a grouped prompt expert GEMM to replace the per-16-row MoE host path, then measure 600K prompts.
 2. Replace the 8 per-layer `wo_a` `_plain` launches and the per-row expert launches with fused kernels (the `_plain` bucket is now ~34% of decode); then revisit DSpark's default.
 3. Document the exact greedy divergence from omlx: 136-139 characters match the `bench.json` LRU reference before the parenthetical wording differs; the bf16 KV cache vs omlx's packed 4-bit/e4m3 formats and the activation quantization are the expected sources.
 4. Measure DSpark at 600K with draft buffers (no-drafts 600K is already 104 GiB/17 GiB).
