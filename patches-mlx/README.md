@@ -77,7 +77,7 @@ Engine patches applied in filename order to upstream TensorFold (`TF_REF` in
 | `0071-dsv41-expert-split8.patch` | Deepen K slices in the one-row expert GEMV |
 | `0072-dsv41-dual-affine.patch` | Fuse `wq_a` + `wkv` onto one activation quantize/group-sum pass |`n| `0073-dsv41-kv-norm-store-default.patch` | Make KV norm/store fusion the world-1 affine decode default |
 
-Implemented: `0001`-`0073`.
+Implemented: `0001`-`0078`.
 
 Rules:
 
@@ -85,3 +85,5 @@ Rules:
 - Rebase onto the pinned `TF_REF` before adding a new patch; do not stack unrelated changes.
 - Keep the upstream file layout; put new family code under `zig/src/families/deepseek_v41/`.
 - Record the upstream commit and the patch set in `Agents/Implementation.md`.
+
+| `0078-dsv41-grouped-shared-head64.patch` | Grouped 2-bit experts, shared w1/w3 dual linear, and head 64-output block |
