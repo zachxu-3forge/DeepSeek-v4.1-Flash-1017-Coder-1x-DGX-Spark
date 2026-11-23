@@ -157,8 +157,8 @@ Triton 3.7.1 and ptxas 13.3.73.
 git clone --depth 1 https://github.com/jayleaton/deepseek-v41-tensorfold-spark recipe
 (cd recipe && scripts/fetch-reference.sh build/reference)      # build/reference/src
 IMAGE=tf-dsv41-mlx:dev
-R=/home/deploy/dsv41-recipe
-A=/home/deploy/dsv41-mlx/assets
+R=/home/deploy/repos/deepseek-v41-tensorfold-spark
+A=/home/deploy/repos/DeepSeek-v4.1-Flash-Coder-1017-1x-DGX-Spark/checkpoints/assets
 PY="docker run --rm --user $(id -u):$(id -g) -v $R:/recipe -v $R/build/reference/src:/refsrc:ro -v $A:/assets -w /recipe/engine/zig -e HOME=/tmp -e TRITON_CACHE_DIR=/tmp/triton --entrypoint python3 $IMAGE"
 $PY tools/zig/triton_fill.py sigs --py /refsrc --out /assets/sigs.json
 docker run --rm --user $(id -u):$(id -g) -v /path/model:/model:ro -v $A:/assets \

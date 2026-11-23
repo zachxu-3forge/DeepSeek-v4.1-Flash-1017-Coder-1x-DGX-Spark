@@ -12,11 +12,12 @@ If another workload is using the GPU, do not rebuild or run the engine; wait or 
 ## 0. Update and set paths
 
 ```sh
-cd /home/deploy/Models/DeepSeek-v4.1-Flash-1017/MLX-Coder/Recipe
+export ROOT=/home/deploy/repos/DeepSeek-v4.1-Flash-Coder-1017-1x-DGX-Spark
+cd "$ROOT"
 git pull
-export MODEL_DIR=/home/deploy/Models/DeepSeek-v4.1-Flash-1017/MLX-Coder
-export WORK=/home/deploy/dsv41-mlx
-export OVERLAY=$WORK/model-translated
+export MODEL_DIR="$ROOT/checkpoints/base"
+export WORK="$ROOT/work"
+export OVERLAY="$ROOT/checkpoints/model-translated"
 export BASE_IMAGE="nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c"
 git log -1 --oneline
 ```
