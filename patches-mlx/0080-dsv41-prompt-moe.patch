@@ -1,0 +1,409 @@
+--- a/zig/src/families/deepseek_v41/forward.zig
++++ b/zig/src/families/deepseek_v41/forward.zig
+@@ -39,8 +39,7 @@
+ 
+ /// The affine MoE's device scratch: reused by every layer and every window, so a decode
+ /// step allocates only when a wider row bucket arrives.
+-pub const MoeScratch = struct {
+-    xq: cuda.DeviceBuffer,
++pub const MoeScratch = struct {    xq: cuda.DeviceBuffer,
+     sx: cuda.DeviceBuffer,
+     g: cuda.DeviceBuffer,
+     u: cuda.DeviceBuffer,
+@@ -76,6 +75,56 @@
+     }
+ };
+ 
++/// The affine MoE's prompt scratch: one set for a whole prefill segment, reused by every layer.
++/// Group-major rows are [experts][maxm] (the router's member table), slot-major the segment's
++/// `rows * slots` rows. `maxm` is the capacity the first layer's routing needed.
++pub const MoePf = struct {
++    xq: cuda.DeviceBuffer,
++    xg: cuda.DeviceBuffer,
++    gate: cuda.DeviceBuffer,
++    up: cuda.DeviceBuffer,
++    g: cuda.DeviceBuffer,
++    u: cuda.DeviceBuffer,
++    act: cuda.DeviceBuffer,
++    xd: cuda.DeviceBuffer,
++    og: cuda.DeviceBuffer,
++    y: cuda.DeviceBuffer,
++    sy: cuda.DeviceBuffer,
++    sg: cuda.DeviceBuffer,
++    su: cuda.DeviceBuffer,
++    sact: cuda.DeviceBuffer,
++    members: cuda.DeviceBuffer,
++    slotmap: cuda.DeviceBuffer,
++    uids: cuda.DeviceBuffer,
++    ucount: cuda.DeviceBuffer,
++    rows: usize = 0,
++    slots: usize = 0,
++    maxm: usize = 0,
++    experts: usize = 0,
++
++    pub fn deinit(s: *MoePf) void {
++        s.xq.free();
++        s.xg.free();
++        s.gate.free();
++        s.up.free();
++        s.g.free();
++        s.u.free();
++        s.act.free();
++        s.xd.free();
++        s.og.free();
++        s.y.free();
++        s.sy.free();
++        s.sg.free();
++        s.su.free();
++        s.sact.free();
++        s.members.free();
++        s.slotmap.free();
++        s.uids.free();
++        s.ucount.free();
++        s.* = undefined;
++    }
++};
++
+ pub const Forward = struct {
+     gpa: std.mem.Allocator,
+     cfg: *const Config,
+@@ -101,6 +150,8 @@
+     send: ?cuda.DeviceBuffer = null,
+     /// the affine MoE's cached device scratch (g/u/actd/y and their group sums)
+     moe_scratch: ?*MoeScratch = null,
++    /// the affine MoE's prompt scratch, one set a prefill segment
++    moe_pf: ?*MoePf = null,
+     /// the window's token ids (the embedding step reads them; window() copies them into ids_own)
+     ids: []const u32 = &.{},
+     /// TF_DSV41_IMAGES=native (vision_rows.zig): every rank keeps image positions out of Engram; rank 0's image rows
+@@ -216,6 +267,10 @@
+             s.deinit();
+             f.gpa.destroy(s);
+         }
++        if (f.moe_pf) |s| {
++            s.deinit();
++            f.gpa.destroy(s);
++        }
+         if (f.prefill_state != null) hooks.set.prefill.?.deinit(f);
+         f.calib_marks.deinit(f.gpa);
+         if (f.gate) |x| hooks.set.gate.?.close(x);
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -238,6 +238,16 @@
+         const ol: usize = @intCast(c.args[5].arg.i);
+         return k.woaGroups(try r.tensorAddr(x), @intCast(out.shape[0]), try r.tensorAddr(wt), try r.tensorAddr(out), groups, gk, ol, std.mem.eql(u8, step, "woa_gm"));
+     }
++    if (std.mem.eql(u8, step, "shared_scatter")) {
++        const sy = c.args[0].arg.t;
++        const y = c.args[1].arg.t;
++        if (sy.dt != .bf16 or y.dt != .bf16 or sy.shape.len != 2 or y.shape.len != 2) return error.BadGlue;
++        const n: usize = @intCast(c.args[2].arg.i);
++        const cols: usize = @intCast(c.args[3].arg.i);
++        const slots: usize = @intCast(c.args[4].arg.i);
++        const topk: usize = @intCast(c.args[5].arg.i);
++        return k.sharedScatter(try r.tensorAddr(sy), try r.tensorAddr(y), n, cols, slots, topk);
++    }
+     if (std.mem.eql(u8, step, "head_gemv")) {        const x = c.args[0].arg.t;
+         const wt = c.args[1].arg.t;
+         const out = c.args[2].arg.t;
+@@ -297,6 +307,201 @@
+     return s;
+ }
+ 
++fn ensureMoePf(f: *Forward, r: *run.Runner, n: usize, D: usize, I: usize, slots: usize, experts: usize, need: usize) !*fwd.MoePf {
++    const cap: usize = @max(16, (need + 63) / 64 * 64);
++    if (f.moe_pf) |s| {
++        if (s.rows >= n and s.slots == slots and s.experts >= experts and s.maxm >= cap) return s;
++        s.deinit();
++        f.gpa.destroy(s);
++        f.moe_pf = null;
++    }
++    const maxm = cap;
++    const P = n * slots;
++    const s = try f.gpa.create(fwd.MoePf);
++    errdefer f.gpa.destroy(s);
++    s.xq = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
++    errdefer s.xq.free();
++    s.xg = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * D * 2);
++    errdefer s.xg.free();
++    s.gate = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * I * 2);
++    errdefer s.gate.free();
++    s.up = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * I * 2);
++    errdefer s.up.free();
++    s.g = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer s.g.free();
++    s.u = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer s.u.free();
++    s.act = try cuda.DeviceBuffer.alloc(r.d, P * I * 2);
++    errdefer s.act.free();
++    s.xd = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * I * 2);
++    errdefer s.xd.free();
++    s.og = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * D * 2);
++    errdefer s.og.free();
++    s.y = try cuda.DeviceBuffer.alloc(r.d, P * D * 2);
++    errdefer s.y.free();
++    s.sy = try cuda.DeviceBuffer.alloc(r.d, n * D * 2);
++    errdefer s.sy.free();
++    s.sg = try cuda.DeviceBuffer.alloc(r.d, n * I * 2);
++    errdefer s.sg.free();
++    s.su = try cuda.DeviceBuffer.alloc(r.d, n * I * 2);
++    errdefer s.su.free();
++    s.sact = try cuda.DeviceBuffer.alloc(r.d, n * I * 2);
++    errdefer s.sact.free();
++    s.members = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * 4);
++    errdefer s.members.free();
++    s.slotmap = try cuda.DeviceBuffer.alloc(r.d, experts * maxm * 4);
++    errdefer s.slotmap.free();
++    s.uids = try cuda.DeviceBuffer.alloc(r.d, experts * 4);
++    errdefer s.uids.free();
++    s.ucount = try cuda.DeviceBuffer.alloc(r.d, 4);
++    errdefer s.ucount.free();
++    s.rows = n;
++    s.slots = slots;
++    s.maxm = maxm;
++    s.experts = experts;
++    f.moe_pf = s;
++    return s;
++}
++
++/// The affine MoE of a prefill segment: one prompt GEMM an expert, not a decode window's GEMV.
++fn moePrompt(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
++    const af = r.affine orelse return error.AffineNotLoaded;
++    const k = r.kernels.others(r.stream);
++    const x = c.args[0].arg.t;
++    const pick = c.args[1].arg.t;
++    const wts = c.args[2].arg.t;
++    const out = c.args[3].arg.t;
++    const L: u32 = @intCast(c.args[4].arg.i);
++    const topk: usize = @intCast(c.args[5].arg.i);
++    const slots: usize = @intCast(c.args[6].arg.i);
++    const limit: f32 = @floatCast(c.args[7].arg.f);
++    const n: usize = @intCast(x.shape[0]);
++    const D: usize = @intCast(x.shape[1]);
++    if (n <= 16 or x.dt != .bf16 or (out.dt != .f32 and out.dt != .bf16)) return error.BadGlue;
++    var b1: [96]u8 = undefined;
++    var b2: [96]u8 = undefined;
++    var b3: [96]u8 = undefined;
++    const sh1 = try std.fmt.bufPrint(&b1, "L{d}.moe.shared.0.w1", .{L});
++    const sh3 = try std.fmt.bufPrint(&b2, "L{d}.moe.shared.0.w3", .{L});
++    const sh2 = try std.fmt.bufPrint(&b3, "L{d}.moe.shared.0.w2", .{L});
++    var e1: [96]u8 = undefined;
++    var e2: [96]u8 = undefined;
++    var e3: [96]u8 = undefined;
++    const w1n = try std.fmt.bufPrint(&e1, "L{d}.moe.w1", .{L});
++    const w3n = try std.fmt.bufPrint(&e2, "L{d}.moe.w3", .{L});
++    const w2n = try std.fmt.bufPrint(&e3, "L{d}.moe.w2", .{L});
++    const sh1i = af.linears.get(sh1);
++    const has_shared = sh1i != null;
++    const I: usize = if (sh1i) |i| i.n else if (af.expert(w1n)) |m| m.layout.n else 0;
++    if (has_shared) {
++        const w2 = af.linears.get(sh2) orelse return error.UnknownAffine;
++        if (af.linears.get(sh3) == null or w2.k != I or w2.n != D) return error.BadGlue;
++    }
++    const x1 = af.expert(w1n) orelse return error.UnknownAffine;
++    const x3 = af.expert(w3n) orelse return error.UnknownAffine;
++    const x2 = af.expert(w2n) orelse return error.UnknownAffine;
++    if (x1.layout.n != I or x1.layout.k != D or x3.layout.n != I or x3.layout.k != D or x2.layout.n != D or x2.layout.k != I) return error.BadGlue;
++    const Et: usize = x1.experts;
++    // The router's picks are this segment's only host-read tensor. One expert's rows are
++    // gathered at a time, in chunks of at most `cap`, so a skewed prompt cannot force a
++    // multi-gigabyte [experts][maxm] table. The chunk's prompt GEMM still amortizes the
++    // expert's weight read over up to 1,024 rows.
++    const cap: usize = 1024;
++    const pick_n = n * slots;
++    const picks = try r.gpa.alloc(i32, pick_n);
++    defer r.gpa.free(picks);
++    try r.stream.synchronize();
++    var pbuf: cuda.DeviceBuffer = .{ .d = r.d, .ptr = try r.tensorAddr(pick), .len = pick_n * 4, .borrowed = true };
++    try pbuf.download(0, std.mem.sliceAsBytes(picks));
++    const counts = try r.gpa.alloc(i32, Et);
++    defer r.gpa.free(counts);
++    @memset(counts, 0);
++    var i: usize = 0;
++    while (i < n) : (i += 1) {
++        var slot: usize = 0;
++        while (slot < topk) : (slot += 1) {
++            const ex = picks[i * slots + slot];
++            if (ex < 0 or ex >= Et) continue;
++            counts[@intCast(ex)] += 1;
++        }
++    }
++    const s = try ensureMoePf(f, r, n, D, I, slots, 1, cap);
++    const maxm = s.maxm;
++    const offsets = try r.gpa.alloc(i32, Et + 1);
++    defer r.gpa.free(offsets);
++    const cursor = try r.gpa.alloc(i32, Et);
++    defer r.gpa.free(cursor);
++    offsets[0] = 0;
++    for (0..Et) |e| offsets[e + 1] = offsets[e] + counts[e];
++    @memset(cursor, 0);
++    const flat = try r.gpa.alloc(i32, n * topk);
++    defer r.gpa.free(flat);
++    i = 0;
++    while (i < n) : (i += 1) {
++        var slot: usize = 0;
++        while (slot < topk) : (slot += 1) {
++            const ex = picks[i * slots + slot];
++            if (ex < 0 or ex >= Et) continue;
++            const e: usize = @intCast(ex);
++            const at: usize = @intCast(offsets[e] + cursor[e]);
++            flat[at] = @intCast(i * 32 + slot);
++            cursor[e] += 1;
++        }
++    }
++    const members = try r.gpa.alloc(i32, maxm);
++    defer r.gpa.free(members);
++    @memset(members, -1);
++    var one: [1]i32 = .{1};
++    try s.ucount.upload(0, std.mem.asBytes(&one));
++    const xa = try r.tensorAddr(x);
++    const src = if (x1.quantize_input) blk: {
++        try af.act.quantFp8(r.stream, xa, D, s.xq.ptr, n, D);
++        break :blk s.xq.ptr;
++    } else xa;
++    // gate/up, an expert's rows a chunk
++    var e: usize = 0;
++    while (e < Et) : (e += 1) {
++        var row0: usize = 0;
++        while (row0 < @as(usize, @intCast(counts[e]))) {
++            const cnt = @min(maxm, @as(usize, @intCast(counts[e])) - row0);
++            const from: usize = @intCast(offsets[e] + @as(i32, @intCast(row0)));
++            @memcpy(members[0..cnt], flat[from..][0..cnt]);
++            if (cnt < maxm) members[cnt] = -1;
++            try s.members.upload(0, std.mem.sliceAsBytes(members));
++            try af.wide.gatherRows(r.stream, src, 0, s.members.ptr, s.ucount.ptr, slots, D, 0, maxm, s.xg.ptr, 0, s.slotmap.ptr);
++            try af.wide.prompt(r.stream, s.xg.ptr, x1.tiles.views[e], s.gate.ptr, cnt);
++            try af.wide.prompt(r.stream, s.xg.ptr, x3.tiles.views[e], s.up.ptr, cnt);
++            try af.wide.scatterGroups(r.stream, s.gate.ptr, s.slotmap.ptr, s.ucount.ptr, maxm, I, s.g.ptr);
++            try af.wide.scatterGroups(r.stream, s.up.ptr, s.slotmap.ptr, s.ucount.ptr, maxm, I, s.u.ptr);
++            row0 += cnt;
++        }
++    }
++    try af.act.swigluClamp(r.stream, s.g.ptr, I, s.u.ptr, I, s.act.ptr, null, n * slots, I, limit);
++    // down, the same rows' activated values
++    e = 0;
++    while (e < Et) : (e += 1) {
++        var row0: usize = 0;
++        while (row0 < @as(usize, @intCast(counts[e]))) {
++            const cnt = @min(maxm, @as(usize, @intCast(counts[e])) - row0);
++            const from: usize = @intCast(offsets[e] + @as(i32, @intCast(row0)));
++            @memcpy(members[0..cnt], flat[from..][0..cnt]);
++            if (cnt < maxm) members[cnt] = -1;
++            try s.members.upload(0, std.mem.sliceAsBytes(members));
++            try af.wide.gatherRows(r.stream, s.act.ptr, 0, s.members.ptr, s.ucount.ptr, slots, I, slots, maxm, s.xd.ptr, 0, s.slotmap.ptr);
++            try af.wide.prompt(r.stream, s.xd.ptr, x2.tiles.views[e], s.og.ptr, cnt);
++            try af.wide.scatterGroups(r.stream, s.og.ptr, s.slotmap.ptr, s.ucount.ptr, maxm, D, s.y.ptr);
++            row0 += cnt;
++        }
++    }
++    if (has_shared) {
++        try af.linear2(r.stream, 0, src, affine_linears.nameHash(sh1), s.sg.ptr, affine_linears.nameHash(sh3), s.su.ptr, n, D, I, I);
++        try af.act.swigluClamp(r.stream, s.sg.ptr, I, s.su.ptr, I, s.sact.ptr, null, n, I, limit);
++        try af.linear(r.stream, 0, affine_linears.nameHash(sh2), s.sact.ptr, s.sy.ptr, n, I, D);
++        try k.sharedScatter(s.sy.ptr, s.y.ptr, n, D, slots, topk);
++    }
++    try k.moeCombine(s.y.ptr, try r.tensorAddr(pick), try r.tensorAddr(wts), try r.tensorAddr(out), out.dt == .bf16, n, slots, topk, D, has_shared);
++}
++
+ fn moeHost(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+     const af = r.affine orelse return error.AffineNotLoaded;
+     const k = r.kernels.others(r.stream);
+@@ -312,6 +517,7 @@
+     const D: usize = @intCast(x.shape[1]);
+     if (x.dt != .bf16 or (out.dt != .f32 and out.dt != .bf16)) return error.BadGlue;
+     if (pick.shape[0] != n or pick.shape[1] != slots or wts.shape[0] != n or wts.shape[1] != slots or out.shape[0] != n or out.shape[1] != D) return error.BadGlue;
++    if (n > 16) return moePrompt(f, r, c);
+ 
+     var b1: [96]u8 = undefined;
+     var b2: [96]u8 = undefined;
+--- a/zig/src/families/deepseek_v41/kernels_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_ops.zig
+@@ -238,8 +238,9 @@
+         "dsv41_woa_groups",
+         "dsv41_moe_combine",
+         "dsv41_head_gemv",
++        "dsv41_shared_scatter",
+     };
+-    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa, moe_combine, head_gemv };
++    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32, woa, moe_combine, head_gemv, shared_scatter };
+     /// DSpark's candidates (optional: resolved apart, so an older fatbin still loads)
+     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
+     /// the most candidates a rank (the kernel's shared sort)
+@@ -566,6 +567,7 @@
+     pub const vsChoose = glue_ops.vsChoose;
+     pub const widenF32 = glue_ops.widenF32;
+     pub const woaGroups = glue_ops.woaGroups;
++    pub const sharedScatter = glue_ops.sharedScatter;
+     pub const moeCombine = glue_ops.moeCombine;
+     pub const headGemv = glue_ops.headGemv;
+     pub const pfGo = glue_ops.pfGo;
+--- a/zig/src/families/deepseek_v41/kernels_glue_ops.zig
++++ b/zig/src/families/deepseek_v41/kernels_glue_ops.zig
+@@ -345,6 +345,19 @@
+     try o.go(o.f.glue[@backingInt(glue.Kind.woa)], .{ g * (ol / 32), rows, 1 }, 256, 0, null, &a);
+ }
+ 
++/// The shared expert's [n, D] prompt rows into the slot-major y at the shared slot.
++pub fn sharedScatter(o: Ops, sy: u64, y: u64, n: usize, D: usize, slots: usize, topk: usize) !void {
++    if (n == 0 or D == 0 or slots == 0) return;
++    var a: cuda.Args = .{};
++    a.add(sy);
++    a.add(y);
++    a.add(@as(c_int, @intCast(n)));
++    a.add(@as(c_int, @intCast(D)));
++    a.add(@as(c_int, @intCast(slots)));
++    a.add(@as(c_int, @intCast(topk)));
++    try o.go(o.f.glue[@backingInt(glue.Kind.shared_scatter)], .{ (D + 255) / 256, n, 1 }, 256, 0, null, &a);
++}
++
+ /// The dense head: x [rows, k] bf16, w [n, k] bf16 -> logits [rows, n] f32.
+ pub fn headGemv(o: Ops, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) !void {
+     if (rows == 0 or k == 0 or k > 5120 or n == 0) return error.Shape;
+--- a/zig/src/families/deepseek_v41/block_prefill_moe.zig
++++ b/zig/src/families/deepseek_v41/block_prefill_moe.zig
+@@ -77,7 +77,7 @@
+             .{ .i = slots },                                            .{ .f = E.dec(e.cfg.routed_scale) },
+             .{ .i = tile },                                             .{ .i = cfg[0] },
+             .{ .i = cfg[1] },                                           .{ .b = true },
+-            .{ .b = false },                                            try e.empty(.i32),
++            .{ .b = e.cfg.format == .affine },                          try e.empty(.i32),
+             try e.empty(.i32),                                          try e.t(.empty, .i32, &.{ 0, 1 }),
+             .{ .i = 0 },                                                .{ .b = false },
+         });
+@@ -94,6 +94,16 @@
+     // the host MoE, a decode window's worth of rows a call (its 16-row kernels).
+     if (e.cfg.format == .affine) {
+         const lim: f64 = E.dec(e.cfg.swiglu_limit);
++        if (n > 16) {
++            try e.glue("moe_host", &.{
++                x,
++                pick,
++                wts,
++                part,
++                .{ .i = L }, .{ .i = topk }, .{ .i = slots }, .{ .f = lim },
++            });
++            return;
++        }
+         var r0: i64 = 0;
+         while (r0 < n) : (r0 += 16) {
+             const m = @min(16, n - r0);
+--- a/zig/kernels/cuda/deepseek_v41/glue.cu
++++ b/zig/kernels/cuda/deepseek_v41/glue.cu
+@@ -141,6 +141,17 @@
+     }
+ }
+ 
++// The shared expert's prompt rows scatter into the slot-major MoE rows at the shared slot.
++extern "C" __global__ void __launch_bounds__(256) dsv41_shared_scatter(const uint16_t* __restrict__ sy,
++                                                                      uint16_t* __restrict__ y,
++                                                                      int n, int D, int slots, int topk) {
++    const int i = blockIdx.y;
++    if (i >= n) return;
++    const uint16_t* src = sy + (size_t)i * D;
++    uint16_t* dst = y + ((size_t)i * slots + topk) * D;
++    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < D; j += blockDim.x * gridDim.x) dst[j] = src[j];
++}
++
+ // The affine MoE's combine: out[i, d] = shared y (slot topk) + sum_{j < topk} w[j] * y[slot j],
+ // in the host path's order. One skipped slot contributes nothing; fp32 sums, then bf16 or f32 out.
+ extern "C" __global__ void __launch_bounds__(256) dsv41_moe_combine(const uint16_t* __restrict__ y,
