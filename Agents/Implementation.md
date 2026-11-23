@@ -1236,6 +1236,19 @@ yet in that set, so `TF_DSV41_AFFINE_PREFILL` stays opt-in.
 The remaining prefill cost is the MoE's per-16-row host path; a grouped prompt expert GEMM is
 the next speed item. TP=2 still needs a second Spark.
 
+### Prompt-MoE experiment (rejected)
+
+A per-expert prompt GEMM was built on top of `0079` (WIP patch `0080`): each expert's rows are
+gathered in chunks of at most 1,024 and run through `AffineN.prompt`, with the shared expert
+also on the prompt path. On a 7,664-token varied prompt it measured **165.6 s** TTFT versus
+180.2 s for the exact 16-row native prefill and 217.4 s for decode windows.
+
+It is not bit-exact. Layer prefixes `0-0` and `0-1` matched the decode path token-for-token,
+but `0-2` diverged, and a 32-step long-prompt logits comparison against the exact native
+prefill measured `top1=0.0%`, `mean_kl=14.98`. The prompt GEMM's K accumulation order differs
+from the decode GEMV; layer 2's router then picks different experts. The path is rejected and
+kept only on a WIP branch; exact `0079` remains the promoted prefill.
+
 ## Open issues and deviations
 
 - Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
