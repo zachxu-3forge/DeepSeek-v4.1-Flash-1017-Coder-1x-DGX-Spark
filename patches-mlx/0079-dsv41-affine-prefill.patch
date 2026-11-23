@@ -193,7 +193,7 @@
              var pa = std.heap.ArenaAllocator.init(gpa);
 --- a/zig/src/families/deepseek_v41/cuda_model.zig
 +++ b/zig/src/families/deepseek_v41/cuda_model.zig
-@@ -235,8 +235,10 @@
+@@ -235,8 +235,13 @@
          }
          try @import("block_admission.zig").serving(&m.cfg, world);
          const affine = m.cfg.format == .affine;
@@ -202,11 +202,14 @@
 +        // Affine prefill is on by default for cold long prompts: its prompt programs are planned
 +        // at the 2,048-row starts, and a session resume at another position stays on decode windows.
 +        const affine_prefill = if (std.c.getenv("TF_DSV41_AFFINE_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else true;
-+        const own_prefill = o.own_prefill and (!affine or affine_prefill);
++        // Multi-slot serving keeps the decode-window prompts: its pool's `_scores`/`_fused`
++        // specializations are not in the prompt AOT set yet.
++        const live_slots = try slots_mod.countFromEnv();
++        const own_prefill = o.own_prefill and (!affine or (affine_prefill and live_slots == 1));
          if (own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
          m.pack = try Pack.open(gpa, io, pack_dir);
          const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
-@@ -516,7 +518,7 @@
+@@ -516,7 +521,7 @@
              m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks, .checkpoint = if (so.disk != null) try prepared.packIdentity(io, &m.pack, if (cache) |*c| c else null) else null });
          }
          tr.step("engram host and sessions", cuda.usage(false));

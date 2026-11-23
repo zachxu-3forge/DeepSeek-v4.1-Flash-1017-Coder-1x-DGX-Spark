@@ -1225,6 +1225,7 @@ Measured on the final `dev` image (`9daaf4cae60a`, patches `0001`-`0079`):
 | 3,245-token prompt, native prefill (final default) | **80.4 s** (+10.1%) | `9c4c8939cde0` |
 | 5,216-token prompt, default | 149.3 s | `9c4c8939cde0` |
 | 5,216-token prompt, native prefill (two full segments) | **128.7 s** (+13.8%) | `9c4c8939cde0` |
+| 4-slot, 3,245-token prompt | 89.8 s (decode windows) | `9c4c8939cde0` |
 | 64-token C1 | 16.66 tok/s, TTFT 0.42 s | `06d2679eec60` |
 | 4-slot aggregate | 21.99 tok/s | — |
 | 256-step logits gate | 99.61% top-1, mean KL 0.000207 | PASS |
@@ -1232,7 +1233,9 @@ Measured on the final `dev` image (`9daaf4cae60a`, patches `0001`-`0079`):
 The AOT set gained the prompt `_fused` variants (`aot.json` now 82 kernels); the stable
 `/assets` mount was updated and a final boot with the default mount path passed. The planned
 prompt starts are the cold-prompt multiples of 2,048; a session resume at another position
-stays on decode windows, so the default is safe for both cold and resumed prompts.
+stays on decode windows, so the default is safe for both cold and resumed prompts. Multi-slot
+serving also stays on decode windows: its pool's `_scores`/`_fused` prompt specializations are
+not in the prompt AOT set.
 
 The remaining prefill cost is the MoE's per-16-row host path; a grouped prompt expert GEMM is
 the next speed item. TP=2 still needs a second Spark.
