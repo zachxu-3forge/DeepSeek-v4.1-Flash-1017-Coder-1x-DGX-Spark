@@ -87,4 +87,4 @@ Rules:
 - Record the upstream commit and the patch set in `Agents/Implementation.md`.
 
 | `0078-dsv41-grouped-shared-head64.patch` | Grouped 2-bit experts, shared w1/w3 dual linear, and head 64-output block |
-| `0079-dsv41-affine-prefill.patch` | Affine native prefill for whole 2,048-row segments: packed linears as prompt GEMMs, dense `wo_a` group launch, and decode-window tails (`TF_DSV41_AFFINE_PREFILL=1`) |
+| `0079-dsv41-affine-prefill.patch` | Affine native prefill for whole 2,048-row segments: packed linears as prompt GEMMs, dense `wo_a` group launch, and decode-window tails (on by default; `TF_DSV41_AFFINE_PREFILL=0` disables) |

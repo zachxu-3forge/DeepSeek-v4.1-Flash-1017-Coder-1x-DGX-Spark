@@ -175,8 +175,8 @@
 -    // the affine path has no native prefill: prompts run as decode windows
 -    if (cfg.format != .affine) for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
 +    // Prompt programs: the same emitter with either the EXL3 linears or the affine checkpoint's
-+    // resident packed linears. The affine path plans them even when the served runtime leaves
-+    // TF_DSV41_AFFINE_PREFILL off: an unused variant costs only its compile.
++    // resident packed linears. They are planned even when TF_DSV41_AFFINE_PREFILL=0 leaves the
++    // prompt variants unused: an unused variant costs only its compile.
 +    for (promptPasses(sv)) |pass| if (pass) |p| try prompts(gpa, a, n, cfg, w, p, layers, log);
      // DSpark
      if (sv.drafts) {
@@ -199,9 +199,9 @@
          const affine = m.cfg.format == .affine;
 -        // Affine prefill is not ported; prompts run as decode windows until it is.
 -        const own_prefill = o.own_prefill and !affine;
-+        // Affine prefill is opt-in while it is gated: its prompt programs are planned only when
-+        // TF_DSV41_AFFINE_PREFILL=1, and the served runtime must make the same choice.
-+        const affine_prefill = if (std.c.getenv("TF_DSV41_AFFINE_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        // Affine prefill is on by default for cold long prompts: its prompt programs are planned
++        // at the 2,048-row starts, and a session resume at another position stays on decode windows.
++        const affine_prefill = if (std.c.getenv("TF_DSV41_AFFINE_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else true;
 +        const own_prefill = o.own_prefill and (!affine or affine_prefill);
          if (own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
          m.pack = try Pack.open(gpa, io, pack_dir);
@@ -236,16 +236,17 @@
              // the rows before the last token prefill; the last token is the pending row of the first verify window
              const sp = pk.promptSplit(rest.len, .verify);
              pf.state(t.f).taps_rows = 0; // a one-token prompt prefills nothing: no stale taps handed over
-@@ -110,9 +113,30 @@
+@@ -110,9 +113,31 @@
              return one[0];
          }
          if (t.own_prefill) {
 -            // the keyed choice after the prompt: the last segment's last row
 -            try t.f.prefill(rest);
              const seg: usize = @import("forward_prefill.zig").segmentRows(t.f);
-+            // affine native prefill is planned for whole segments only: anything shorter runs as the
-+            // decode windows the served path used before (the keyed choice comes from the last row)
-+            const full: usize = if (t.prefill_full_only) rest.len / seg * seg else rest.len;
++            // affine native prefill is planned for whole segments from the cold-prompt starts;
++            // a session resume at an unaligned position stays on decode windows
++            const aligned = at % seg == 0;
++            const full: usize = if (!t.prefill_full_only) rest.len else if (aligned) rest.len / seg * seg else 0;
 +            if (full > 0) try t.f.prefill(rest[0..full]);
 +            if (full < rest.len) {
 +                var at_ = full;

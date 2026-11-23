@@ -1204,8 +1204,9 @@ Record the approach that was actually implemented, even if it differs from `Agen
 
 ## Affine prefill (2026-11-20)
 
-Patch `0079` adds the affine checkpoint's native prompt path, opt-in with
-`TF_DSV41_AFFINE_PREFILL=1`. Whole 2,048-row segments run through the prefill emitter with:
+Patch `0079` adds the affine checkpoint's native prompt path. It is on by default;
+`TF_DSV41_AFFINE_PREFILL=0` restores the 16-row decode windows. Whole 2,048-row segments run
+through the prefill emitter with:
 
 - packed `AffineN` linears as the prompt GEMM (`rows > 16`, the existing `affine_prefill` kernels);
 - the checkpoint's dense bf16 `wo_a` through one group-major `wo_a` launch per layer;
@@ -1221,7 +1222,7 @@ Measured on the final `dev` image (`9daaf4cae60a`, patches `0001`-`0079`):
 | Case | TTFT / speed | Token SHA |
 | --- | --- | --- |
 | 3,245-token prompt, default (`AFFINE_PREFILL` off) | 89.4 s | `9c4c8939cde0` |
-| 3,245-token prompt, native prefill | **85.3 s** (+4.6%) | `9c4c8939cde0` |
+| 3,245-token prompt, native prefill (final default) | **80.4 s** (+10.1%) | `9c4c8939cde0` |
 | 5,216-token prompt, default | 149.3 s | `9c4c8939cde0` |
 | 5,216-token prompt, native prefill (two full segments) | **128.7 s** (+13.8%) | `9c4c8939cde0` |
 | 64-token C1 | 16.66 tok/s, TTFT 0.42 s | `06d2679eec60` |
@@ -1230,8 +1231,8 @@ Measured on the final `dev` image (`9daaf4cae60a`, patches `0001`-`0079`):
 
 The AOT set gained the prompt `_fused` variants (`aot.json` now 82 kernels); the stable
 `/assets` mount was updated and a final boot with the default mount path passed. The planned
-prompt starts are the cold-prompt multiples of 2,048; an arbitrary session-resume start is not
-yet in that set, so `TF_DSV41_AFFINE_PREFILL` stays opt-in.
+prompt starts are the cold-prompt multiples of 2,048; a session resume at another position
+stays on decode windows, so the default is safe for both cold and resumed prompts.
 
 The remaining prefill cost is the MoE's per-16-row host path; a grouped prompt expert GEMM is
 the next speed item. TP=2 still needs a second Spark.
@@ -1271,7 +1272,7 @@ kept only on a WIP branch; exact `0079` remains the promoted prefill.
 
 ## Next actions
 
-1. Affine native prefill is implemented and verified (`0079`; 128.7 s vs 149.3 s on a 5,216-token prompt, exact SHA). Next: a grouped prompt expert GEMM to replace the per-16-row MoE host path, then measure 600K prompts.
+1. Affine native prefill is implemented, default, and verified (`0079`; 80.4 s vs 89.4 s on a 3,245-token prompt, exact SHA; 128.7 s vs 149.3 s on 5,216 tokens). Next: a grouped prompt expert GEMM that preserves the decode GEMV's accumulation order, then measure 600K prompts.
 2. Replace the 8 per-layer `wo_a` `_plain` launches and the per-row expert launches with fused kernels (the `_plain` bucket is now ~34% of decode); then revisit DSpark's default.
 3. Document the exact greedy divergence from omlx: 136-139 characters match the `bench.json` LRU reference before the parenthetical wording differs; the bf16 KV cache vs omlx's packed 4-bit/e4m3 formats and the activation quantization are the expected sources.
 4. Measure DSpark at 600K with draft buffers (no-drafts 600K is already 104 GiB/17 GiB).
