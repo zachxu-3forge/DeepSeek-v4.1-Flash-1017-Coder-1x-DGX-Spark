@@ -1,0 +1,314 @@
+--- a/zig/kernels/cuda/affine8.cu
++++ b/zig/kernels/cuda/affine8.cu
+@@ -6,6 +6,7 @@
+ 
+ #include "affine_codes.cuh"
+ #include "common/qmm_frag.cuh"
++#include "common/reduce.cuh"
+ 
+ namespace tf_affine8 {
+ 
+@@ -277,6 +278,127 @@
+     if (tid == 0) tickets[tile] = 0;
+ }
+ 
++// The clamped SwiGLU's fp32 product is this close to a bf16 midpoint; recompute exp in double there,
++// as act_rows.cu's swiglu does, so the bf16 row is the host's.
++__device__ __forceinline__ bool gu_near_bf16_mid(float y) {
++    const uint32_t bits = __float_as_uint(y);
++    if ((bits & 0x7f800000u) == 0x7f800000u) return false;
++    const uint32_t low = bits & 0xffffu;
++    const uint32_t d = low >= 0x8000u ? low - 0x8000u : 0x8000u - low;
++    const uint32_t wrap = 0x10000u - d;
++    return d < 32u || wrap < 32u;
++}
++
++__device__ __forceinline__ float gu_swiglu_one(float g, float u, float limit, bool exact) {
++    const float a = fminf(g, limit);
++    const float ef = exact ? static_cast<float>(exp(static_cast<double>(-a))) : expf(-a);
++    const float s = __fdiv_rn(a, __fadd_rn(1.0f, ef));
++    return __fmul_rn(s, fminf(fmaxf(u, -limit), limit));
++}
++
++// One (token, routed slot) pair's gate/up tiles, then the exact clamped SwiGLU and its group sums.
++// Both projections call the same `gemv` as tf_affineB_experts, so the values are byte-equal.
++template <int B>
++__device__ __forceinline__ void moe_gu_body(
++    const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
++    const uint32_t* __restrict__ w1, const __nv_bfloat16* __restrict__ s1, const __nv_bfloat16* __restrict__ b1,
++    const uint32_t* __restrict__ w3, const __nv_bfloat16* __restrict__ s3, const __nv_bfloat16* __restrict__ b3,
++    const int* __restrict__ pick, int slots, int topk, int rows, int k, int n, int npad, int sk, int tiles,
++    long long expert_words, long long expert_scales,
++    __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ up,
++    __nv_bfloat16* __restrict__ act, float* __restrict__ sums, float limit) {
++    (void)rows;
++    const int tile = blockIdx.x;
++    if (tile >= tiles) return;
++    const int p = blockIdx.y;
++    const int i = p / topk, j = p - i * topk;
++    const int e = pick[i * slots + j];
++    if (e < 0) return;
++    const size_t row = static_cast<size_t>(i * slots + j) * n;
++    Part A;
++    A.w = w1 + static_cast<size_t>(e) * expert_words;
++    A.scales = s1 + static_cast<size_t>(e) * expert_scales;
++    A.biases = b1 + static_cast<size_t>(e) * expert_scales;
++    A.out = gate + row; A.n = n; A.npad = npad; A.sk = sk; A.tiles = tiles;
++    Part C = A;
++    C.w = w3 + static_cast<size_t>(e) * expert_words;
++    C.scales = s3 + static_cast<size_t>(e) * expert_scales;
++    C.biases = b3 + static_cast<size_t>(e) * expert_scales;
++    C.out = up + row;
++    const __nv_bfloat16* xr = x + static_cast<size_t>(i) * k;
++    const float* xsr = xs + static_cast<size_t>(i) * (k / 64);
++    gemv<64, 64, 6, B>(xr, xsr, A, 1, k, k);
++    gemv<64, 64, 6, B>(xr, xsr, C, 1, k, k);
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        const int c = threadIdx.x;
++        const bool live = c < 8;
++        uint4 gp = {}, upp = {};
++        if (live) {
++            gp = *reinterpret_cast<const uint4*>(gate + row + tile * 64 + 8 * c);
++            upp = *reinterpret_cast<const uint4*>(up + row + tile * 64 + 8 * c);
++        }
++        float g[8], u[8], o[8];
++        if (live) { tf_common::unpack8(gp, g); tf_common::unpack8(upp, u); }
++#pragma unroll
++        for (int q = 0; q < 8; ++q) {
++            if (!live) { o[q] = 0.f; continue; }
++            o[q] = gu_swiglu_one(g[q], u[q], limit, false);
++            if (gu_near_bf16_mid(o[q])) o[q] = gu_swiglu_one(g[q], u[q], limit, true);
++        }
++        const uint4 op = tf_common::pack8(o);
++        if (live) *reinterpret_cast<uint4*>(act + row + tile * 64 + 8 * c) = op;
++        const float s = tf_common::group_sum8(op, live);
++        if (c == 0) sums[static_cast<size_t>(i * slots + j) * (n / 64) + tile] = s;
++    }
++}
++
++// The shared expert's gate/up, same tiles and arithmetic, at its slot (topk) in the slot-major rows.
++template <int B>
++__device__ __forceinline__ void moe_gu_shared_body(
++    const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
++    const uint32_t* __restrict__ w1, const __nv_bfloat16* __restrict__ s1, const __nv_bfloat16* __restrict__ b1,
++    const uint32_t* __restrict__ w3, const __nv_bfloat16* __restrict__ s3, const __nv_bfloat16* __restrict__ b3,
++    int slots, int topk, int k, int n, int npad, int sk, int tiles,
++    __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ up,
++    __nv_bfloat16* __restrict__ act, float* __restrict__ sums, float limit) {
++    const int tile = blockIdx.x;
++    if (tile >= tiles) return;
++    const int i = blockIdx.y;
++    const size_t row = static_cast<size_t>(i * slots + topk) * n;
++    Part A;
++    A.w = w1; A.scales = s1; A.biases = b1;
++    A.out = gate + row; A.n = n; A.npad = npad; A.sk = sk; A.tiles = tiles;
++    Part C = A;
++    C.w = w3; C.scales = s3; C.biases = b3; C.out = up + row;
++    const __nv_bfloat16* xr = x + static_cast<size_t>(i) * k;
++    const float* xsr = xs + static_cast<size_t>(i) * (k / 64);
++    gemv<64, 64, 6, B>(xr, xsr, A, 1, k, k);
++    gemv<64, 64, 6, B>(xr, xsr, C, 1, k, k);
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        const int c = threadIdx.x;
++        const bool live = c < 8;
++        uint4 gp = {}, upp = {};
++        if (live) {
++            gp = *reinterpret_cast<const uint4*>(gate + row + tile * 64 + 8 * c);
++            upp = *reinterpret_cast<const uint4*>(up + row + tile * 64 + 8 * c);
++        }
++        float g[8], u[8], o[8];
++        if (live) { tf_common::unpack8(gp, g); tf_common::unpack8(upp, u); }
++#pragma unroll
++        for (int q = 0; q < 8; ++q) {
++            if (!live) { o[q] = 0.f; continue; }
++            o[q] = gu_swiglu_one(g[q], u[q], limit, false);
++            if (gu_near_bf16_mid(o[q])) o[q] = gu_swiglu_one(g[q], u[q], limit, true);
++        }
++        const uint4 op = tf_common::pack8(o);
++        if (live) *reinterpret_cast<uint4*>(act + row + tile * 64 + 8 * c) = op;
++        const float s = tf_common::group_sum8(op, live);
++        if (c == 0) sums[static_cast<size_t>(i * slots + topk) * (n / 64) + tile] = s;
++    }
++}
++
+ }  // namespace tf_affine8
+ 
+ // Shared bytes: 6 stages for gemv, 4 for split (cuda/qlinear.zig's affine8 constants).
+@@ -344,6 +466,36 @@
+ TF_AFFINE_EXPERT_GATHER(8)
+ #undef TF_AFFINE_EXPERT_GATHER
+ 
++// Gate/up plus the clamped SwiGLU in one launch: the routed experts' pairs, then the shared expert's.
++#define TF_AFFINE_MOE_GU(B)                                                                                                          \
++    extern "C" __global__ void __launch_bounds__(128) tf_affine##B##_moe_gu(                                                       \
++        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,                                                         \
++        const uint32_t* __restrict__ w1, const __nv_bfloat16* __restrict__ s1, const __nv_bfloat16* __restrict__ b1,               \
++        const uint32_t* __restrict__ w3, const __nv_bfloat16* __restrict__ s3, const __nv_bfloat16* __restrict__ b3,               \
++        const int* __restrict__ pick, int slots, int topk, int rows, int k, int n, int npad, int sk, int tiles,                    \
++        long long expert_words, long long expert_scales,                                                                           \
++        __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ act,                         \
++        float* __restrict__ sums, float limit) {                                                                                   \
++        tf_affine8::moe_gu_body<B>(x, xs, w1, s1, b1, w3, s3, b3, pick, slots, topk, rows, k, n, npad, sk, tiles,                 \
++                                   expert_words, expert_scales, gate, up, act, sums, limit);                                       \
++    }                                                                                                                              \
++    extern "C" __global__ void __launch_bounds__(128) tf_affine##B##_moe_gu_shared(                                                \
++        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,                                                         \
++        const uint32_t* __restrict__ w1, const __nv_bfloat16* __restrict__ s1, const __nv_bfloat16* __restrict__ b1,               \
++        const uint32_t* __restrict__ w3, const __nv_bfloat16* __restrict__ s3, const __nv_bfloat16* __restrict__ b3,               \
++        int slots, int topk, int k, int n, int npad, int sk, int tiles,                                                            \
++        __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ act,                         \
++        float* __restrict__ sums, float limit) {                                                                                   \
++        tf_affine8::moe_gu_shared_body<B>(x, xs, w1, s1, b1, w3, s3, b3, slots, topk, k, n, npad, sk, tiles,                      \
++                                          gate, up, act, sums, limit);                                                             \
++    }
++TF_AFFINE_MOE_GU(2)
++TF_AFFINE_MOE_GU(3)
++TF_AFFINE_MOE_GU(5)
++TF_AFFINE_MOE_GU(6)
++TF_AFFINE_MOE_GU(8)
++#undef TF_AFFINE_MOE_GU
++
+ // MLX words of 2, 3, 5 or 6 bits -> narrow tiles: a lane's pairs' first codes in low halves, second in high.
+ extern "C" __global__ void tf_affinen_pack(const uint32_t* __restrict__ w, int bits, int n, int kw, int kg, uint32_t* __restrict__ out,
+                                            long long total) {
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -350,6 +350,8 @@
+     split_fns: [tile_widths.len]Function,
+     prefill_fns: [tile_widths.len]Function,
+     gather_fns: [tile_widths.len]Function, // one launch over a layer's routed experts
++    gu_fns: [tile_widths.len]Function, // gate/up + SwiGLU, routed pairs
++    gu_shared_fns: [tile_widths.len]Function, // gate/up + SwiGLU, the shared expert
+     pack4_fn: Function, // MLX codes of 2 to 4 bits into the affine-4 tiles
+     pack8_fn: Function, // MLX codes of 5 to 8 bits into the 8-bit tiles
+     packn_fn: Function, // MLX codes of 2, 3, 5 or 6 bits into tiles of that width
+@@ -365,16 +367,20 @@
+     /// From loaded affine8, affine_prefill and affine4_pack modules; GB10 decodes without the split form.
+     pub fn resolve(d: *const Driver, mod: Module, prefill_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !AffineNKernels {
+         var a: AffineNKernels = undefined;
+-        for (tile_widths, &a.gemv_fns, &a.split_fns, &a.prefill_fns, &a.gather_fns, &a.gemv_blocks) |bits, *g, *sp, *pf, *ga, *blocks| {
++        for (tile_widths, &a.gemv_fns, &a.split_fns, &a.prefill_fns, &a.gather_fns, &a.gu_fns, &a.gu_shared_fns, &a.gemv_blocks) |bits, *g, *sp, *pf, *ga, *gu, *gs, *blocks| {
+             var name: [32]u8 = undefined;
+             g.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_gemv", .{bits}, 0));
+             sp.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_split", .{bits}, 0));
+             pf.* = try prefill_mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_prefill", .{bits}, 0));
+             ga.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_experts", .{bits}, 0));
++            gu.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_moe_gu", .{bits}, 0));
++            gs.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_affine{d}_moe_gu_shared", .{bits}, 0));
+             try g.allowDynamicShared(gemvSmem(bits));
+             try sp.allowDynamicShared(splitSmem(bits));
+             try pf.allowDynamicShared(prefillSmem(bits));
+             try ga.allowDynamicShared(gemvSmem(bits));
++            try gu.allowDynamicShared(gemvSmem(bits));
++            try gs.allowDynamicShared(gemvSmem(bits));
+             blocks.* = @max(1, try g.occupancy(128, gemvSmem(bits))) * sms;
+         }
+         a.pack4_fn = try mod.function("tf_affine8_pack4");
+@@ -529,6 +535,41 @@
+         try launch_.launch(a.gather_fns[at], cfg, s, &g);
+     }
+ 
++    /// Routed gate/up plus the clamped SwiGLU in one launch: the same `gemv` as `gatherExperts`,
++    /// so `act` and its group sums are byte-equal to the separate w1, w3 and `swigluClamp` calls.
++    pub fn moeGu(a: *const AffineNKernels, s: Stream, x: u64, xs: u64, q1: AffineN, q3: AffineN, pick: u64, rows: usize, slots: usize, topk: usize, gate: u64, up: u64, act: u64, sums: u64, limit: f32) !void {
++        if (rows == 0 or topk == 0 or topk > slots or q1.bits != q3.bits) return error.Shape;
++        const at = try widthAt(q1.bits);
++        var sk = splitK(q1.n, q1.k);
++        if (rows == 1) {
++            while (sk < 8 and (q1.k / 64) % (sk * 2) == 0) : (sk *= 2) {}
++        }
++        const tiles = (q1.n + 63) / 64;
++        const l = AffineN.layout(q1.n, q1.k, q1.bits);
++        var g: launch_.Args = .{};
++        for ([_]u64{ x, xs, q1.w, q1.s, q1.b, q3.w, q3.s, q3.b, pick }) |v| g.add(v);
++        for ([_]usize{ slots, topk, rows, q1.k, q1.n, q1.npad, sk, tiles }) |v| g.add(int(v));
++        g.add(@as(c_longlong, @intCast(l.words / 4)));
++        g.add(@as(c_longlong, @intCast(l.scales / 2)));
++        for ([_]u64{ gate, up, act, sums }) |v| g.add(v);
++        g.add(@as(f32, limit));
++        try launch_.launch(a.gu_fns[at], .{ .grid = .{ .x = u(tiles), .y = u(rows * topk) }, .block = .{ .x = 128 }, .shared = gemvSmem(q1.bits), .pdl = false }, s, &g);
++    }
++
++    /// The shared expert's gate/up plus SwiGLU, at its slot (`topk`) in the slot-major rows.
++    pub fn moeGuShared(a: *const AffineNKernels, s: Stream, x: u64, xs: u64, q1: AffineN, q3: AffineN, rows: usize, slots: usize, topk: usize, gate: u64, up: u64, act: u64, sums: u64, limit: f32) !void {
++        if (rows == 0 or topk >= slots or q1.bits != q3.bits) return error.Shape;
++        const at = try widthAt(q1.bits);
++        const sk = splitK(q1.n, q1.k);
++        const tiles = (q1.n + 63) / 64;
++        var g: launch_.Args = .{};
++        for ([_]u64{ x, xs, q1.w, q1.s, q1.b, q3.w, q3.s, q3.b }) |v| g.add(v);
++        for ([_]usize{ slots, topk, q1.k, q1.n, q1.npad, sk, tiles }) |v| g.add(int(v));
++        for ([_]u64{ gate, up, act, sums }) |v| g.add(v);
++        g.add(@as(f32, limit));
++        try launch_.launch(a.gu_shared_fns[at], .{ .grid = .{ .x = u(tiles), .y = u(rows) }, .block = .{ .x = 128 }, .shared = gemvSmem(q1.bits), .pdl = false }, s, &g);
++    }
++
+     /// Prompt rows x (rows, k) -> out (rows, n), bf16: Affine4Kernels.prompt's blocks and bands over AffineN's tiles.
+     pub fn prompt(a: *const AffineNKernels, s: Stream, x: u64, q: AffineN, out: u64, rows: usize) !void {
+         const at = try widthAt(q.bits);
+--- a/zig/src/families/deepseek_v41/forward_glue.zig
++++ b/zig/src/families/deepseek_v41/forward_glue.zig
+@@ -326,6 +326,8 @@
+     const w3n = try std.fmt.bufPrint(&e2, "L{d}.moe.w3", .{L});
+     const w2n = try std.fmt.bufPrint(&e3, "L{d}.moe.w2", .{L});
+     const has_shared = af.linears.get(sh1) != null;
++    const sh1i = af.linears.get(sh1);
++    const sh3i = af.linears.get(sh3);
+     const I: usize = if (has_shared) af.linears.get(sh1).?.n else if (af.expert(w1n)) |m| m.layout.n else 0;
+     if (has_shared) {
+         const w2 = af.linears.get(sh2) orelse return error.UnknownAffine;
+@@ -366,28 +368,35 @@
+     try af.act.groupSums(r.stream, xq, D, sx, n, D);
+     try r.d.check(r.d.api.cuMemsetD32Async(s.ucount.ptr, 0, 1, r.stream.handle), "cuMemsetD32Async");
+     try k.routerGroup(pick_dev, s.uids.ptr, s.ucount.ptr, s.members.ptr, n, slots, x1.experts, 16);
+-    if (has_shared) for (0..n) |i| {
+-        const p = i * slots + topk;
+-        const xr = xq + i * D * 2;
+-        const sr = sx + i * dg * 4;
+-        try af.linear2(r.stream, sr, xr, affine_linears.nameHash(sh1), g + p * I * 2, affine_linears.nameHash(sh3), u + p * I * 2, 1, D, I, I);
+-    };
+     const grouped = n > 1 and q1.bits == 2 and q3.bits == 2 and
+         (std.c.getenv("TF_DSV41_GROUPED") == null or !std.mem.eql(u8, std.mem.span(std.c.getenv("TF_DSV41_GROUPED").?), "0"));
+-    if (grouped) {
+-        try af.wide.gatherRows(r.stream, xq, sx, s.members.ptr, s.ucount.ptr, slots, D, 0, 16, s.xg.ptr, s.xsg.ptr, s.slotmap.ptr);
+-        try af.wide.groupGemv2(r.stream, s.xg.ptr, s.xsg.ptr, q1.w, q1.s, q1.b, s.uids.ptr, s.ucount.ptr, s.members.ptr, 16, D, I, cuda.qlinear.splitK(q1.n, q1.k), l1.words / 4, l1.scales / 2, s.og.ptr);
+-        try af.wide.scatterGroups(r.stream, s.og.ptr, s.slotmap.ptr, s.ucount.ptr, 16, I, g);
+-        try af.wide.groupGemv2(r.stream, s.xg.ptr, s.xsg.ptr, q3.w, q3.s, q3.b, s.uids.ptr, s.ucount.ptr, s.members.ptr, 16, D, I, cuda.qlinear.splitK(q3.n, q3.k), l3.words / 4, l3.scales / 2, s.og.ptr);
+-        try af.wide.scatterGroups(r.stream, s.og.ptr, s.slotmap.ptr, s.ucount.ptr, 16, I, u);
++    const fuse_gu = n == 1 and has_shared and sh1i != null and sh3i != null and sh1i.?.n == I and sh3i.?.n == I;
++    if (fuse_gu) {
++        // One launch for the routed pairs, one for the shared expert: gate/up and the exact
++        // clamped SwiGLU write the same act/sums the separate w1, w3, linear2 and swiglu calls did.
++        try af.wide.moeGu(r.stream, xq, sx, q1, q3, pick_dev, n, slots, topk, g, u, actd, sa, limit);
++        try af.wide.moeGuShared(r.stream, xq, sx, sh1i.?.tiles.an, sh3i.?.tiles.an, n, slots, topk, g, u, actd, sa, limit);
+     } else {
+-        try af.wide.gatherExperts(r.stream, xq, sx, q1, g, pick_dev, n, slots, topk, 0, l1.words / 4, l1.scales / 2);
+-        try af.wide.gatherExperts(r.stream, xq, sx, q3, u, pick_dev, n, slots, topk, 0, l3.words / 4, l3.scales / 2);
++        if (has_shared) for (0..n) |i| {
++            const p = i * slots + topk;
++            const xr = xq + i * D * 2;
++            const sr = sx + i * dg * 4;
++            try af.linear2(r.stream, sr, xr, affine_linears.nameHash(sh1), g + p * I * 2, affine_linears.nameHash(sh3), u + p * I * 2, 1, D, I, I);
++        };
++        if (grouped) {
++            try af.wide.gatherRows(r.stream, xq, sx, s.members.ptr, s.ucount.ptr, slots, D, 0, 16, s.xg.ptr, s.xsg.ptr, s.slotmap.ptr);
++            try af.wide.groupGemv2(r.stream, s.xg.ptr, s.xsg.ptr, q1.w, q1.s, q1.b, s.uids.ptr, s.ucount.ptr, s.members.ptr, 16, D, I, cuda.qlinear.splitK(q1.n, q1.k), l1.words / 4, l1.scales / 2, s.og.ptr);
++            try af.wide.scatterGroups(r.stream, s.og.ptr, s.slotmap.ptr, s.ucount.ptr, 16, I, g);
++            try af.wide.groupGemv2(r.stream, s.xg.ptr, s.xsg.ptr, q3.w, q3.s, q3.b, s.uids.ptr, s.ucount.ptr, s.members.ptr, 16, D, I, cuda.qlinear.splitK(q3.n, q3.k), l3.words / 4, l3.scales / 2, s.og.ptr);
++            try af.wide.scatterGroups(r.stream, s.og.ptr, s.slotmap.ptr, s.ucount.ptr, 16, I, u);
++        } else {
++            try af.wide.gatherExperts(r.stream, xq, sx, q1, g, pick_dev, n, slots, topk, 0, l1.words / 4, l1.scales / 2);
++            try af.wide.gatherExperts(r.stream, xq, sx, q3, u, pick_dev, n, slots, topk, 0, l3.words / 4, l3.scales / 2);
++        }
++        // The host's clamp, exact division, and near-midpoint double-exp fallback in one kernel.
++        try af.act.swigluClamp(r.stream, g, I, u, I, actd, sa, n * slots, I, limit);
+     }
+ 
+-    // The host's clamp, exact division, and near-midpoint double-exp fallback in one kernel.
+-    try af.act.swigluClamp(r.stream, g, I, u, I, actd, sa, n * slots, I, limit);
+-
+     if (has_shared) for (0..n) |i| {
+         const p = i * slots + topk;
+         const ar = actd + p * I * 2;
