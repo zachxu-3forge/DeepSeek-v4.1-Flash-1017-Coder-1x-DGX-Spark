@@ -1253,6 +1253,25 @@ prefill measured `top1=0.0%`, `mean_kl=14.98`. The prompt GEMM's K accumulation 
 from the decode GEMV; layer 2's router then picks different experts. The path is rejected and
 kept only on a WIP branch; exact `0079` remains the promoted prefill.
 
+### Decode profile and fused-MoE status (2026-11-23)
+
+A 64-token per-call profile (`TF_DSV41_PROFILE`) puts decode at 68.3 ms/token:
+`moe_host` 33.5%, `wo_a` 22.3%, packed affine linears 21.3%, head 10.6%, `linear2` 3.6%,
+mHC 2.7%, attention 1.5%, router 1.5%. Engram is 1.4% (`engram.wait`), so I/O is not the C1
+lever.
+
+TensorFold's ledger and the Qwen3.8-27B recipe point at the same split: ordered input group
+sums and per-shape K splits are already used here (`linear2`, `splitK`, deeper M=1 expert
+slices); the unapplied items are the x3ld-style wide load path, a fused affine MoE, affine L2
+prefetch (explicitly skipped by `if (!affine)`), add+norm fusion, and the copy/DFlash2-style
+speculation that gives Qwen its one-stream gains. The Qwen recipe also keeps fused projection
+members separate when their bit widths differ.
+
+`0081` (WIP, on `wip/fused-gu`) is the first fused affine MoE kernel: routed and shared
+gate/up plus the exact clamped SwiGLU in one launch each, using the same `affine8::gemv` and
+`group_sum8` order. It is byte-exact on the 64-token run (`06d2679eec60`) at 16.76 tok/s, but
+speed-neutral at C1. It is a foundation for down+combine and wider tiles, not a promoted gain.
+
 ## Open issues and deviations
 
 - Stage 1a-1q plus prep admit metadata, read bytes, enumerate the plan, validate it at boot, exercise 192 experts/world 1, list mixed DSpark modules, provide CPU dequantization oracles, audit CUDA widths, define per-expert fallback views, read mixed tensors, build the dispatch table, freeze binding layouts, resolve device addresses, build a one-layer fixture, pack and launch `AffineN`, verify one projection on the Spark, and add the layer-0 projection sweep, byte budget, resident linear set, and device-to-device linear. The guard reports 307 affine8 linears, 120 expert fallbacks, 21 MXFP8, 9 MXFP4; the `wq_a` smoke matches the CPU reference. The attention/MoE forward and per-expert loop remain.
