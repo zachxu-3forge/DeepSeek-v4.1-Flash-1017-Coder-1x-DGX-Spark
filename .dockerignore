@@ -1,5 +1,7 @@
 # Keep the build context small; the image needs only the Dockerfile, patches, scripts, and docs.
 .git
+checkpoints
+work
 .gitignore
 out
 runs

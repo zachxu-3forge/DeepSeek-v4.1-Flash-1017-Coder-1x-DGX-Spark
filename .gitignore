@@ -2,3 +2,7 @@ scripts/local.sh
 .env
 __pycache__/
 out/
+checkpoints/
+work/
+*.safetensors
+*.gguf
